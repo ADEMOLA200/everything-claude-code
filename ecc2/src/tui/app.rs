@@ -27,6 +27,24 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
+                if dashboard.is_input_mode() {
+                    match (key.modifiers, key.code) {
+                        (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
+                        (_, KeyCode::Esc) => dashboard.cancel_input(),
+                        (_, KeyCode::Enter) => dashboard.submit_input().await,
+                        (_, KeyCode::Backspace) => dashboard.pop_input_char(),
+                        (modifiers, KeyCode::Char(ch))
+                            if !modifiers.contains(KeyModifiers::CONTROL)
+                                && !modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            dashboard.push_input_char(ch);
+                        }
+                        _ => {}
+                    }
+
+                    continue;
+                }
+
                 match (key.modifiers, key.code) {
                     (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
                     (_, KeyCode::Char('q')) => break,
@@ -38,6 +56,15 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     (_, KeyCode::Char('-')) => dashboard.decrease_pane_size(),
                     (_, KeyCode::Char('j')) | (_, KeyCode::Down) => dashboard.scroll_down(),
                     (_, KeyCode::Char('k')) | (_, KeyCode::Up) => dashboard.scroll_up(),
+                    (_, KeyCode::Char('/')) => dashboard.begin_search(),
+                    (_, KeyCode::Esc) => dashboard.clear_search(),
+                    (_, KeyCode::Char('n')) if dashboard.has_active_search() => {
+                        dashboard.next_search_match()
+                    }
+                    (_, KeyCode::Char('N')) if dashboard.has_active_search() => {
+                        dashboard.prev_search_match()
+                    }
+                    (_, KeyCode::Char('N')) => dashboard.begin_spawn_prompt(),
                     (_, KeyCode::Char('n')) => dashboard.new_session().await,
                     (_, KeyCode::Char('a')) => dashboard.assign_selected().await,
                     (_, KeyCode::Char('b')) => dashboard.rebalance_selected_team().await,
@@ -47,6 +74,10 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     (_, KeyCode::Char('G')) => dashboard.coordinate_backlog().await,
                     (_, KeyCode::Char('v')) => dashboard.toggle_output_mode(),
                     (_, KeyCode::Char('c')) => dashboard.toggle_conflict_protocol_mode(),
+                    (_, KeyCode::Char('e')) => dashboard.toggle_output_filter(),
+                    (_, KeyCode::Char('f')) => dashboard.cycle_output_time_filter(),
+                    (_, KeyCode::Char('A')) => dashboard.toggle_search_scope(),
+                    (_, KeyCode::Char('o')) => dashboard.toggle_search_agent_filter(),
                     (_, KeyCode::Char('m')) => dashboard.merge_selected_worktree().await,
                     (_, KeyCode::Char('M')) => dashboard.merge_ready_worktrees().await,
                     (_, KeyCode::Char('l')) => dashboard.cycle_pane_layout(),

@@ -1,10 +1,12 @@
+use chrono::{Duration, Utc};
 use ratatui::{
     prelude::*,
     widgets::{
         Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Table, TableState, Tabs, Wrap,
     },
 };
-use std::collections::HashMap;
+use regex::Regex;
+use std::collections::{HashMap, HashSet};
 use tokio::sync::broadcast;
 
 use super::widgets::{budget_state, format_currency, format_token_count, BudgetState, TokenMeter};
@@ -12,13 +14,13 @@ use crate::comms;
 use crate::config::{Config, PaneLayout, Theme};
 use crate::observability::ToolLogEntry;
 use crate::session::manager;
-use crate::session::output::{OutputEvent, OutputLine, SessionOutputStore, OUTPUT_BUFFER_LIMIT};
+use crate::session::output::{
+    OutputEvent, OutputLine, OutputStream, SessionOutputStore, OUTPUT_BUFFER_LIMIT,
+};
 use crate::session::store::{DaemonActivity, StateStore};
 use crate::session::{Session, SessionMessage, SessionState};
 use crate::worktree;
 
-#[cfg(test)]
-use crate::session::output::OutputStream;
 #[cfg(test)]
 use crate::session::{SessionMetrics, WorktreeInfo};
 
@@ -53,6 +55,8 @@ pub struct Dashboard {
     sessions: Vec<Session>,
     session_output_cache: HashMap<String, Vec<OutputLine>>,
     unread_message_counts: HashMap<String, usize>,
+    approval_queue_counts: HashMap<String, usize>,
+    approval_queue_preview: Vec<SessionMessage>,
     handoff_backlog_counts: HashMap<String, usize>,
     worktree_health_by_session: HashMap<String, worktree::WorktreeHealth>,
     global_handoff_backlog_leads: usize,
@@ -70,6 +74,8 @@ pub struct Dashboard {
     selected_conflict_protocol: Option<String>,
     selected_merge_readiness: Option<worktree::MergeReadiness>,
     output_mode: OutputMode,
+    output_filter: OutputFilter,
+    output_time_filter: OutputTimeFilter,
     selected_pane: Pane,
     selected_session: usize,
     show_help: bool,
@@ -78,6 +84,13 @@ pub struct Dashboard {
     output_scroll_offset: usize,
     last_output_height: usize,
     pane_size_percent: u16,
+    search_input: Option<String>,
+    spawn_input: Option<String>,
+    search_query: Option<String>,
+    search_scope: SearchScope,
+    search_agent_filter: SearchAgentFilter,
+    search_matches: Vec<SearchMatch>,
+    selected_search_match: usize,
     session_table_state: TableState,
 }
 
@@ -111,6 +124,53 @@ enum OutputMode {
     ConflictProtocol,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputFilter {
+    All,
+    ErrorsOnly,
+    ToolCallsOnly,
+    FileChangesOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputTimeFilter {
+    AllTime,
+    Last15Minutes,
+    LastHour,
+    Last24Hours,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchScope {
+    SelectedSession,
+    AllSessions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchAgentFilter {
+    AllAgents,
+    SelectedAgentType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchMatch {
+    session_id: String,
+    line_index: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnRequest {
+    requested_count: usize,
+    task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnPlan {
+    requested_count: usize,
+    spawn_count: usize,
+    task: String,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PaneAreas {
     sessions: Rect,
@@ -132,7 +192,14 @@ struct AggregateUsage {
 struct DelegatedChildSummary {
     session_id: String,
     state: SessionState,
+    approval_backlog: usize,
     handoff_backlog: usize,
+    tokens_used: u64,
+    files_changed: u32,
+    duration_secs: u64,
+    task_preview: String,
+    branch: Option<String>,
+    last_output_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -171,6 +238,8 @@ impl Dashboard {
             sessions,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
+            approval_queue_counts: HashMap::new(),
+            approval_queue_preview: Vec::new(),
             handoff_backlog_counts: HashMap::new(),
             worktree_health_by_session: HashMap::new(),
             global_handoff_backlog_leads: 0,
@@ -188,6 +257,8 @@ impl Dashboard {
             selected_conflict_protocol: None,
             selected_merge_readiness: None,
             output_mode: OutputMode::SessionOutput,
+            output_filter: OutputFilter::All,
+            output_time_filter: OutputTimeFilter::AllTime,
             selected_pane: Pane::Sessions,
             selected_session: 0,
             show_help: false,
@@ -196,6 +267,13 @@ impl Dashboard {
             output_scroll_offset: 0,
             last_output_height: 0,
             pane_size_percent,
+            search_input: None,
+            spawn_input: None,
+            search_query: None,
+            search_scope: SearchScope::SelectedSession,
+            search_agent_filter: SearchAgentFilter::AllAgents,
+            search_matches: Vec::new(),
+            selected_search_match: 0,
             session_table_state,
         };
         dashboard.unread_message_counts = dashboard.db.unread_message_counts().unwrap_or_default();
@@ -291,22 +369,31 @@ impl Dashboard {
             &self.worktree_health_by_session,
             stabilized,
         );
+        let mut overview_lines = vec![
+            summary_line(&summary),
+            attention_queue_line(&summary, stabilized),
+            approval_queue_line(&self.approval_queue_counts),
+        ];
+        if let Some(preview) = approval_queue_preview_line(&self.approval_queue_preview) {
+            overview_lines.push(preview);
+        }
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(2), Constraint::Min(3)])
+            .constraints([
+                Constraint::Length(overview_lines.len() as u16),
+                Constraint::Min(3),
+            ])
             .split(inner_area);
 
-        frame.render_widget(
-            Paragraph::new(vec![
-                summary_line(&summary),
-                attention_queue_line(&summary, stabilized),
-            ]),
-            chunks[0],
-        );
+        frame.render_widget(Paragraph::new(overview_lines), chunks[0]);
 
         let rows = self.sessions.iter().map(|session| {
             session_row(
                 session,
+                self.approval_queue_counts
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(0),
                 self.handoff_backlog_counts
                     .get(&session.id)
                     .copied()
@@ -314,7 +401,14 @@ impl Dashboard {
             )
         });
         let header = Row::new([
-            "ID", "Agent", "State", "Branch", "Backlog", "Tokens", "Duration",
+            "ID",
+            "Agent",
+            "State",
+            "Branch",
+            "Approvals",
+            "Backlog",
+            "Tokens",
+            "Duration",
         ])
         .style(Style::default().add_modifier(Modifier::BOLD));
         let widths = [
@@ -322,6 +416,7 @@ impl Dashboard {
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Min(12),
+            Constraint::Length(10),
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(8),
@@ -364,17 +459,20 @@ impl Dashboard {
         let (title, content) = if self.sessions.get(self.selected_session).is_some() {
             match self.output_mode {
                 OutputMode::SessionOutput => {
-                    let lines = self.selected_output_lines();
+                    let lines = self.visible_output_lines();
                     let content = if lines.is_empty() {
-                        "Waiting for session output...".to_string()
+                        Text::from(self.empty_output_message())
+                    } else if self.search_query.is_some() {
+                        self.render_searchable_output(&lines)
                     } else {
-                        lines
-                            .iter()
-                            .map(|line| line.text.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                        Text::from(
+                            lines
+                                .iter()
+                                .map(|line| Line::from(line.text.clone()))
+                                .collect::<Vec<_>>(),
+                        )
                     };
-                    (" Output ", content)
+                    (self.output_title(), content)
                 }
                 OutputMode::WorktreeDiff => {
                     let content = self
@@ -390,19 +488,19 @@ impl Dashboard {
                         .unwrap_or_else(|| {
                             "No worktree diff available for the selected session.".to_string()
                         });
-                    (" Diff ", content)
+                    (" Diff ".to_string(), Text::from(content))
                 }
                 OutputMode::ConflictProtocol => {
                     let content = self.selected_conflict_protocol.clone().unwrap_or_else(|| {
                         "No conflicted worktree available for the selected session.".to_string()
                     });
-                    (" Conflict Protocol ", content)
+                    (" Conflict Protocol ".to_string(), Text::from(content))
                 }
             }
         } else {
             (
-                " Output ",
-                "No sessions. Press 'n' to start one.".to_string(),
+                self.output_title(),
+                Text::from("No sessions. Press 'n' to start one."),
             )
         };
 
@@ -449,6 +547,87 @@ impl Dashboard {
             .scroll((self.output_scroll_offset as u16, 0))
             .wrap(Wrap { trim: false });
         frame.render_widget(additions, column_chunks[1]);
+    }
+
+    fn output_title(&self) -> String {
+        let filter = format!(
+            "{}{}",
+            self.output_filter.title_suffix(),
+            self.output_time_filter.title_suffix()
+        );
+        let scope = self.search_scope.title_suffix();
+        let agent = self.search_agent_title_suffix();
+        if let Some(input) = self.search_input.as_ref() {
+            return format!(" Output{filter}{scope}{agent} /{input}_ ");
+        }
+
+        if let Some(query) = self.search_query.as_ref() {
+            let total = self.search_matches.len();
+            let current = if total == 0 {
+                0
+            } else {
+                self.selected_search_match.min(total.saturating_sub(1)) + 1
+            };
+            return format!(" Output{filter}{scope}{agent} /{query} {current}/{total} ");
+        }
+
+        format!(" Output{filter}{scope}{agent} ")
+    }
+
+    fn empty_output_message(&self) -> &'static str {
+        match (self.output_filter, self.output_time_filter) {
+            (OutputFilter::All, OutputTimeFilter::AllTime) => "Waiting for session output...",
+            (OutputFilter::ErrorsOnly, OutputTimeFilter::AllTime) => {
+                "No stderr output for this session yet."
+            }
+            (OutputFilter::ToolCallsOnly, OutputTimeFilter::AllTime) => {
+                "No tool-call output for this session yet."
+            }
+            (OutputFilter::FileChangesOnly, OutputTimeFilter::AllTime) => {
+                "No file-change output for this session yet."
+            }
+            (OutputFilter::All, _) => "No output lines in the selected time range.",
+            (OutputFilter::ErrorsOnly, _) => "No stderr output in the selected time range.",
+            (OutputFilter::ToolCallsOnly, _) => "No tool-call output in the selected time range.",
+            (OutputFilter::FileChangesOnly, _) => {
+                "No file-change output in the selected time range."
+            }
+        }
+    }
+
+    fn render_searchable_output(&self, lines: &[&OutputLine]) -> Text<'static> {
+        let Some(query) = self.search_query.as_deref() else {
+            return Text::from(
+                lines
+                    .iter()
+                    .map(|line| Line::from(line.text.clone()))
+                    .collect::<Vec<_>>(),
+            );
+        };
+
+        let selected_session_id = self.selected_session_id();
+        let active_match = self.search_matches.get(self.selected_search_match);
+
+        Text::from(
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    highlight_output_line(
+                        &line.text,
+                        query,
+                        active_match
+                            .zip(selected_session_id)
+                            .map(|(search_match, session_id)| {
+                                search_match.session_id == session_id
+                                    && search_match.line_index == index
+                            })
+                            .unwrap_or(false),
+                        self.theme_palette(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn render_metrics(&self, frame: &mut Frame, area: Rect) {
@@ -531,15 +710,45 @@ impl Dashboard {
     }
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
-        let text = format!(
-            " [n]ew session  [a]ssign  re[b]alance  global re[B]alance  dra[i]n inbox  [g]lobal dispatch  coordinate [G]lobal  [v]iew diff  conflict proto[c]ol  [m]erge  merge ready [M]  auto-worktree [t]  auto-merge [w]  toggle [p]olicy  [,/.] dispatch limit  [s]top  [u]resume  [x]cleanup  prune inactive [X]  [d]elete  [r]efresh  [Tab] switch pane  [j/k] scroll  [+/-] resize  [l]ayout {}  [T]heme {}  [?] help  [q]uit ",
+        let base_text = format!(
+            " [n]ew session  natural spawn [N]  [a]ssign  re[b]alance  global re[B]alance  dra[i]n inbox  [g]lobal dispatch  coordinate [G]lobal  [v]iew diff  conflict proto[c]ol  cont[e]nt filter  time [f]ilter  search scope [A]  agent filter [o]  [m]erge  merge ready [M]  auto-worktree [t]  auto-merge [w]  toggle [p]olicy  [,/.] dispatch limit  [s]top  [u]resume  [x]cleanup  prune inactive [X]  [d]elete  [r]efresh  [Tab] switch pane  [j/k] scroll  [+/-] resize  [l]ayout {}  [T]heme {}  [?] help  [q]uit ",
             self.layout_label(),
             self.theme_label()
         );
-        let text = if let Some(note) = self.operator_note.as_ref() {
-            format!(" {} |{}", truncate_for_dashboard(note, 96), text)
+
+        let search_prefix = if let Some(input) = self.spawn_input.as_ref() {
+            format!(" spawn>{input}_ | [Enter] queue [Esc] cancel |")
+        } else if let Some(input) = self.search_input.as_ref() {
+            format!(
+                " /{input}_ | {} | {} | [Enter] apply [Esc] cancel |",
+                self.search_scope.label(),
+                self.search_agent_filter_label()
+            )
+        } else if let Some(query) = self.search_query.as_ref() {
+            let total = self.search_matches.len();
+            let current = if total == 0 {
+                0
+            } else {
+                self.selected_search_match.min(total.saturating_sub(1)) + 1
+            };
+            format!(
+                " /{query} {current}/{total} | {} | {} | [n/N] navigate [Esc] clear |",
+                self.search_scope.label(),
+                self.search_agent_filter_label()
+            )
         } else {
-            text
+            String::new()
+        };
+
+        let text = if self.spawn_input.is_some()
+            || self.search_input.is_some()
+            || self.search_query.is_some()
+        {
+            format!(" {search_prefix}")
+        } else if let Some(note) = self.operator_note.as_ref() {
+            format!(" {} |{}", truncate_for_dashboard(note, 96), base_text)
+        } else {
+            base_text
         };
         let aggregate = self.aggregate_usage();
         let (summary_text, summary_style) = self.aggregate_cost_summary();
@@ -578,6 +787,7 @@ impl Dashboard {
             "Keyboard Shortcuts:",
             "",
             "  n       New session",
+            "  N       Natural-language multi-agent spawn prompt",
             "  a       Assign follow-up work from selected session",
             "  b       Rebalance backed-up delegate handoff backlog for selected lead",
             "  B       Rebalance backed-up delegate handoff backlog across lead teams",
@@ -586,6 +796,10 @@ impl Dashboard {
             "  G       Dispatch then rebalance backlog across lead teams",
             "  v       Toggle selected worktree diff in output pane",
             "  c       Show conflict-resolution protocol for selected conflicted worktree",
+            "  e       Cycle output content filter: all/errors/tool calls/file changes",
+            "  f       Cycle output time filter between all/15m/1h/24h",
+            "  A       Toggle search scope between selected session and all sessions",
+            "  o       Toggle search agent filter between all agents and selected agent type",
             "  m       Merge selected ready worktree into base and clean it up",
             "  M       Merge all ready inactive worktrees and clean them up",
             "  l       Cycle pane layout and persist it",
@@ -603,6 +817,9 @@ impl Dashboard {
             "  S-Tab   Previous pane",
             "  j/↓     Scroll down",
             "  k/↑     Scroll up",
+            "  /       Search current session output",
+            "  n/N     Next/previous search match when search is active",
+            "  Esc     Clear active search or cancel search input",
             "  +/=     Increase pane size and persist it",
             "  -       Decrease pane size and persist it",
             "  r       Refresh",
@@ -674,6 +891,65 @@ impl Dashboard {
                 self.pane_size_percent = previous_pane_size;
                 self.selected_pane = previous_selected_pane;
                 self.set_operator_note(format!("failed to persist pane layout: {error}"));
+            }
+        }
+    }
+
+    fn auto_split_layout_after_spawn(&mut self, spawned_count: usize) -> Option<String> {
+        let config_path = crate::config::Config::config_path();
+        self.auto_split_layout_after_spawn_with_save(spawned_count, &config_path, |cfg| cfg.save())
+    }
+
+    fn auto_split_layout_after_spawn_with_save<F>(
+        &mut self,
+        spawned_count: usize,
+        config_path: &std::path::Path,
+        save: F,
+    ) -> Option<String>
+    where
+        F: FnOnce(&Config) -> anyhow::Result<()>,
+    {
+        if spawned_count <= 1 {
+            return None;
+        }
+
+        let live_session_count = self.active_session_count();
+        let target_layout = recommended_spawn_layout(live_session_count);
+        if self.cfg.pane_layout == target_layout {
+            self.selected_pane = Pane::Sessions;
+            self.ensure_selected_pane_visible();
+            return Some(format!(
+                "auto-focused sessions in {} layout for {} live session(s)",
+                pane_layout_name(target_layout),
+                live_session_count
+            ));
+        }
+
+        let previous_layout = self.cfg.pane_layout;
+        let previous_pane_size = self.pane_size_percent;
+        let previous_selected_pane = self.selected_pane;
+
+        self.cfg.pane_layout = target_layout;
+        self.pane_size_percent = configured_pane_size(&self.cfg, target_layout);
+        self.persist_current_pane_size();
+        self.selected_pane = Pane::Sessions;
+        self.ensure_selected_pane_visible();
+
+        match save(&self.cfg) {
+            Ok(()) => Some(format!(
+                "auto-split {} layout for {} live session(s)",
+                pane_layout_name(target_layout),
+                live_session_count
+            )),
+            Err(error) => {
+                self.cfg.pane_layout = previous_layout;
+                self.pane_size_percent = previous_pane_size;
+                self.selected_pane = previous_selected_pane;
+                Some(format!(
+                    "spawned {} session(s) but failed to persist auto-split layout to {}: {error}",
+                    spawned_count,
+                    config_path.display()
+                ))
             }
         }
     }
@@ -845,6 +1121,10 @@ impl Dashboard {
                 "Cannot queue new session: active session limit reached ({})",
                 self.cfg.max_parallel_sessions
             );
+            self.set_operator_note(format!(
+                "cannot queue new session: active session limit reached ({})",
+                self.cfg.max_parallel_sessions
+            ));
             return;
         }
 
@@ -1503,6 +1783,339 @@ impl Dashboard {
         self.show_help = !self.show_help;
     }
 
+    pub fn is_input_mode(&self) -> bool {
+        self.spawn_input.is_some() || self.search_input.is_some()
+    }
+
+    pub fn has_active_search(&self) -> bool {
+        self.search_query.is_some()
+    }
+
+    pub fn begin_spawn_prompt(&mut self) {
+        if self.search_input.is_some() {
+            self.set_operator_note(
+                "finish output search input before opening spawn prompt".to_string(),
+            );
+            return;
+        }
+
+        self.spawn_input = Some(self.spawn_prompt_seed());
+        self.set_operator_note(
+            "spawn mode | try: give me 3 agents working on fix flaky tests".to_string(),
+        );
+    }
+
+    pub fn toggle_search_scope(&mut self) {
+        if self.output_mode != OutputMode::SessionOutput {
+            self.set_operator_note(
+                "search scope is only available in session output view".to_string(),
+            );
+            return;
+        }
+
+        self.search_scope = self.search_scope.next();
+        self.recompute_search_matches();
+        self.sync_output_scroll(self.last_output_height.max(1));
+
+        if self.search_query.is_some() {
+            self.set_operator_note(format!(
+                "search scope set to {} | {} match(es)",
+                self.search_scope.label(),
+                self.search_matches.len()
+            ));
+        } else {
+            self.set_operator_note(format!("search scope set to {}", self.search_scope.label()));
+        }
+    }
+
+    pub fn toggle_search_agent_filter(&mut self) {
+        if self.output_mode != OutputMode::SessionOutput {
+            self.set_operator_note(
+                "search agent filter is only available in session output view".to_string(),
+            );
+            return;
+        }
+
+        let Some(selected_agent_type) = self.selected_agent_type().map(str::to_owned) else {
+            self.set_operator_note("search agent filter requires a selected session".to_string());
+            return;
+        };
+
+        self.search_agent_filter = match self.search_agent_filter {
+            SearchAgentFilter::AllAgents => SearchAgentFilter::SelectedAgentType,
+            SearchAgentFilter::SelectedAgentType => SearchAgentFilter::AllAgents,
+        };
+        self.recompute_search_matches();
+        self.sync_output_scroll(self.last_output_height.max(1));
+
+        if self.search_query.is_some() {
+            self.set_operator_note(format!(
+                "search agent filter set to {} | {} match(es)",
+                self.search_agent_filter.label(&selected_agent_type),
+                self.search_matches.len()
+            ));
+        } else {
+            self.set_operator_note(format!(
+                "search agent filter set to {}",
+                self.search_agent_filter.label(&selected_agent_type)
+            ));
+        }
+    }
+
+    pub fn begin_search(&mut self) {
+        if self.spawn_input.is_some() {
+            self.set_operator_note("finish spawn prompt before searching output".to_string());
+            return;
+        }
+
+        if self.output_mode != OutputMode::SessionOutput {
+            self.set_operator_note("search is only available in session output view".to_string());
+            return;
+        }
+
+        self.search_input = Some(self.search_query.clone().unwrap_or_default());
+        self.set_operator_note("search mode | type a query and press Enter".to_string());
+    }
+
+    pub fn push_input_char(&mut self, ch: char) {
+        if let Some(input) = self.spawn_input.as_mut() {
+            input.push(ch);
+        } else if let Some(input) = self.search_input.as_mut() {
+            input.push(ch);
+        }
+    }
+
+    pub fn pop_input_char(&mut self) {
+        if let Some(input) = self.spawn_input.as_mut() {
+            input.pop();
+        } else if let Some(input) = self.search_input.as_mut() {
+            input.pop();
+        }
+    }
+
+    pub fn cancel_input(&mut self) {
+        if self.spawn_input.take().is_some() {
+            self.set_operator_note("spawn input cancelled".to_string());
+        } else if self.search_input.take().is_some() {
+            self.set_operator_note("search input cancelled".to_string());
+        }
+    }
+
+    pub async fn submit_input(&mut self) {
+        if self.spawn_input.is_some() {
+            self.submit_spawn_prompt().await;
+        } else {
+            self.submit_search();
+        }
+    }
+
+    fn submit_search(&mut self) {
+        let Some(input) = self.search_input.take() else {
+            return;
+        };
+
+        let query = input.trim().to_string();
+        if query.is_empty() {
+            self.clear_search();
+            return;
+        }
+
+        if let Err(error) = compile_search_regex(&query) {
+            self.search_input = Some(query.clone());
+            self.set_operator_note(format!("invalid regex /{query}: {error}"));
+            return;
+        }
+
+        self.search_query = Some(query.clone());
+        self.recompute_search_matches();
+        if self.search_matches.is_empty() {
+            self.set_operator_note(format!("search /{query} found no matches"));
+        } else {
+            self.set_operator_note(format!(
+                "search /{query} matched {} line(s) across {} session(s) | n/N navigate matches",
+                self.search_matches.len(),
+                self.search_match_session_count()
+            ));
+        }
+    }
+
+    async fn submit_spawn_prompt(&mut self) {
+        let Some(input) = self.spawn_input.take() else {
+            return;
+        };
+
+        let plan = match self.build_spawn_plan(&input) {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.spawn_input = Some(input);
+                self.set_operator_note(error);
+                return;
+            }
+        };
+
+        let source_session = self.sessions.get(self.selected_session).cloned();
+        let handoff_context = source_session.as_ref().map(|session| {
+            format!(
+                "Dashboard handoff from {} [{}] | cwd {}{}",
+                format_session_id(&session.id),
+                session.agent_type,
+                session.working_dir.display(),
+                session
+                    .worktree
+                    .as_ref()
+                    .map(|worktree| format!(
+                        " | worktree {} ({})",
+                        worktree.branch,
+                        worktree.path.display()
+                    ))
+                    .unwrap_or_default()
+            )
+        });
+        let source_task = source_session.as_ref().map(|session| session.task.clone());
+        let source_session_id = source_session.as_ref().map(|session| session.id.clone());
+        let agent = self.cfg.default_agent.clone();
+        let mut created_ids = Vec::new();
+
+        for task in expand_spawn_tasks(&plan.task, plan.spawn_count) {
+            let session_id = match manager::create_session(
+                &self.db,
+                &self.cfg,
+                &task,
+                &agent,
+                self.cfg.auto_create_worktrees,
+            )
+            .await
+            {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    let preferred_selection =
+                        post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
+                    self.refresh_after_spawn(preferred_selection.as_deref());
+                    let mut summary = if created_ids.is_empty() {
+                        format!("spawn failed: {error}")
+                    } else {
+                        format!(
+                            "spawn partially completed: {} of {} queued before failure: {error}",
+                            created_ids.len(),
+                            plan.spawn_count
+                        )
+                    };
+                    if let Some(layout_note) = self.auto_split_layout_after_spawn(created_ids.len())
+                    {
+                        summary.push_str(" | ");
+                        summary.push_str(&layout_note);
+                    }
+                    self.set_operator_note(summary);
+                    return;
+                }
+            };
+
+            if let (Some(source_id), Some(task), Some(context)) = (
+                source_session_id.as_ref(),
+                source_task.as_ref(),
+                handoff_context.as_ref(),
+            ) {
+                if let Err(error) = comms::send(
+                    &self.db,
+                    source_id,
+                    &session_id,
+                    &comms::MessageType::TaskHandoff {
+                        task: task.clone(),
+                        context: context.clone(),
+                    },
+                ) {
+                    tracing::warn!(
+                        "Failed to send handoff from session {} to {}: {error}",
+                        source_id,
+                        session_id
+                    );
+                }
+            }
+
+            created_ids.push(session_id);
+        }
+
+        let preferred_selection =
+            post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
+        self.refresh_after_spawn(preferred_selection.as_deref());
+        let mut note = build_spawn_note(&plan, created_ids.len());
+        if let Some(layout_note) = self.auto_split_layout_after_spawn(created_ids.len()) {
+            note.push_str(" | ");
+            note.push_str(&layout_note);
+        }
+        self.set_operator_note(note);
+    }
+
+    pub fn clear_search(&mut self) {
+        let had_query = self.search_query.take().is_some();
+        let had_input = self.search_input.take().is_some();
+        self.search_matches.clear();
+        self.selected_search_match = 0;
+        if had_query || had_input {
+            self.set_operator_note("cleared output search".to_string());
+        }
+    }
+
+    pub fn next_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            self.set_operator_note("no output search matches to navigate".to_string());
+            return;
+        }
+
+        self.selected_search_match = (self.selected_search_match + 1) % self.search_matches.len();
+        self.focus_selected_search_match();
+        self.set_operator_note(self.search_navigation_note());
+    }
+
+    pub fn prev_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            self.set_operator_note("no output search matches to navigate".to_string());
+            return;
+        }
+
+        self.selected_search_match = if self.selected_search_match == 0 {
+            self.search_matches.len() - 1
+        } else {
+            self.selected_search_match - 1
+        };
+        self.focus_selected_search_match();
+        self.set_operator_note(self.search_navigation_note());
+    }
+
+    pub fn toggle_output_filter(&mut self) {
+        if self.output_mode != OutputMode::SessionOutput {
+            self.set_operator_note(
+                "output filters are only available in session output view".to_string(),
+            );
+            return;
+        }
+
+        self.output_filter = self.output_filter.next();
+        self.recompute_search_matches();
+        self.sync_output_scroll(self.last_output_height.max(1));
+        self.set_operator_note(format!(
+            "output filter set to {}",
+            self.output_filter.label()
+        ));
+    }
+
+    pub fn cycle_output_time_filter(&mut self) {
+        if self.output_mode != OutputMode::SessionOutput {
+            self.set_operator_note(
+                "output time filters are only available in session output view".to_string(),
+            );
+            return;
+        }
+
+        self.output_time_filter = self.output_time_filter.next();
+        self.recompute_search_matches();
+        self.sync_output_scroll(self.last_output_height.max(1));
+        self.set_operator_note(format!(
+            "output time filter set to {}",
+            self.output_time_filter.label()
+        ));
+    }
+
     pub fn toggle_auto_dispatch_policy(&mut self) {
         self.cfg.auto_dispatch_unread_handoffs = !self.cfg.auto_dispatch_unread_handoffs;
         match self.cfg.save() {
@@ -1627,6 +2240,7 @@ impl Dashboard {
         self.sync_worktree_health_by_session();
         self.sync_global_handoff_backlog();
         self.sync_daemon_activity();
+        self.sync_output_cache();
         self.sync_selection_by_id(selected_id.as_deref());
         self.ensure_selected_pane_visible();
         self.sync_selected_output();
@@ -1659,6 +2273,28 @@ impl Dashboard {
         self.sync_selection();
     }
 
+    fn sync_output_cache(&mut self) {
+        let active_session_ids: HashSet<_> = self
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect();
+        self.session_output_cache
+            .retain(|session_id, _| active_session_ids.contains(session_id.as_str()));
+
+        for session in &self.sessions {
+            match self.db.get_output_lines(&session.id, OUTPUT_BUFFER_LIMIT) {
+                Ok(lines) => {
+                    self.output_store.replace_lines(&session.id, lines.clone());
+                    self.session_output_cache.insert(session.id.clone(), lines);
+                }
+                Err(error) => {
+                    tracing::warn!("Failed to load session output for {}: {error}", session.id);
+                }
+            }
+        }
+    }
+
     fn ensure_selected_pane_visible(&mut self) {
         if !self.visible_panes().contains(&self.selected_pane) {
             self.selected_pane = Pane::Sessions;
@@ -1679,6 +2315,23 @@ impl Dashboard {
                 self.global_handoff_backlog_messages = 0;
             }
         }
+    }
+
+    fn sync_approval_queue(&mut self) {
+        self.approval_queue_counts = match self.db.unread_approval_counts() {
+            Ok(counts) => counts,
+            Err(error) => {
+                tracing::warn!("Failed to refresh approval queue counts: {error}");
+                HashMap::new()
+            }
+        };
+        self.approval_queue_preview = match self.db.unread_approval_queue(3) {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!("Failed to refresh approval queue preview: {error}");
+                Vec::new()
+            }
+        };
     }
 
     fn sync_handoff_backlog_counts(&mut self) {
@@ -1727,21 +2380,15 @@ impl Dashboard {
     }
 
     fn sync_selected_output(&mut self) {
-        let Some(session_id) = self.selected_session_id().map(ToOwned::to_owned) else {
+        if self.selected_session_id().is_none() {
             self.output_scroll_offset = 0;
             self.output_follow = true;
+            self.search_matches.clear();
+            self.selected_search_match = 0;
             return;
-        };
-
-        match self.db.get_output_lines(&session_id, OUTPUT_BUFFER_LIMIT) {
-            Ok(lines) => {
-                self.output_store.replace_lines(&session_id, lines.clone());
-                self.session_output_cache.insert(session_id, lines);
-            }
-            Err(error) => {
-                tracing::warn!("Failed to load session output: {error}");
-            }
         }
+
+        self.recompute_search_matches();
     }
 
     fn sync_selected_diff(&mut self) {
@@ -1779,6 +2426,7 @@ impl Dashboard {
     fn sync_selected_messages(&mut self) {
         let Some(session_id) = self.selected_session_id().map(ToOwned::to_owned) else {
             self.selected_messages.clear();
+            self.sync_approval_queue();
             return;
         };
 
@@ -1808,6 +2456,8 @@ impl Dashboard {
                 Vec::new()
             }
         };
+
+        self.sync_approval_queue();
     }
 
     fn sync_selected_lineage(&mut self) {
@@ -1837,6 +2487,11 @@ impl Dashboard {
                     match self.db.get_session(&child_id) {
                         Ok(Some(session)) => {
                             team.total += 1;
+                            let approval_backlog = self
+                                .approval_queue_counts
+                                .get(&child_id)
+                                .copied()
+                                .unwrap_or(0);
                             let handoff_backlog = match self.db.unread_task_handoff_count(&child_id)
                             {
                                 Ok(count) => count,
@@ -1859,14 +2514,44 @@ impl Dashboard {
                             }
 
                             route_candidates.push(DelegatedChildSummary {
+                                approval_backlog,
                                 handoff_backlog,
                                 state: state.clone(),
                                 session_id: child_id.clone(),
+                                tokens_used: session.metrics.tokens_used,
+                                files_changed: session.metrics.files_changed,
+                                duration_secs: session.metrics.duration_secs,
+                                task_preview: truncate_for_dashboard(&session.task, 40),
+                                branch: session
+                                    .worktree
+                                    .as_ref()
+                                    .map(|worktree| worktree.branch.clone()),
+                                last_output_preview: self
+                                    .db
+                                    .get_output_lines(&child_id, 1)
+                                    .ok()
+                                    .and_then(|lines| lines.last().cloned())
+                                    .map(|line| truncate_for_dashboard(&line.text, 48)),
                             });
                             delegated.push(DelegatedChildSummary {
+                                approval_backlog,
                                 handoff_backlog,
                                 state,
                                 session_id: child_id,
+                                tokens_used: session.metrics.tokens_used,
+                                files_changed: session.metrics.files_changed,
+                                duration_secs: session.metrics.duration_secs,
+                                task_preview: truncate_for_dashboard(&session.task, 40),
+                                branch: session
+                                    .worktree
+                                    .as_ref()
+                                    .map(|worktree| worktree.branch.clone()),
+                                last_output_preview: self
+                                    .db
+                                    .get_output_lines(&session.id, 1)
+                                    .ok()
+                                    .and_then(|lines| lines.last().cloned())
+                                    .map(|line| truncate_for_dashboard(&line.text, 48)),
                             });
                         }
                         Ok(None) => {}
@@ -1965,6 +2650,152 @@ impl Dashboard {
             .unwrap_or(&[])
     }
 
+    fn selected_agent_type(&self) -> Option<&str> {
+        self.sessions
+            .get(self.selected_session)
+            .map(|session| session.agent_type.as_str())
+    }
+
+    fn search_agent_filter_label(&self) -> String {
+        self.search_agent_filter
+            .label(self.selected_agent_type().unwrap_or("selected agent"))
+            .to_string()
+    }
+
+    fn search_agent_title_suffix(&self) -> String {
+        match self.selected_agent_type() {
+            Some(agent_type) => self
+                .search_agent_filter
+                .title_suffix(agent_type)
+                .to_string(),
+            None => String::new(),
+        }
+    }
+
+    fn visible_output_lines_for_session(&self, session_id: &str) -> Vec<&OutputLine> {
+        self.session_output_cache
+            .get(session_id)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter(|line| {
+                        self.output_filter.matches(line) && self.output_time_filter.matches(line)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn visible_output_lines(&self) -> Vec<&OutputLine> {
+        self.selected_session_id()
+            .map(|session_id| self.visible_output_lines_for_session(session_id))
+            .unwrap_or_default()
+    }
+
+    fn recompute_search_matches(&mut self) {
+        let Some(query) = self.search_query.clone() else {
+            self.search_matches.clear();
+            self.selected_search_match = 0;
+            return;
+        };
+
+        let Ok(regex) = compile_search_regex(&query) else {
+            self.search_matches.clear();
+            self.selected_search_match = 0;
+            return;
+        };
+
+        self.search_matches = self
+            .search_target_session_ids()
+            .into_iter()
+            .flat_map(|session_id| {
+                self.visible_output_lines_for_session(session_id)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(index, line)| {
+                        regex.is_match(&line.text).then_some(SearchMatch {
+                            session_id: session_id.to_string(),
+                            line_index: index,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        if self.search_matches.is_empty() {
+            self.selected_search_match = 0;
+            return;
+        }
+
+        self.selected_search_match = self
+            .selected_search_match
+            .min(self.search_matches.len().saturating_sub(1));
+        self.focus_selected_search_match();
+    }
+
+    fn focus_selected_search_match(&mut self) {
+        let Some(search_match) = self.search_matches.get(self.selected_search_match).cloned()
+        else {
+            return;
+        };
+
+        if self.selected_session_id() != Some(search_match.session_id.as_str()) {
+            self.sync_selection_by_id(Some(&search_match.session_id));
+            self.sync_selected_output();
+            self.sync_selected_diff();
+            self.sync_selected_messages();
+            self.sync_selected_lineage();
+            self.refresh_logs();
+        }
+
+        self.output_follow = false;
+        let viewport_height = self.last_output_height.max(1);
+        let offset = search_match
+            .line_index
+            .saturating_sub(viewport_height.saturating_sub(1) / 2);
+        self.output_scroll_offset = offset.min(self.max_output_scroll());
+    }
+
+    fn search_navigation_note(&self) -> String {
+        let query = self.search_query.as_deref().unwrap_or_default();
+        let total = self.search_matches.len();
+        let current = if total == 0 {
+            0
+        } else {
+            self.selected_search_match.min(total.saturating_sub(1)) + 1
+        };
+
+        format!(
+            "search /{query} match {current}/{total} | {}",
+            self.search_scope.label()
+        )
+    }
+
+    fn search_match_session_count(&self) -> usize {
+        self.search_matches
+            .iter()
+            .map(|search_match| search_match.session_id.as_str())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    fn search_target_session_ids(&self) -> Vec<&str> {
+        let selected_session_id = self.selected_session_id();
+        let selected_agent_type = self.selected_agent_type();
+
+        self.sessions
+            .iter()
+            .filter(|session| {
+                self.search_scope
+                    .matches(selected_session_id, session.id.as_str())
+                    && self
+                        .search_agent_filter
+                        .matches(selected_agent_type, session.agent_type.as_str())
+            })
+            .map(|session| session.id.as_str())
+            .collect()
+    }
+
     fn sync_output_scroll(&mut self, viewport_height: usize) {
         self.last_output_height = viewport_height.max(1);
         let max_scroll = self.max_output_scroll();
@@ -1977,9 +2808,18 @@ impl Dashboard {
     }
 
     fn max_output_scroll(&self) -> usize {
-        self.selected_output_lines()
+        self.visible_output_lines()
             .len()
             .saturating_sub(self.last_output_height.max(1))
+    }
+
+    #[cfg(test)]
+    fn visible_output_text(&self) -> String {
+        self.visible_output_lines()
+            .iter()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn reset_output_view(&mut self) {
@@ -2178,12 +3018,24 @@ impl Dashboard {
             if !self.selected_child_sessions.is_empty() {
                 lines.push("Delegates".to_string());
                 for child in &self.selected_child_sessions {
-                    lines.push(format!(
-                        "- {} [{}] | backlog {}",
+                    let mut child_line = format!(
+                        "- {} [{}] | approvals {} | backlog {} | progress {} tok / {} files / {} | task {}",
                         format_session_id(&child.session_id),
                         session_state_label(&child.state),
-                        child.handoff_backlog
-                    ));
+                        child.approval_backlog,
+                        child.handoff_backlog,
+                        format_token_count(child.tokens_used),
+                        child.files_changed,
+                        format_duration(child.duration_secs),
+                        child.task_preview
+                    );
+                    if let Some(branch) = child.branch.as_ref() {
+                        child_line.push_str(&format!(" | branch {branch}"));
+                    }
+                    lines.push(child_line);
+                    if let Some(last_output_preview) = child.last_output_preview.as_ref() {
+                        lines.push(format!("  last output {last_output_preview}"));
+                    }
                 }
             }
 
@@ -2359,6 +3211,17 @@ impl Dashboard {
             .count()
     }
 
+    fn refresh_after_spawn(&mut self, select_session_id: Option<&str>) {
+        self.refresh();
+        self.sync_selection_by_id(select_session_id);
+        self.reset_output_view();
+        self.sync_selected_output();
+        self.sync_selected_diff();
+        self.sync_selected_messages();
+        self.sync_selected_lineage();
+        self.refresh_logs();
+    }
+
     fn new_session_task(&self) -> String {
         self.sessions
             .get(self.selected_session)
@@ -2370,6 +3233,31 @@ impl Dashboard {
                 )
             })
             .unwrap_or_else(|| "New ECC 2.0 session".to_string())
+    }
+
+    fn spawn_prompt_seed(&self) -> String {
+        format!("give me 2 agents working on {}", self.new_session_task())
+    }
+
+    fn build_spawn_plan(&self, input: &str) -> Result<SpawnPlan, String> {
+        let request = parse_spawn_request(input)?;
+        let available_slots = self
+            .cfg
+            .max_parallel_sessions
+            .saturating_sub(self.active_session_count());
+
+        if available_slots == 0 {
+            return Err(format!(
+                "cannot queue sessions: active session limit reached ({})",
+                self.cfg.max_parallel_sessions
+            ));
+        }
+
+        Ok(SpawnPlan {
+            requested_count: request.requested_count,
+            spawn_count: request.requested_count.min(available_slots),
+            task: request.task,
+        })
     }
 
     fn pane_areas(&self, area: Rect) -> PaneAreas {
@@ -2556,6 +3444,314 @@ impl Pane {
     }
 }
 
+impl OutputFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::ErrorsOnly,
+            Self::ErrorsOnly => Self::ToolCallsOnly,
+            Self::ToolCallsOnly => Self::FileChangesOnly,
+            Self::FileChangesOnly => Self::All,
+        }
+    }
+
+    fn matches(self, line: &OutputLine) -> bool {
+        match self {
+            OutputFilter::All => true,
+            OutputFilter::ErrorsOnly => line.stream == OutputStream::Stderr,
+            OutputFilter::ToolCallsOnly => looks_like_tool_call(&line.text),
+            OutputFilter::FileChangesOnly => looks_like_file_change(&line.text),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            OutputFilter::All => "all",
+            OutputFilter::ErrorsOnly => "errors",
+            OutputFilter::ToolCallsOnly => "tool calls",
+            OutputFilter::FileChangesOnly => "file changes",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            OutputFilter::All => "",
+            OutputFilter::ErrorsOnly => " errors",
+            OutputFilter::ToolCallsOnly => " tool calls",
+            OutputFilter::FileChangesOnly => " file changes",
+        }
+    }
+}
+
+fn looks_like_tool_call(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    const TOOL_PREFIXES: &[&str] = &[
+        "tool ",
+        "tool:",
+        "[tool",
+        "tool call",
+        "calling tool",
+        "running tool",
+        "invoking tool",
+        "using tool",
+        "read(",
+        "write(",
+        "edit(",
+        "multi_edit(",
+        "bash(",
+        "grep(",
+        "glob(",
+        "search(",
+        "ls(",
+        "apply_patch(",
+    ];
+
+    TOOL_PREFIXES.iter().any(|prefix| lower.starts_with(prefix))
+}
+
+fn parse_spawn_request(input: &str) -> Result<SpawnRequest, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("spawn request cannot be empty".to_string());
+    }
+
+    let count = Regex::new(r"\b([1-9]\d*)\b")
+        .expect("spawn count regex")
+        .captures(trimmed)
+        .and_then(|captures| captures.get(1))
+        .and_then(|count| count.as_str().parse::<usize>().ok())
+        .unwrap_or(1);
+
+    let task = extract_spawn_task(trimmed);
+    if task.is_empty() {
+        return Err("spawn request must include a task description".to_string());
+    }
+
+    Ok(SpawnRequest {
+        requested_count: count,
+        task,
+    })
+}
+
+fn extract_spawn_task(input: &str) -> String {
+    let trimmed = input.trim();
+    let lower = trimmed.to_ascii_lowercase();
+
+    for marker in ["working on ", "work on ", "for ", ":"] {
+        if let Some(start) = lower.find(marker) {
+            let task = trimmed[start + marker.len()..]
+                .trim_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '-');
+            if !task.is_empty() {
+                return task.to_string();
+            }
+        }
+    }
+
+    let stripped =
+        Regex::new(r"(?i)^\s*(give me|spawn|queue|start|launch)\s+\d+\s+(agents?|sessions?)\s*")
+            .expect("spawn command regex")
+            .replace(trimmed, "");
+    let stripped = stripped.trim_matches(|ch: char| ch.is_whitespace() || ch == ':' || ch == '-');
+    if !stripped.is_empty() && stripped != trimmed {
+        return stripped.to_string();
+    }
+
+    trimmed.to_string()
+}
+
+fn expand_spawn_tasks(task: &str, count: usize) -> Vec<String> {
+    if count <= 1 {
+        return vec![task.to_string()];
+    }
+
+    (0..count)
+        .map(|index| format!("{task} [{}/{}]", index + 1, count))
+        .collect()
+}
+
+fn build_spawn_note(plan: &SpawnPlan, created_count: usize) -> String {
+    let task = truncate_for_dashboard(&plan.task, 72);
+    if plan.spawn_count < plan.requested_count {
+        format!(
+            "spawned {created_count} session(s) for {task} (requested {}, capped at {})",
+            plan.requested_count, plan.spawn_count
+        )
+    } else {
+        format!("spawned {created_count} session(s) for {task}")
+    }
+}
+
+fn post_spawn_selection_id(
+    source_session_id: Option<&str>,
+    created_ids: &[String],
+) -> Option<String> {
+    if created_ids.len() > 1 {
+        source_session_id
+            .map(ToOwned::to_owned)
+            .or_else(|| created_ids.first().cloned())
+    } else {
+        created_ids.first().cloned()
+    }
+}
+
+fn looks_like_file_change(text: &str) -> bool {
+    let lower = text.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+
+    if lower.contains("applied patch")
+        || lower.contains("patch applied")
+        || lower.starts_with("diff --git ")
+    {
+        return true;
+    }
+
+    const FILE_CHANGE_VERBS: &[&str] = &[
+        "updated ",
+        "created ",
+        "deleted ",
+        "renamed ",
+        "modified ",
+        "wrote ",
+        "editing ",
+        "edited ",
+        "writing ",
+    ];
+
+    FILE_CHANGE_VERBS
+        .iter()
+        .any(|prefix| lower.starts_with(prefix) && contains_path_like_token(text))
+}
+
+fn contains_path_like_token(text: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        let trimmed = token.trim_matches(|ch: char| {
+            matches!(
+                ch,
+                '[' | ']' | '(' | ')' | '{' | '}' | ',' | ':' | ';' | '"' | '\''
+            )
+        });
+
+        trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.starts_with("./")
+            || trimmed.starts_with("../")
+            || trimmed
+                .rsplit_once('.')
+                .map(|(stem, ext)| {
+                    !stem.is_empty()
+                        && !ext.is_empty()
+                        && ext.len() <= 10
+                        && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+                })
+                .unwrap_or(false)
+    })
+}
+
+impl OutputTimeFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::AllTime => Self::Last15Minutes,
+            Self::Last15Minutes => Self::LastHour,
+            Self::LastHour => Self::Last24Hours,
+            Self::Last24Hours => Self::AllTime,
+        }
+    }
+
+    fn matches(self, line: &OutputLine) -> bool {
+        match self {
+            Self::AllTime => true,
+            Self::Last15Minutes => line
+                .occurred_at()
+                .map(|timestamp| timestamp >= Utc::now() - Duration::minutes(15))
+                .unwrap_or(false),
+            Self::LastHour => line
+                .occurred_at()
+                .map(|timestamp| timestamp >= Utc::now() - Duration::hours(1))
+                .unwrap_or(false),
+            Self::Last24Hours => line
+                .occurred_at()
+                .map(|timestamp| timestamp >= Utc::now() - Duration::hours(24))
+                .unwrap_or(false),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::AllTime => "all time",
+            Self::Last15Minutes => "last 15m",
+            Self::LastHour => "last 1h",
+            Self::Last24Hours => "last 24h",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::AllTime => "",
+            Self::Last15Minutes => " last 15m",
+            Self::LastHour => " last 1h",
+            Self::Last24Hours => " last 24h",
+        }
+    }
+}
+
+impl SearchScope {
+    fn next(self) -> Self {
+        match self {
+            Self::SelectedSession => Self::AllSessions,
+            Self::AllSessions => Self::SelectedSession,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::SelectedSession => "selected session",
+            Self::AllSessions => "all sessions",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::SelectedSession => "",
+            Self::AllSessions => " all sessions",
+        }
+    }
+
+    fn matches(self, selected_session_id: Option<&str>, session_id: &str) -> bool {
+        match self {
+            Self::SelectedSession => selected_session_id == Some(session_id),
+            Self::AllSessions => true,
+        }
+    }
+}
+
+impl SearchAgentFilter {
+    fn matches(self, selected_agent_type: Option<&str>, session_agent_type: &str) -> bool {
+        match self {
+            Self::AllAgents => true,
+            Self::SelectedAgentType => selected_agent_type == Some(session_agent_type),
+        }
+    }
+
+    fn label(self, selected_agent_type: &str) -> String {
+        match self {
+            Self::AllAgents => "all agents".to_string(),
+            Self::SelectedAgentType => format!("agent {}", selected_agent_type),
+        }
+    }
+
+    fn title_suffix(self, selected_agent_type: &str) -> String {
+        match self {
+            Self::AllAgents => String::new(),
+            Self::SelectedAgentType => format!(" {}", self.label(selected_agent_type)),
+        }
+    }
+}
+
 impl SessionSummary {
     fn from_sessions(
         sessions: &[Session],
@@ -2605,7 +3801,11 @@ impl SessionSummary {
     }
 }
 
-fn session_row(session: &Session, unread_messages: usize) -> Row<'static> {
+fn session_row(
+    session: &Session,
+    approval_requests: usize,
+    unread_messages: usize,
+) -> Row<'static> {
     Row::new(vec![
         Cell::from(format_session_id(&session.id)),
         Cell::from(session.agent_type.clone()),
@@ -2615,6 +3815,18 @@ fn session_row(session: &Session, unread_messages: usize) -> Row<'static> {
                 .add_modifier(Modifier::BOLD),
         ),
         Cell::from(session_branch(session)),
+        Cell::from(if approval_requests == 0 {
+            "-".to_string()
+        } else {
+            approval_requests.to_string()
+        })
+        .style(if approval_requests == 0 {
+            Style::default()
+        } else {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        }),
         Cell::from(if unread_messages == 0 {
             "-".to_string()
         } else {
@@ -2719,6 +3931,49 @@ fn attention_queue_line(summary: &SessionSummary, stabilized: bool) -> Line<'sta
     Line::from(spans)
 }
 
+fn approval_queue_line(approval_queue_counts: &HashMap<String, usize>) -> Line<'static> {
+    let pending_sessions = approval_queue_counts.len();
+    let pending_items: usize = approval_queue_counts.values().sum();
+
+    if pending_items == 0 {
+        return Line::from(vec![
+            Span::styled(
+                "Approval queue clear",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  no unanswered queries or conflicts"),
+        ]);
+    }
+
+    Line::from(vec![
+        Span::styled(
+            "Approval queue  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        summary_span("Pending", pending_items, Color::Yellow),
+        summary_span("Sessions", pending_sessions, Color::Yellow),
+    ])
+}
+
+fn approval_queue_preview_line(messages: &[SessionMessage]) -> Option<Line<'static>> {
+    let message = messages.first()?;
+    let preview = truncate_for_dashboard(&comms::preview(&message.msg_type, &message.content), 72);
+
+    Some(Line::from(vec![
+        Span::raw("- "),
+        Span::styled(
+            format_session_id(&message.to_session),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::raw(preview),
+    ]))
+}
+
 fn truncate_for_dashboard(value: &str, max_chars: usize) -> String {
     let trimmed = value.trim();
     if trimmed.chars().count() <= max_chars {
@@ -2736,6 +3991,73 @@ fn configured_pane_size(cfg: &Config, layout: PaneLayout) -> u16 {
     };
 
     configured.clamp(MIN_PANE_SIZE_PERCENT, MAX_PANE_SIZE_PERCENT)
+}
+
+fn recommended_spawn_layout(live_session_count: usize) -> PaneLayout {
+    if live_session_count >= 3 {
+        PaneLayout::Grid
+    } else {
+        PaneLayout::Vertical
+    }
+}
+
+fn pane_layout_name(layout: PaneLayout) -> &'static str {
+    match layout {
+        PaneLayout::Horizontal => "horizontal",
+        PaneLayout::Vertical => "vertical",
+        PaneLayout::Grid => "grid",
+    }
+}
+
+fn compile_search_regex(query: &str) -> Result<Regex, regex::Error> {
+    Regex::new(query)
+}
+
+fn highlight_output_line(
+    text: &str,
+    query: &str,
+    is_current_match: bool,
+    palette: ThemePalette,
+) -> Line<'static> {
+    if query.is_empty() {
+        return Line::from(text.to_string());
+    }
+
+    let Ok(regex) = compile_search_regex(query) else {
+        return Line::from(text.to_string());
+    };
+
+    let mut spans = Vec::new();
+    let mut cursor = 0;
+    for matched in regex.find_iter(text) {
+        let start = matched.start();
+        let end = matched.end();
+
+        if start > cursor {
+            spans.push(Span::raw(text[cursor..start].to_string()));
+        }
+
+        let match_style = if is_current_match {
+            Style::default()
+                .bg(palette.accent)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::Yellow).fg(Color::Black)
+        };
+        spans.push(Span::styled(text[start..end].to_string(), match_style));
+        cursor = end;
+    }
+
+    if cursor < text.len() {
+        spans.push(Span::raw(text[cursor..].to_string()));
+    }
+
+    if spans.is_empty() {
+        Line::from(text.to_string())
+    } else {
+        Line::from(spans)
+    }
 }
 
 fn build_worktree_diff_columns(patch: &str) -> WorktreeDiffColumns {
@@ -2902,7 +4224,7 @@ mod tests {
 
     #[test]
     fn render_sessions_shows_summary_headers_and_selected_row() {
-        let dashboard = test_dashboard(
+        let mut dashboard = test_dashboard(
             vec![
                 sample_session(
                     "run-12345678",
@@ -2923,6 +4245,16 @@ mod tests {
             ],
             1,
         );
+        dashboard.approval_queue_counts = HashMap::from([(String::from("run-12345678"), 2usize)]);
+        dashboard.approval_queue_preview = vec![SessionMessage {
+            id: 1,
+            from_session: "lead-12345678".to_string(),
+            to_session: "run-12345678".to_string(),
+            content: "{\"question\":\"Need approval to continue\"}".to_string(),
+            msg_type: "query".to_string(),
+            read: false,
+            timestamp: Utc::now(),
+        }];
 
         let rendered = render_dashboard_text(dashboard, 180, 24);
         assert!(rendered.contains("ID"));
@@ -2930,8 +4262,71 @@ mod tests {
         assert!(rendered.contains("Total 2"));
         assert!(rendered.contains("Running 1"));
         assert!(rendered.contains("Completed 1"));
-        assert!(rendered.contains("Attention queue clear"));
+        assert!(rendered.contains("Approval queue"));
         assert!(rendered.contains("done-876"));
+    }
+
+    #[test]
+    fn approval_queue_preview_line_uses_target_session_and_preview() {
+        let line = approval_queue_preview_line(&[SessionMessage {
+            id: 1,
+            from_session: "lead-12345678".to_string(),
+            to_session: "run-12345678".to_string(),
+            content: "{\"question\":\"Need approval to continue\"}".to_string(),
+            msg_type: "query".to_string(),
+            read: false,
+            timestamp: Utc::now(),
+        }])
+        .expect("approval preview line");
+
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("run-123"));
+        assert!(rendered.contains("query"));
+    }
+
+    #[test]
+    fn sync_selected_messages_refreshes_approval_queue_after_marking_read() {
+        let sessions = vec![
+            sample_session(
+                "lead-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/lead"),
+                512,
+                42,
+            ),
+            sample_session(
+                "worker-123456",
+                "reviewer",
+                SessionState::Idle,
+                Some("ecc/worker"),
+                64,
+                5,
+            ),
+        ];
+        let mut dashboard = test_dashboard(sessions, 1);
+        for session in &dashboard.sessions {
+            dashboard.db.insert_session(session).unwrap();
+        }
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-123456",
+                "{\"question\":\"Need operator input\"}",
+                "query",
+            )
+            .unwrap();
+        dashboard.unread_message_counts = dashboard.db.unread_message_counts().unwrap();
+
+        dashboard.sync_selected_messages();
+
+        assert_eq!(dashboard.approval_queue_counts.get("worker-123456"), None);
+        assert!(dashboard.approval_queue_preview.is_empty());
     }
 
     #[test]
@@ -2959,10 +4354,7 @@ mod tests {
         );
         dashboard.session_output_cache.insert(
             "focus-12345678".to_string(),
-            vec![OutputLine {
-                stream: OutputStream::Stdout,
-                text: "last useful output".to_string(),
-            }],
+            vec![test_output_line(OutputStream::Stdout, "last useful output")],
         );
         dashboard.selected_diff_summary = Some("1 file changed, 2 insertions(+)".to_string());
         dashboard.selected_diff_preview = vec![
@@ -3114,6 +4506,41 @@ diff --git a/src/next.rs b/src/next.rs
         ));
         assert!(text.contains("Coordination mode dispatch-first"));
         assert!(text.contains("Next route reuse idle worker-1"));
+    }
+
+    #[test]
+    fn selected_session_metrics_text_includes_delegate_task_board() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+        dashboard.selected_child_sessions = vec![DelegatedChildSummary {
+            session_id: "delegate-12345678".to_string(),
+            state: SessionState::Running,
+            approval_backlog: 1,
+            handoff_backlog: 2,
+            tokens_used: 1_280,
+            files_changed: 3,
+            duration_secs: 12,
+            task_preview: "Implement rust tui delegate board".to_string(),
+            branch: Some("ecc/delegate-12345678".to_string()),
+            last_output_preview: Some("Investigating pane selection behavior".to_string()),
+        }];
+
+        let text = dashboard.selected_session_metrics_text();
+        assert!(
+            text.contains(
+                "- delegate [Running] | approvals 1 | backlog 2 | progress 1,280 tok / 3 files / 00:00:12 | task Implement rust tui delegate board | branch ecc/delegate-12345678"
+            )
+        );
+        assert!(text.contains("  last output Investigating pane selection behavior"));
     }
 
     #[test]
@@ -3616,6 +5043,77 @@ diff --git a/src/next.rs b/src/next.rs
     }
 
     #[test]
+    fn sync_selected_lineage_populates_delegate_task_and_output_previews() {
+        let lead = sample_session(
+            "lead-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/lead"),
+            512,
+            42,
+        );
+        let mut child = sample_session(
+            "worker-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/worker"),
+            128,
+            12,
+        );
+        child.task = "Implement delegate metrics board for ECC 2.0".to_string();
+
+        let mut dashboard = test_dashboard(vec![lead.clone(), child.clone()], 0);
+        dashboard.db.insert_session(&lead).unwrap();
+        dashboard.db.insert_session(&child).unwrap();
+        dashboard
+            .db
+            .update_metrics("worker-12345678", &child.metrics)
+            .unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "worker-12345678",
+                "{\"task\":\"Delegated work\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .append_output_line(
+                "worker-12345678",
+                OutputStream::Stdout,
+                "Reviewing delegate metrics board layout",
+            )
+            .unwrap();
+        dashboard
+            .approval_queue_counts
+            .insert("worker-12345678".into(), 2);
+
+        dashboard.sync_selected_lineage();
+
+        assert_eq!(dashboard.selected_child_sessions.len(), 1);
+        assert_eq!(dashboard.selected_child_sessions[0].approval_backlog, 2);
+        assert_eq!(dashboard.selected_child_sessions[0].tokens_used, 128);
+        assert_eq!(dashboard.selected_child_sessions[0].files_changed, 2);
+        assert_eq!(dashboard.selected_child_sessions[0].duration_secs, 12);
+        assert_eq!(
+            dashboard.selected_child_sessions[0].task_preview,
+            "Implement delegate metrics board for EC…"
+        );
+        assert_eq!(
+            dashboard.selected_child_sessions[0].branch.as_deref(),
+            Some("ecc/worker")
+        );
+        assert_eq!(
+            dashboard.selected_child_sessions[0]
+                .last_output_preview
+                .as_deref(),
+            Some("Reviewing delegate metrics board layout")
+        );
+    }
+
+    #[test]
     fn aggregate_cost_summary_mentions_total_cost() {
         let db = StateStore::open(Path::new(":memory:")).unwrap();
         let mut cfg = Config::default();
@@ -3665,6 +5163,90 @@ diff --git a/src/next.rs b/src/next.rs
         );
 
         assert_eq!(dashboard.active_session_count(), 3);
+    }
+
+    #[test]
+    fn spawn_prompt_seed_uses_selected_session_context() {
+        let dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+
+        assert_eq!(
+            dashboard.spawn_prompt_seed(),
+            "give me 2 agents working on Follow up on focus-12: Render dashboard rows"
+        );
+    }
+
+    #[test]
+    fn parse_spawn_request_extracts_count_and_task_from_natural_language() {
+        let request = parse_spawn_request("give me 10 agents working on stabilize the queue")
+            .expect("spawn request should parse");
+
+        assert_eq!(
+            request,
+            SpawnRequest {
+                requested_count: 10,
+                task: "stabilize the queue".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_spawn_request_defaults_to_single_session_without_count() {
+        let request = parse_spawn_request("stabilize the queue").expect("spawn request");
+
+        assert_eq!(
+            request,
+            SpawnRequest {
+                requested_count: 1,
+                task: "stabilize the queue".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn build_spawn_plan_caps_requested_count_to_available_slots() {
+        let dashboard = test_dashboard(
+            vec![
+                sample_session("pending-1", "planner", SessionState::Pending, None, 1, 1),
+                sample_session("running-1", "planner", SessionState::Running, None, 1, 1),
+                sample_session("idle-1", "planner", SessionState::Idle, None, 1, 1),
+            ],
+            0,
+        );
+
+        let plan = dashboard
+            .build_spawn_plan("give me 9 agents working on ship release notes")
+            .expect("spawn plan");
+
+        assert_eq!(
+            plan,
+            SpawnPlan {
+                requested_count: 9,
+                spawn_count: 5,
+                task: "ship release notes".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn expand_spawn_tasks_suffixes_multi_session_requests() {
+        assert_eq!(
+            expand_spawn_tasks("stabilize the queue", 3),
+            vec![
+                "stabilize the queue [1/3]".to_string(),
+                "stabilize the queue [2/3]".to_string(),
+                "stabilize the queue [3/3]".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3781,6 +5363,605 @@ diff --git a/src/next.rs b/src/next.rs
 
         let _ = std::fs::remove_file(db_path);
         Ok(())
+    }
+
+    #[test]
+    fn submit_search_tracks_matches_and_sets_navigation_note() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha"),
+                test_output_line(OutputStream::Stdout, "beta"),
+                test_output_line(OutputStream::Stdout, "alpha tail"),
+            ],
+        );
+        dashboard.last_output_height = 2;
+
+        dashboard.begin_search();
+        for ch in "alpha.*".chars() {
+            dashboard.push_input_char(ch);
+        }
+        dashboard.submit_search();
+
+        assert_eq!(dashboard.search_query.as_deref(), Some("alpha.*"));
+        assert_eq!(
+            dashboard.search_matches,
+            vec![
+                SearchMatch {
+                    session_id: "focus-12345678".to_string(),
+                    line_index: 0,
+                },
+                SearchMatch {
+                    session_id: "focus-12345678".to_string(),
+                    line_index: 2,
+                },
+            ]
+        );
+        assert_eq!(dashboard.selected_search_match, 0);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("search /alpha.* matched 2 line(s) across 1 session(s) | n/N navigate matches")
+        );
+    }
+
+    #[test]
+    fn next_search_match_wraps_and_updates_scroll_offset() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha-1"),
+                test_output_line(OutputStream::Stdout, "beta"),
+                test_output_line(OutputStream::Stdout, "alpha-2"),
+            ],
+        );
+        dashboard.search_query = Some(r"alpha-\d".to_string());
+        dashboard.last_output_height = 1;
+        dashboard.recompute_search_matches();
+
+        dashboard.next_search_match();
+        assert_eq!(dashboard.selected_search_match, 1);
+        assert_eq!(dashboard.output_scroll_offset, 2);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some(r"search /alpha-\d match 2/2 | selected session")
+        );
+
+        dashboard.next_search_match();
+        assert_eq!(dashboard.selected_search_match, 0);
+        assert_eq!(dashboard.output_scroll_offset, 0);
+    }
+
+    #[test]
+    fn submit_search_rejects_invalid_regex_and_keeps_input() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+
+        dashboard.begin_search();
+        for ch in "(".chars() {
+            dashboard.push_input_char(ch);
+        }
+        dashboard.submit_search();
+
+        assert_eq!(dashboard.search_input.as_deref(), Some("("));
+        assert!(dashboard.search_query.is_none());
+        assert!(dashboard.search_matches.is_empty());
+        assert!(dashboard
+            .operator_note
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("invalid regex /(:"));
+    }
+
+    #[test]
+    fn clear_search_resets_active_query_and_matches() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.search_input = Some("draft".to_string());
+        dashboard.search_query = Some("alpha".to_string());
+        dashboard.search_matches = vec![
+            SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 1,
+            },
+            SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 3,
+            },
+        ];
+        dashboard.selected_search_match = 1;
+
+        dashboard.clear_search();
+
+        assert!(dashboard.search_input.is_none());
+        assert!(dashboard.search_query.is_none());
+        assert!(dashboard.search_matches.is_empty());
+        assert_eq!(dashboard.selected_search_match, 0);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("cleared output search")
+        );
+    }
+
+    #[test]
+    fn toggle_output_filter_keeps_only_stderr_lines() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "stdout line"),
+                test_output_line(OutputStream::Stderr, "stderr line"),
+            ],
+        );
+
+        dashboard.toggle_output_filter();
+
+        assert_eq!(dashboard.output_filter, OutputFilter::ErrorsOnly);
+        assert_eq!(dashboard.visible_output_text(), "stderr line");
+        assert_eq!(dashboard.output_title(), " Output errors ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("output filter set to errors")
+        );
+    }
+
+    #[test]
+    fn toggle_output_filter_cycles_tool_calls_and_file_changes() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "normal output"),
+                test_output_line(OutputStream::Stdout, "Read(src/lib.rs)"),
+                test_output_line(OutputStream::Stdout, "Updated ecc2/src/tui/dashboard.rs"),
+                test_output_line(OutputStream::Stderr, "stderr line"),
+            ],
+        );
+
+        dashboard.toggle_output_filter();
+        assert_eq!(dashboard.output_filter, OutputFilter::ErrorsOnly);
+        assert_eq!(dashboard.visible_output_text(), "stderr line");
+
+        dashboard.toggle_output_filter();
+        assert_eq!(dashboard.output_filter, OutputFilter::ToolCallsOnly);
+        assert_eq!(dashboard.visible_output_text(), "Read(src/lib.rs)");
+        assert_eq!(dashboard.output_title(), " Output tool calls ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("output filter set to tool calls")
+        );
+
+        dashboard.toggle_output_filter();
+        assert_eq!(dashboard.output_filter, OutputFilter::FileChangesOnly);
+        assert_eq!(
+            dashboard.visible_output_text(),
+            "Updated ecc2/src/tui/dashboard.rs"
+        );
+        assert_eq!(dashboard.output_title(), " Output file changes ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("output filter set to file changes")
+        );
+    }
+
+    #[test]
+    fn search_matches_respect_error_only_filter() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha stdout"),
+                test_output_line(OutputStream::Stderr, "alpha stderr"),
+                test_output_line(OutputStream::Stderr, "beta stderr"),
+            ],
+        );
+        dashboard.output_filter = OutputFilter::ErrorsOnly;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+
+        dashboard.recompute_search_matches();
+
+        assert_eq!(
+            dashboard.search_matches,
+            vec![SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 0,
+            }]
+        );
+        assert_eq!(dashboard.visible_output_text(), "alpha stderr\nbeta stderr");
+    }
+
+    #[test]
+    fn search_matches_respect_tool_call_filter() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha normal"),
+                test_output_line(OutputStream::Stdout, "Read(alpha.rs)"),
+                test_output_line(OutputStream::Stdout, "Write(beta.rs)"),
+            ],
+        );
+        dashboard.output_filter = OutputFilter::ToolCallsOnly;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+
+        dashboard.recompute_search_matches();
+
+        assert_eq!(
+            dashboard.search_matches,
+            vec![SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 0,
+            }]
+        );
+        assert_eq!(
+            dashboard.visible_output_text(),
+            "Read(alpha.rs)\nWrite(beta.rs)"
+        );
+    }
+
+    #[test]
+    fn search_matches_respect_file_change_filter() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line(OutputStream::Stdout, "alpha normal"),
+                test_output_line(OutputStream::Stdout, "Updated alpha.rs"),
+                test_output_line(OutputStream::Stdout, "Renamed beta.rs to gamma.rs"),
+            ],
+        );
+        dashboard.output_filter = OutputFilter::FileChangesOnly;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+
+        dashboard.recompute_search_matches();
+
+        assert_eq!(
+            dashboard.search_matches,
+            vec![SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 0,
+            }]
+        );
+        assert_eq!(
+            dashboard.visible_output_text(),
+            "Updated alpha.rs\nRenamed beta.rs to gamma.rs"
+        );
+    }
+
+    #[test]
+    fn cycle_output_time_filter_keeps_only_recent_lines() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line_minutes_ago(OutputStream::Stdout, "recent line", 5),
+                test_output_line_minutes_ago(OutputStream::Stdout, "older line", 45),
+                test_output_line_minutes_ago(OutputStream::Stdout, "stale line", 180),
+            ],
+        );
+
+        dashboard.cycle_output_time_filter();
+
+        assert_eq!(
+            dashboard.output_time_filter,
+            OutputTimeFilter::Last15Minutes
+        );
+        assert_eq!(dashboard.visible_output_text(), "recent line");
+        assert_eq!(dashboard.output_title(), " Output last 15m ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("output time filter set to last 15m")
+        );
+    }
+
+    #[test]
+    fn search_matches_respect_time_filter() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                None,
+                1,
+                1,
+            )],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![
+                test_output_line_minutes_ago(OutputStream::Stdout, "alpha recent", 10),
+                test_output_line_minutes_ago(OutputStream::Stdout, "beta recent", 10),
+                test_output_line_minutes_ago(OutputStream::Stdout, "alpha stale", 180),
+            ],
+        );
+        dashboard.output_time_filter = OutputTimeFilter::Last15Minutes;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+
+        dashboard.recompute_search_matches();
+
+        assert_eq!(
+            dashboard.search_matches,
+            vec![SearchMatch {
+                session_id: "focus-12345678".to_string(),
+                line_index: 0,
+            }]
+        );
+        assert_eq!(dashboard.visible_output_text(), "alpha recent\nbeta recent");
+    }
+
+    #[test]
+    fn search_scope_all_sessions_matches_across_output_buffers() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session(
+                    "focus-12345678",
+                    "planner",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+                sample_session(
+                    "review-87654321",
+                    "reviewer",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+            ],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha local")],
+        );
+        dashboard.session_output_cache.insert(
+            "review-87654321".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha global")],
+        );
+        dashboard.search_query = Some("alpha.*".to_string());
+
+        dashboard.toggle_search_scope();
+
+        assert_eq!(dashboard.search_scope, SearchScope::AllSessions);
+        assert_eq!(
+            dashboard.search_matches,
+            vec![
+                SearchMatch {
+                    session_id: "focus-12345678".to_string(),
+                    line_index: 0,
+                },
+                SearchMatch {
+                    session_id: "review-87654321".to_string(),
+                    line_index: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("search scope set to all sessions | 2 match(es)")
+        );
+        assert_eq!(
+            dashboard.output_title(),
+            " Output all sessions /alpha.* 1/2 "
+        );
+    }
+
+    #[test]
+    fn next_search_match_switches_selected_session_in_all_sessions_scope() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session(
+                    "focus-12345678",
+                    "planner",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+                sample_session(
+                    "review-87654321",
+                    "reviewer",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+            ],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha local")],
+        );
+        dashboard.session_output_cache.insert(
+            "review-87654321".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha global")],
+        );
+        dashboard.search_scope = SearchScope::AllSessions;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.last_output_height = 1;
+        dashboard.recompute_search_matches();
+
+        dashboard.next_search_match();
+
+        assert_eq!(dashboard.selected_session_id(), Some("review-87654321"));
+        assert_eq!(dashboard.selected_search_match, 1);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("search /alpha.* match 2/2 | all sessions")
+        );
+    }
+
+    #[test]
+    fn search_agent_filter_selected_agent_type_limits_global_search() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session(
+                    "focus-12345678",
+                    "planner",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+                sample_session(
+                    "planner-2222222",
+                    "planner",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+                sample_session(
+                    "review-87654321",
+                    "reviewer",
+                    SessionState::Running,
+                    None,
+                    1,
+                    1,
+                ),
+            ],
+            0,
+        );
+        dashboard.session_output_cache.insert(
+            "focus-12345678".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha local")],
+        );
+        dashboard.session_output_cache.insert(
+            "planner-2222222".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha planner")],
+        );
+        dashboard.session_output_cache.insert(
+            "review-87654321".to_string(),
+            vec![test_output_line(OutputStream::Stdout, "alpha reviewer")],
+        );
+        dashboard.search_scope = SearchScope::AllSessions;
+        dashboard.search_query = Some("alpha.*".to_string());
+        dashboard.recompute_search_matches();
+
+        dashboard.toggle_search_agent_filter();
+
+        assert_eq!(
+            dashboard.search_agent_filter,
+            SearchAgentFilter::SelectedAgentType
+        );
+        assert_eq!(
+            dashboard.search_matches,
+            vec![
+                SearchMatch {
+                    session_id: "focus-12345678".to_string(),
+                    line_index: 0,
+                },
+                SearchMatch {
+                    session_id: "planner-2222222".to_string(),
+                    line_index: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("search agent filter set to agent planner | 2 match(es)")
+        );
+        assert_eq!(
+            dashboard.output_title(),
+            " Output all sessions agent planner /alpha.* 1/2 "
+        );
     }
 
     #[tokio::test]
@@ -4439,6 +6620,116 @@ diff --git a/src/next.rs b/src/next.rs
     }
 
     #[test]
+    fn auto_split_layout_after_spawn_prefers_vertical_for_two_live_sessions() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session("running-1", "planner", SessionState::Running, None, 1, 1),
+                sample_session("idle-1", "planner", SessionState::Idle, None, 1, 1),
+            ],
+            0,
+        );
+
+        let note = dashboard.auto_split_layout_after_spawn_with_save(
+            2,
+            Path::new("/tmp/ecc2-noop.toml"),
+            |_| Ok(()),
+        );
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Vertical);
+        assert_eq!(
+            dashboard.pane_size_percent,
+            dashboard.cfg.linear_pane_size_percent
+        );
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+        assert_eq!(
+            note.as_deref(),
+            Some("auto-split vertical layout for 2 live session(s)")
+        );
+    }
+
+    #[test]
+    fn auto_split_layout_after_spawn_prefers_grid_for_three_live_sessions() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session("pending-1", "planner", SessionState::Pending, None, 1, 1),
+                sample_session("running-1", "planner", SessionState::Running, None, 1, 1),
+                sample_session("idle-1", "planner", SessionState::Idle, None, 1, 1),
+            ],
+            1,
+        );
+        dashboard.selected_pane = Pane::Output;
+
+        let note = dashboard.auto_split_layout_after_spawn_with_save(
+            2,
+            Path::new("/tmp/ecc2-noop.toml"),
+            |_| Ok(()),
+        );
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Grid);
+        assert_eq!(
+            dashboard.pane_size_percent,
+            dashboard.cfg.grid_pane_size_percent
+        );
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+        assert_eq!(
+            note.as_deref(),
+            Some("auto-split grid layout for 3 live session(s)")
+        );
+    }
+
+    #[test]
+    fn auto_split_layout_after_spawn_focuses_sessions_when_layout_already_matches() {
+        let mut dashboard = test_dashboard(
+            vec![
+                sample_session("pending-1", "planner", SessionState::Pending, None, 1, 1),
+                sample_session("running-1", "planner", SessionState::Running, None, 1, 1),
+                sample_session("idle-1", "planner", SessionState::Idle, None, 1, 1),
+            ],
+            1,
+        );
+        dashboard.cfg.pane_layout = PaneLayout::Grid;
+        dashboard.selected_pane = Pane::Output;
+
+        let note = dashboard.auto_split_layout_after_spawn_with_save(
+            3,
+            Path::new("/tmp/ecc2-noop.toml"),
+            |_| Ok(()),
+        );
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Grid);
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+        assert_eq!(
+            note.as_deref(),
+            Some("auto-focused sessions in grid layout for 3 live session(s)")
+        );
+    }
+
+    #[test]
+    fn post_spawn_selection_prefers_lead_for_multi_spawn() {
+        let preferred = post_spawn_selection_id(
+            Some("lead-12345678"),
+            &["child-a".to_string(), "child-b".to_string()],
+        );
+
+        assert_eq!(preferred.as_deref(), Some("lead-12345678"));
+    }
+
+    #[test]
+    fn post_spawn_selection_keeps_single_spawn_on_created_session() {
+        let preferred = post_spawn_selection_id(Some("lead-12345678"), &["child-a".to_string()]);
+
+        assert_eq!(preferred.as_deref(), Some("child-a"));
+    }
+
+    #[test]
+    fn post_spawn_selection_falls_back_to_first_created_when_no_lead_exists() {
+        let preferred =
+            post_spawn_selection_id(None, &["child-a".to_string(), "child-b".to_string()]);
+
+        assert_eq!(preferred.as_deref(), Some("child-a"));
+    }
+
+    #[test]
     fn toggle_theme_persists_config() {
         let mut dashboard = test_dashboard(Vec::new(), 0);
         let tempdir = std::env::temp_dir().join(format!("ecc2-theme-policy-{}", Uuid::new_v4()));
@@ -4473,6 +6764,22 @@ diff --git a/src/next.rs b/src/next.rs
         assert_eq!(dashboard.theme_palette().row_highlight_bg, Color::Gray);
     }
 
+    fn test_output_line(stream: OutputStream, text: &str) -> OutputLine {
+        OutputLine::new(stream, text, Utc::now().to_rfc3339())
+    }
+
+    fn test_output_line_minutes_ago(
+        stream: OutputStream,
+        text: &str,
+        minutes_ago: i64,
+    ) -> OutputLine {
+        OutputLine::new(
+            stream,
+            text,
+            (Utc::now() - chrono::Duration::minutes(minutes_ago)).to_rfc3339(),
+        )
+    }
+
     fn test_dashboard(sessions: Vec<Session>, selected_session: usize) -> Dashboard {
         let selected_session = selected_session.min(sessions.len().saturating_sub(1));
         let cfg = Config::default();
@@ -4492,6 +6799,8 @@ diff --git a/src/next.rs b/src/next.rs
             sessions,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
+            approval_queue_counts: HashMap::new(),
+            approval_queue_preview: Vec::new(),
             handoff_backlog_counts: HashMap::new(),
             worktree_health_by_session: HashMap::new(),
             global_handoff_backlog_leads: 0,
@@ -4509,6 +6818,8 @@ diff --git a/src/next.rs b/src/next.rs
             selected_conflict_protocol: None,
             selected_merge_readiness: None,
             output_mode: OutputMode::SessionOutput,
+            output_filter: OutputFilter::All,
+            output_time_filter: OutputTimeFilter::AllTime,
             selected_pane: Pane::Sessions,
             selected_session,
             show_help: false,
@@ -4516,6 +6827,13 @@ diff --git a/src/next.rs b/src/next.rs
             output_follow: true,
             output_scroll_offset: 0,
             last_output_height: 0,
+            search_input: None,
+            spawn_input: None,
+            search_query: None,
+            search_scope: SearchScope::SelectedSession,
+            search_agent_filter: SearchAgentFilter::AllAgents,
+            search_matches: Vec::new(),
+            selected_search_match: 0,
             session_table_state,
         }
     }
