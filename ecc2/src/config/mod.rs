@@ -33,8 +33,10 @@ pub struct BudgetAlertThresholds {
 pub struct Config {
     pub db_path: PathBuf,
     pub worktree_root: PathBuf,
+    pub worktree_branch_prefix: String,
     pub max_parallel_sessions: usize,
     pub max_parallel_worktrees: usize,
+    pub worktree_retention_secs: u64,
     pub session_timeout_secs: u64,
     pub heartbeat_interval_secs: u64,
     pub auto_terminate_stale_sessions: bool,
@@ -67,6 +69,11 @@ pub struct PaneNavigationConfig {
     pub move_right: String,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ProjectWorktreeConfigOverride {
+    max_parallel_worktrees: Option<usize>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneNavigationAction {
     FocusSlot(usize),
@@ -88,8 +95,10 @@ impl Default for Config {
         Self {
             db_path: home.join(".claude").join("ecc2.db"),
             worktree_root: PathBuf::from("/tmp/ecc-worktrees"),
+            worktree_branch_prefix: "ecc".to_string(),
             max_parallel_sessions: 8,
             max_parallel_worktrees: 6,
+            worktree_retention_secs: 0,
             session_timeout_secs: 3600,
             heartbeat_interval_secs: 30,
             auto_terminate_stale_sessions: false,
@@ -153,14 +162,47 @@ impl Config {
 
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path();
+        let project_path = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| Self::project_config_path_from(&cwd));
+        Self::load_from_paths(&config_path, project_path.as_deref())
+    }
 
-        if config_path.exists() {
-            let content = std::fs::read_to_string(&config_path)?;
-            let config: Config = toml::from_str(&content)?;
-            Ok(config)
+    fn load_from_paths(
+        config_path: &std::path::Path,
+        project_override_path: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let mut config = if config_path.exists() {
+            let content = std::fs::read_to_string(config_path)?;
+            toml::from_str(&content)?
         } else {
-            Ok(Config::default())
+            Config::default()
+        };
+
+        if let Some(project_path) = project_override_path.filter(|path| path.exists()) {
+            let content = std::fs::read_to_string(project_path)?;
+            let overrides: ProjectWorktreeConfigOverride = toml::from_str(&content)?;
+            if let Some(limit) = overrides.max_parallel_worktrees {
+                config.max_parallel_worktrees = limit;
+            }
         }
+
+        Ok(config)
+    }
+
+    fn project_config_path_from(start: &std::path::Path) -> Option<PathBuf> {
+        let global = Self::config_path();
+        let mut current = Some(start);
+
+        while let Some(path) = current {
+            let candidate = path.join(".claude").join("ecc2.toml");
+            if candidate.exists() && candidate != global {
+                return Some(candidate);
+            }
+            current = path.parent();
+        }
+
+        None
     }
 
     pub fn save(&self) -> Result<()> {
@@ -340,6 +382,7 @@ db_path = "/tmp/ecc2.db"
 worktree_root = "/tmp/ecc-worktrees"
 max_parallel_sessions = 8
 max_parallel_worktrees = 6
+worktree_retention_secs = 0
 session_timeout_secs = 3600
 heartbeat_interval_secs = 30
 auto_terminate_stale_sessions = false
@@ -350,6 +393,14 @@ theme = "Dark"
         let config: Config = toml::from_str(legacy_config).unwrap();
         let defaults = Config::default();
 
+        assert_eq!(
+            config.worktree_branch_prefix,
+            defaults.worktree_branch_prefix
+        );
+        assert_eq!(
+            config.worktree_retention_secs,
+            defaults.worktree_retention_secs
+        );
         assert_eq!(config.cost_budget_usd, defaults.cost_budget_usd);
         assert_eq!(config.token_budget, defaults.token_budget);
         assert_eq!(
@@ -404,6 +455,28 @@ theme = "Dark"
         let config: Config = toml::from_str(r#"pane_layout = "grid""#).unwrap();
 
         assert_eq!(config.pane_layout, PaneLayout::Grid);
+    }
+
+    #[test]
+    fn worktree_branch_prefix_deserializes_from_toml() {
+        let config: Config = toml::from_str(r#"worktree_branch_prefix = "bots/ecc""#).unwrap();
+
+        assert_eq!(config.worktree_branch_prefix, "bots/ecc");
+    }
+
+    #[test]
+    fn project_worktree_limit_override_replaces_global_limit() {
+        let tempdir = std::env::temp_dir().join(format!("ecc2-config-{}", Uuid::new_v4()));
+        let global_path = tempdir.join("global.toml");
+        let project_path = tempdir.join("project.toml");
+        std::fs::create_dir_all(&tempdir).unwrap();
+        std::fs::write(&global_path, "max_parallel_worktrees = 6\n").unwrap();
+        std::fs::write(&project_path, "max_parallel_worktrees = 2\n").unwrap();
+
+        let config = Config::load_from_paths(&global_path, Some(&project_path)).unwrap();
+        assert_eq!(config.max_parallel_worktrees, 2);
+
+        let _ = std::fs::remove_dir_all(tempdir);
     }
 
     #[test]
@@ -535,6 +608,7 @@ critical = 1.10
         config.auto_dispatch_limit_per_session = 9;
         config.auto_create_worktrees = false;
         config.auto_merge_ready_worktrees = true;
+        config.worktree_branch_prefix = "bots/ecc".to_string();
         config.budget_alert_thresholds = BudgetAlertThresholds {
             advisory: 0.45,
             warning: 0.70,
@@ -553,6 +627,7 @@ critical = 1.10
         assert_eq!(loaded.auto_dispatch_limit_per_session, 9);
         assert!(!loaded.auto_create_worktrees);
         assert!(loaded.auto_merge_ready_worktrees);
+        assert_eq!(loaded.worktree_branch_prefix, "bots/ecc");
         assert_eq!(
             loaded.budget_alert_thresholds,
             BudgetAlertThresholds {

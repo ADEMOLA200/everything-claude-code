@@ -19,7 +19,7 @@ use crate::session::manager;
 use crate::session::output::{
     OutputEvent, OutputLine, OutputStream, SessionOutputStore, OUTPUT_BUFFER_LIMIT,
 };
-use crate::session::store::{DaemonActivity, StateStore};
+use crate::session::store::{DaemonActivity, FileActivityOverlap, StateStore};
 use crate::session::{FileActivityEntry, Session, SessionMessage, SessionState};
 use crate::worktree;
 
@@ -34,11 +34,13 @@ const PANE_RESIZE_STEP_PERCENT: u16 = 5;
 const MAX_LOG_ENTRIES: u64 = 12;
 const MAX_DIFF_PREVIEW_LINES: usize = 6;
 const MAX_DIFF_PATCH_LINES: usize = 80;
+const MAX_FILE_ACTIVITY_PATCH_LINES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorktreeDiffColumns {
     removals: String,
     additions: String,
+    hunk_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,6 +76,10 @@ pub struct Dashboard {
     selected_diff_summary: Option<String>,
     selected_diff_preview: Vec<String>,
     selected_diff_patch: Option<String>,
+    selected_diff_hunk_offsets_unified: Vec<usize>,
+    selected_diff_hunk_offsets_split: Vec<usize>,
+    selected_diff_hunk: usize,
+    diff_view_mode: DiffViewMode,
     selected_conflict_protocol: Option<String>,
     selected_merge_readiness: Option<worktree::MergeReadiness>,
     output_mode: OutputMode,
@@ -136,6 +142,12 @@ enum OutputMode {
     Timeline,
     WorktreeDiff,
     ConflictProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffViewMode {
+    Split,
+    Unified,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +215,7 @@ struct TimelineEvent {
     session_id: String,
     event_type: TimelineEventType,
     summary: String,
+    detail_lines: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +338,10 @@ impl Dashboard {
             selected_diff_summary: None,
             selected_diff_preview: Vec::new(),
             selected_diff_patch: None,
+            selected_diff_hunk_offsets_unified: Vec::new(),
+            selected_diff_hunk_offsets_split: Vec::new(),
+            selected_diff_hunk: 0,
+            diff_view_mode: DiffViewMode::Split,
             selected_conflict_protocol: None,
             selected_merge_readiness: None,
             output_mode: OutputMode::SessionOutput,
@@ -540,6 +557,7 @@ impl Dashboard {
         if self.sessions.get(self.selected_session).is_some()
             && self.output_mode == OutputMode::WorktreeDiff
             && self.selected_diff_patch.is_some()
+            && self.diff_view_mode == DiffViewMode::Split
         {
             self.render_split_diff_output(frame, area);
             return;
@@ -586,7 +604,7 @@ impl Dashboard {
                         .unwrap_or_else(|| {
                             "No worktree diff available for the selected session.".to_string()
                         });
-                    (" Diff ".to_string(), Text::from(content))
+                    (self.output_title(), Text::from(content))
                 }
                 OutputMode::ConflictProtocol => {
                     let content = self.selected_conflict_protocol.clone().unwrap_or_else(|| {
@@ -616,7 +634,7 @@ impl Dashboard {
     fn render_split_diff_output(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Diff ")
+            .title(self.output_title())
             .border_style(self.pane_border_style(Pane::Output));
         let inner_area = block.inner(area);
         frame.render_widget(block, area);
@@ -654,6 +672,14 @@ impl Dashboard {
                 self.timeline_scope.title_suffix(),
                 self.timeline_event_filter.title_suffix(),
                 self.output_time_filter.title_suffix()
+            );
+        }
+
+        if self.output_mode == OutputMode::WorktreeDiff {
+            return format!(
+                " Diff{}{} ",
+                self.diff_view_mode.title_suffix(),
+                self.diff_hunk_title_suffix()
             );
         }
 
@@ -881,15 +907,31 @@ impl Dashboard {
             self.logs
                 .iter()
                 .map(|entry| {
-                    format!(
-                        "[{}] {} | {}ms | risk {:.0}%\ninput: {}\noutput: {}",
+                    let mut block = format!(
+                        "[{}] {} | {}ms | risk {:.0}%",
                         self.short_timestamp(&entry.timestamp),
                         entry.tool_name,
                         entry.duration_ms,
                         entry.risk_score * 100.0,
+                    );
+                    if !entry.trigger_summary.trim().is_empty() {
+                        block.push_str(&format!(
+                            "\nwhy: {}",
+                            self.log_field(&entry.trigger_summary)
+                        ));
+                    }
+                    if entry.input_params_json.trim() != "{}" {
+                        block.push_str(&format!(
+                            "\nparams: {}",
+                            self.log_field(&entry.input_params_json)
+                        ));
+                    }
+                    block.push_str(&format!(
+                        "\ninput: {}\noutput: {}",
                         self.log_field(&entry.input_summary),
                         self.log_field(&entry.output_summary)
-                    )
+                    ));
+                    block
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n")
@@ -1004,6 +1046,8 @@ impl Dashboard {
             "  y       Toggle selected-session timeline view".to_string(),
             "  E       Cycle timeline event filter".to_string(),
             "  v       Toggle selected worktree diff in output pane".to_string(),
+            "  V       Toggle diff view mode between split and unified".to_string(),
+            "  {/}     Jump to previous/next diff hunk in the active diff view".to_string(),
             "  c       Show conflict-resolution protocol for selected conflicted worktree"
                 .to_string(),
             "  e       Cycle output content filter: all/errors/tool calls/file changes".to_string(),
@@ -1655,10 +1699,21 @@ impl Dashboard {
 
         self.refresh();
         self.sync_selection_by_id(Some(&session_id));
-        self.set_operator_note(format!(
-            "spawned session {}",
-            format_session_id(&session_id)
-        ));
+        let queued_for_worktree = self
+            .db
+            .pending_worktree_queue_contains(&session_id)
+            .unwrap_or(false);
+        if queued_for_worktree {
+            self.set_operator_note(format!(
+                "queued session {} pending worktree slot",
+                format_session_id(&session_id)
+            ));
+        } else {
+            self.set_operator_note(format!(
+                "spawned session {}",
+                format_session_id(&session_id)
+            ));
+        }
         self.reset_output_view();
         self.sync_selected_output();
         self.sync_selected_diff();
@@ -1675,7 +1730,7 @@ impl Dashboard {
                     self.output_mode = OutputMode::WorktreeDiff;
                     self.selected_pane = Pane::Output;
                     self.output_follow = false;
-                    self.output_scroll_offset = 0;
+                    self.output_scroll_offset = self.current_diff_hunk_offset();
                     self.set_operator_note("showing selected worktree diff".to_string());
                 } else {
                     self.set_operator_note("no worktree diff for selected session".to_string());
@@ -1697,6 +1752,54 @@ impl Dashboard {
                 self.set_operator_note("showing session output".to_string());
             }
         }
+    }
+
+    pub fn toggle_diff_view_mode(&mut self) {
+        if self.output_mode != OutputMode::WorktreeDiff || self.selected_diff_patch.is_none() {
+            self.set_operator_note("no active worktree diff view to toggle".to_string());
+            return;
+        }
+
+        self.diff_view_mode = match self.diff_view_mode {
+            DiffViewMode::Split => DiffViewMode::Unified,
+            DiffViewMode::Unified => DiffViewMode::Split,
+        };
+        self.output_follow = false;
+        self.output_scroll_offset = self.current_diff_hunk_offset();
+        self.set_operator_note(format!("diff view set to {}", self.diff_view_mode.label()));
+    }
+
+    pub fn next_diff_hunk(&mut self) {
+        self.move_diff_hunk(1);
+    }
+
+    pub fn prev_diff_hunk(&mut self) {
+        self.move_diff_hunk(-1);
+    }
+
+    fn move_diff_hunk(&mut self, delta: isize) {
+        if self.output_mode != OutputMode::WorktreeDiff || self.selected_diff_patch.is_none() {
+            self.set_operator_note("no active worktree diff to navigate".to_string());
+            return;
+        }
+
+        let (len, next_offset) = {
+            let offsets = self.current_diff_hunk_offsets();
+            if offsets.is_empty() {
+                self.set_operator_note("no diff hunks in bounded preview".to_string());
+                return;
+            }
+
+            let len = offsets.len();
+            let next = (self.selected_diff_hunk as isize + delta).rem_euclid(len as isize) as usize;
+            (len, offsets[next])
+        };
+
+        let next = (self.selected_diff_hunk as isize + delta).rem_euclid(len as isize) as usize;
+        self.selected_diff_hunk = next;
+        self.output_follow = false;
+        self.output_scroll_offset = next_offset;
+        self.set_operator_note(format!("diff hunk {}/{}", next + 1, len));
     }
 
     pub fn toggle_timeline_mode(&mut self) {
@@ -2227,22 +2330,43 @@ impl Dashboard {
     }
 
     pub async fn prune_inactive_worktrees(&mut self) {
-        match manager::prune_inactive_worktrees(&self.db).await {
+        match manager::prune_inactive_worktrees(&self.db, &self.cfg).await {
             Ok(outcome) => {
                 self.refresh();
-                if outcome.cleaned_session_ids.is_empty() {
+                if outcome.cleaned_session_ids.is_empty() && outcome.retained_session_ids.is_empty()
+                {
                     self.set_operator_note("no inactive worktrees to prune".to_string());
-                } else if outcome.active_with_worktree_ids.is_empty() {
+                } else if outcome.cleaned_session_ids.is_empty() {
                     self.set_operator_note(format!(
-                        "pruned {} inactive worktree(s)",
-                        outcome.cleaned_session_ids.len()
+                        "deferred {} inactive worktree(s) within retention",
+                        outcome.retained_session_ids.len()
                     ));
+                } else if outcome.active_with_worktree_ids.is_empty() {
+                    if outcome.retained_session_ids.is_empty() {
+                        self.set_operator_note(format!(
+                            "pruned {} inactive worktree(s)",
+                            outcome.cleaned_session_ids.len()
+                        ));
+                    } else {
+                        self.set_operator_note(format!(
+                            "pruned {} inactive worktree(s); deferred {} within retention",
+                            outcome.cleaned_session_ids.len(),
+                            outcome.retained_session_ids.len()
+                        ));
+                    }
                 } else {
-                    self.set_operator_note(format!(
+                    let mut note = format!(
                         "pruned {} inactive worktree(s); skipped {} active session(s)",
                         outcome.cleaned_session_ids.len(),
                         outcome.active_with_worktree_ids.len()
-                    ));
+                    );
+                    if !outcome.retained_session_ids.is_empty() {
+                        note.push_str(&format!(
+                            "; deferred {} within retention",
+                            outcome.retained_session_ids.len()
+                        ));
+                    }
+                    self.set_operator_note(note);
                 }
             }
             Err(error) => {
@@ -2547,7 +2671,15 @@ impl Dashboard {
         let preferred_selection =
             post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
         self.refresh_after_spawn(preferred_selection.as_deref());
-        let mut note = build_spawn_note(&plan, created_ids.len());
+        let queued_count = created_ids
+            .iter()
+            .filter(|session_id| {
+                self.db
+                    .pending_worktree_queue_contains(session_id)
+                    .unwrap_or(false)
+            })
+            .count();
+        let mut note = build_spawn_note(&plan, created_ids.len(), queued_count);
         if let Some(layout_note) = self.auto_split_layout_after_spawn(created_ids.len()) {
             note.push_str(" | ");
             note.push_str(&layout_note);
@@ -2750,6 +2882,10 @@ impl Dashboard {
                 Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
                 Err(broadcast::error::TryRecvError::Closed) => break,
             }
+        }
+
+        if let Err(error) = manager::activate_pending_worktree_sessions(&self.db, &self.cfg).await {
+            tracing::warn!("Failed to activate queued worktree sessions: {error}");
         }
 
         self.sync_from_store();
@@ -3099,6 +3235,19 @@ impl Dashboard {
                 .ok()
                 .flatten()
         });
+        self.selected_diff_hunk_offsets_unified = self
+            .selected_diff_patch
+            .as_deref()
+            .map(build_unified_diff_hunk_offsets)
+            .unwrap_or_default();
+        self.selected_diff_hunk_offsets_split = self
+            .selected_diff_patch
+            .as_deref()
+            .map(|patch| build_worktree_diff_columns(patch).hunk_offsets)
+            .unwrap_or_default();
+        if self.selected_diff_hunk >= self.current_diff_hunk_offsets().len() {
+            self.selected_diff_hunk = 0;
+        }
         self.selected_merge_readiness =
             worktree.and_then(|worktree| worktree::merge_readiness(worktree).ok());
         self.selected_conflict_protocol = session
@@ -3114,6 +3263,29 @@ impl Dashboard {
             && self.selected_conflict_protocol.is_none()
         {
             self.output_mode = OutputMode::SessionOutput;
+        }
+    }
+
+    fn current_diff_hunk_offsets(&self) -> &[usize] {
+        match self.diff_view_mode {
+            DiffViewMode::Split => &self.selected_diff_hunk_offsets_split,
+            DiffViewMode::Unified => &self.selected_diff_hunk_offsets_unified,
+        }
+    }
+
+    fn current_diff_hunk_offset(&self) -> usize {
+        self.current_diff_hunk_offsets()
+            .get(self.selected_diff_hunk)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn diff_hunk_title_suffix(&self) -> String {
+        let total = self.current_diff_hunk_offsets().len();
+        if total == 0 {
+            String::new()
+        } else {
+            format!(" {}/{}", self.selected_diff_hunk + 1, total)
         }
     }
 
@@ -3410,19 +3582,26 @@ impl Dashboard {
             .into_iter()
             .filter(|event| self.timeline_event_filter.matches(event.event_type))
             .filter(|event| self.output_time_filter.matches_timestamp(event.occurred_at))
-            .map(|event| {
+            .flat_map(|event| {
                 let prefix = if show_session_label {
                     format!("{} ", format_session_id(&event.session_id))
                 } else {
                     String::new()
                 };
-                Line::from(format!(
+                let mut lines = vec![Line::from(format!(
                     "[{}] {}{:<11} {}",
                     event.occurred_at.format("%H:%M:%S"),
                     prefix,
                     event.event_type.label(),
                     event.summary
-                ))
+                ))];
+                lines.extend(
+                    event
+                        .detail_lines
+                        .into_iter()
+                        .map(|line| Line::from(format!("               {}", line))),
+                );
+                lines
             })
             .collect()
     }
@@ -3459,6 +3638,7 @@ impl Dashboard {
                 session.agent_type,
                 truncate_for_dashboard(&session.task, 64)
             ),
+            detail_lines: Vec::new(),
         }];
 
         if session.updated_at > session.created_at {
@@ -3467,6 +3647,7 @@ impl Dashboard {
                 session_id: session.id.clone(),
                 event_type: TimelineEventType::Lifecycle,
                 summary: format!("state {} | updated session metadata", session.state),
+                detail_lines: Vec::new(),
             });
         }
 
@@ -3479,6 +3660,7 @@ impl Dashboard {
                     "attached worktree {} from {}",
                     worktree.branch, worktree.base_branch
                 ),
+                detail_lines: Vec::new(),
             });
         }
 
@@ -3492,6 +3674,7 @@ impl Dashboard {
                 session_id: session.id.clone(),
                 event_type: TimelineEventType::FileChange,
                 summary: format!("files touched {}", session.metrics.files_changed),
+                detail_lines: Vec::new(),
             });
         } else {
             events.extend(file_activity.into_iter().map(|entry| TimelineEvent {
@@ -3499,6 +3682,7 @@ impl Dashboard {
                 session_id: session.id.clone(),
                 event_type: TimelineEventType::FileChange,
                 summary: file_activity_summary(&entry),
+                detail_lines: file_activity_patch_lines(&entry, MAX_FILE_ACTIVITY_PATCH_LINES),
             }));
         }
 
@@ -3525,6 +3709,7 @@ impl Dashboard {
                         64
                     )
                 ),
+                detail_lines: Vec::new(),
             }
         }));
 
@@ -3544,6 +3729,7 @@ impl Dashboard {
                     entry.duration_ms,
                     truncate_for_dashboard(&entry.input_summary, 56)
                 ),
+                detail_lines: tool_log_detail_lines(&entry),
             })
         }));
         events
@@ -4148,6 +4334,25 @@ impl Dashboard {
                         self.short_timestamp(&entry.timestamp.to_rfc3339()),
                         file_activity_summary(&entry)
                     ));
+                    for detail in file_activity_patch_lines(&entry, 2) {
+                        lines.push(format!("  {}", detail));
+                    }
+                }
+            }
+            let file_overlaps = self
+                .db
+                .list_file_overlaps(&session.id, 3)
+                .unwrap_or_default();
+            if !file_overlaps.is_empty() {
+                lines.push("Potential overlaps".to_string());
+                for overlap in file_overlaps {
+                    lines.push(format!(
+                        "- {}",
+                        file_overlap_summary(
+                            &overlap,
+                            &self.short_timestamp(&overlap.timestamp.to_rfc3339())
+                        )
+                    ));
                 }
             }
             lines.push(format!(
@@ -4717,16 +4922,22 @@ fn expand_spawn_tasks(task: &str, count: usize) -> Vec<String> {
         .collect()
 }
 
-fn build_spawn_note(plan: &SpawnPlan, created_count: usize) -> String {
+fn build_spawn_note(plan: &SpawnPlan, created_count: usize, queued_count: usize) -> String {
     let task = truncate_for_dashboard(&plan.task, 72);
-    if plan.spawn_count < plan.requested_count {
+    let mut note = if plan.spawn_count < plan.requested_count {
         format!(
             "spawned {created_count} session(s) for {task} (requested {}, capped at {})",
             plan.requested_count, plan.spawn_count
         )
     } else {
         format!("spawned {created_count} session(s) for {task}")
+    };
+
+    if queued_count > 0 {
+        note.push_str(&format!(" | {queued_count} pending worktree slot"));
     }
+
+    note
 }
 
 fn post_spawn_selection_id(
@@ -4849,6 +5060,22 @@ impl OutputTimeFilter {
             Self::Last15Minutes => " last 15m",
             Self::LastHour => " last 1h",
             Self::Last24Hours => " last 24h",
+        }
+    }
+}
+
+impl DiffViewMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Split => "split",
+            Self::Unified => "unified",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::Split => " split",
+            Self::Unified => " unified",
         }
     }
 }
@@ -5320,6 +5547,7 @@ fn highlight_output_line(
 fn build_worktree_diff_columns(patch: &str) -> WorktreeDiffColumns {
     let mut removals = Vec::new();
     let mut additions = Vec::new();
+    let mut hunk_offsets = Vec::new();
 
     for line in patch.lines() {
         if line.is_empty() {
@@ -5343,6 +5571,9 @@ fn build_worktree_diff_columns(patch: &str) -> WorktreeDiffColumns {
         }
 
         if line.starts_with("diff --git ") || line.starts_with("@@") {
+            if line.starts_with("@@") {
+                hunk_offsets.push(removals.len().max(additions.len()));
+            }
             removals.push(line.to_string());
             additions.push(line.to_string());
             continue;
@@ -5370,7 +5601,16 @@ fn build_worktree_diff_columns(patch: &str) -> WorktreeDiffColumns {
         } else {
             additions.join("\n")
         },
+        hunk_offsets,
     }
+}
+
+fn build_unified_diff_hunk_offsets(patch: &str) -> Vec<usize> {
+    patch
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| line.starts_with("@@").then_some(index))
+        .collect()
 }
 
 fn session_state_label(state: &SessionState) -> &'static str {
@@ -5398,27 +5638,73 @@ fn session_state_color(state: &SessionState) -> Color {
 }
 
 fn file_activity_summary(entry: &FileActivityEntry) -> String {
-    format!(
+    let mut summary = format!(
         "{} {}",
-        file_activity_verb(&entry.tool_name),
+        file_activity_verb(entry.action.clone()),
         truncate_for_dashboard(&entry.path, 72)
+    );
+
+    if let Some(diff_preview) = entry.diff_preview.as_ref() {
+        summary.push_str(" | ");
+        summary.push_str(&truncate_for_dashboard(diff_preview, 56));
+    }
+
+    summary
+}
+
+fn file_activity_patch_lines(entry: &FileActivityEntry, max_lines: usize) -> Vec<String> {
+    entry
+        .patch_preview
+        .as_deref()
+        .map(|patch| {
+            patch
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty() && *line != "@@" && *line != "+" && *line != "-")
+                .take(max_lines)
+                .map(|line| truncate_for_dashboard(line, 72))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn file_overlap_summary(entry: &FileActivityOverlap, timestamp: &str) -> String {
+    format!(
+        "{} {} | {} {} as {} | {}",
+        file_activity_verb(entry.current_action.clone()),
+        truncate_for_dashboard(&entry.path, 48),
+        entry.other_session_state,
+        format_session_id(&entry.other_session_id),
+        file_activity_verb(entry.other_action.clone()),
+        timestamp
     )
 }
 
-fn file_activity_verb(tool_name: &str) -> &'static str {
-    let tool_name = tool_name.trim().to_ascii_lowercase();
-    if tool_name.contains("read") {
-        "read"
-    } else if tool_name.contains("write") {
-        "write"
-    } else if tool_name.contains("edit") {
-        "edit"
-    } else if tool_name.contains("delete") || tool_name.contains("remove") {
-        "delete"
-    } else if tool_name.contains("move") || tool_name.contains("rename") {
-        "move"
-    } else {
-        "touch"
+fn tool_log_detail_lines(entry: &ToolLogEntry) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !entry.trigger_summary.trim().is_empty() {
+        lines.push(format!(
+            "why {}",
+            truncate_for_dashboard(&entry.trigger_summary, 72)
+        ));
+    }
+    if entry.input_params_json.trim() != "{}" {
+        lines.push(format!(
+            "params {}",
+            truncate_for_dashboard(&entry.input_params_json, 72)
+        ));
+    }
+    lines
+}
+
+fn file_activity_verb(action: crate::session::FileActivityAction) -> &'static str {
+    match action {
+        crate::session::FileActivityAction::Read => "read",
+        crate::session::FileActivityAction::Create => "create",
+        crate::session::FileActivityAction::Modify => "modify",
+        crate::session::FileActivityAction::Move => "move",
+        crate::session::FileActivityAction::Delete => "delete",
+        crate::session::FileActivityAction::Touch => "touch",
     }
 }
 
@@ -5955,6 +6241,95 @@ mod tests {
     }
 
     #[test]
+    fn toggle_diff_view_mode_switches_to_unified_rendering() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+        let patch = "--- Branch diff vs main ---\n\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-old line\n\
++new line"
+            .to_string();
+        dashboard.selected_diff_summary = Some("1 file changed".to_string());
+        dashboard.selected_diff_patch = Some(patch.clone());
+        dashboard.selected_diff_hunk_offsets_split =
+            build_worktree_diff_columns(&patch).hunk_offsets;
+        dashboard.selected_diff_hunk_offsets_unified = build_unified_diff_hunk_offsets(&patch);
+        dashboard.toggle_output_mode();
+
+        dashboard.toggle_diff_view_mode();
+
+        assert_eq!(dashboard.diff_view_mode, DiffViewMode::Unified);
+        assert_eq!(dashboard.output_title(), " Diff unified 1/1 ");
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("diff view set to unified")
+        );
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("Diff unified 1/1"));
+        assert!(rendered.contains("@@ -1 +1 @@"));
+        assert!(rendered.contains("-old line"));
+        assert!(rendered.contains("+new line"));
+        assert!(!rendered.contains("Removals"));
+        assert!(!rendered.contains("Additions"));
+    }
+
+    #[test]
+    fn diff_hunk_navigation_updates_scroll_offset_and_wraps() {
+        let mut dashboard = test_dashboard(
+            vec![sample_session(
+                "focus-12345678",
+                "planner",
+                SessionState::Running,
+                Some("ecc/focus"),
+                512,
+                42,
+            )],
+            0,
+        );
+        let patch = "--- Branch diff vs main ---\n\
+diff --git a/src/lib.rs b/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-old line\n\
++new line\n\
+@@ -5 +5 @@\n\
+-second old\n\
++second new"
+            .to_string();
+        dashboard.selected_diff_patch = Some(patch.clone());
+        let split_offsets = build_worktree_diff_columns(&patch).hunk_offsets;
+        dashboard.selected_diff_hunk_offsets_split = split_offsets.clone();
+        dashboard.selected_diff_hunk_offsets_unified = build_unified_diff_hunk_offsets(&patch);
+        dashboard.output_mode = OutputMode::WorktreeDiff;
+
+        dashboard.next_diff_hunk();
+        assert_eq!(dashboard.selected_diff_hunk, 1);
+        assert_eq!(dashboard.output_scroll_offset, split_offsets[1]);
+        assert_eq!(dashboard.output_title(), " Diff split 2/2 ");
+        assert_eq!(dashboard.operator_note.as_deref(), Some("diff hunk 2/2"));
+
+        dashboard.next_diff_hunk();
+        assert_eq!(dashboard.selected_diff_hunk, 0);
+        assert_eq!(dashboard.output_scroll_offset, split_offsets[0]);
+        assert_eq!(dashboard.output_title(), " Diff split 1/2 ");
+        assert_eq!(dashboard.operator_note.as_deref(), Some("diff hunk 1/2"));
+
+        dashboard.prev_diff_hunk();
+        assert_eq!(dashboard.selected_diff_hunk, 1);
+        assert_eq!(dashboard.output_scroll_offset, split_offsets[1]);
+        assert_eq!(dashboard.operator_note.as_deref(), Some("diff hunk 2/2"));
+    }
+
+    #[test]
     fn toggle_timeline_mode_renders_selected_session_events() {
         let now = Utc::now();
         let mut session = sample_session(
@@ -5986,7 +6361,9 @@ mod tests {
                 "focus-12345678",
                 "bash",
                 "cargo test -q",
+                "{\"command\":\"cargo test -q\"}",
                 "ok",
+                "stabilize planner session",
                 240,
                 0.2,
                 &(now - chrono::Duration::minutes(3)).to_rfc3339(),
@@ -6005,6 +6382,8 @@ mod tests {
         assert!(rendered.contains("created session as planner"));
         assert!(rendered.contains("received query lead-123"));
         assert!(rendered.contains("tool bash"));
+        assert!(rendered.contains("why stabilize planner session"));
+        assert!(rendered.contains("params {\"command\":\"cargo test -q\"}"));
         assert!(rendered.contains("files touched 3"));
     }
 
@@ -6040,7 +6419,9 @@ mod tests {
                 "focus-12345678",
                 "bash",
                 "cargo test -q",
+                "{}",
                 "ok",
+                "",
                 240,
                 0.2,
                 &(now - chrono::Duration::minutes(3)).to_rfc3339(),
@@ -6091,7 +6472,7 @@ mod tests {
             &metrics_path,
             concat!(
                 "{\"id\":\"evt-1\",\"session_id\":\"focus-12345678\",\"tool_name\":\"Read\",\"input_summary\":\"Read src/lib.rs\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
-                "{\"id\":\"evt-2\",\"session_id\":\"focus-12345678\",\"tool_name\":\"Write\",\"input_summary\":\"Write README.md\",\"output_summary\":\"updated readme\",\"file_paths\":[\"README.md\"],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
+                "{\"id\":\"evt-2\",\"session_id\":\"focus-12345678\",\"tool_name\":\"Write\",\"input_summary\":\"Write README.md\",\"output_summary\":\"updated readme\",\"file_paths\":[\"README.md\"],\"file_events\":[{\"path\":\"README.md\",\"action\":\"create\",\"diff_preview\":\"+ # ECC 2.0\",\"patch_preview\":\"+ # ECC 2.0\\n+ \\n+ A richer dashboard\"}],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
             ),
         )?;
         dashboard.db.sync_tool_activity_metrics(&metrics_path)?;
@@ -6100,13 +6481,69 @@ mod tests {
         dashboard.toggle_timeline_mode();
         let rendered = dashboard.rendered_output_text(180, 30);
         assert!(rendered.contains("read src/lib.rs"));
-        assert!(rendered.contains("write README.md"));
+        assert!(rendered.contains("create README.md"));
+        assert!(rendered.contains("+ # ECC 2.0"));
+        assert!(rendered.contains("+ A richer dashboard"));
         assert!(!rendered.contains("files touched 2"));
 
         let metrics_text = dashboard.selected_session_metrics_text();
         assert!(metrics_text.contains("Recent file activity"));
-        assert!(metrics_text.contains("write README.md"));
+        assert!(metrics_text.contains("create README.md"));
+        assert!(metrics_text.contains("+ # ECC 2.0"));
+        assert!(metrics_text.contains("+ A richer dashboard"));
         assert!(metrics_text.contains("read src/lib.rs"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn metrics_text_surfaces_file_activity_overlaps() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("ecc2-file-overlaps-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root)?;
+        let now = Utc::now();
+        let mut focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/focus"),
+            512,
+            42,
+        );
+        focus.created_at = now - chrono::Duration::hours(1);
+        focus.updated_at = now - chrono::Duration::minutes(3);
+
+        let mut delegate = sample_session(
+            "delegate-87654321",
+            "coder",
+            SessionState::Idle,
+            Some("ecc/delegate"),
+            256,
+            12,
+        );
+        delegate.created_at = now - chrono::Duration::minutes(50);
+        delegate.updated_at = now - chrono::Duration::minutes(2);
+
+        let mut dashboard = test_dashboard(vec![focus.clone(), delegate.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&delegate)?;
+
+        let metrics_path = root.join("tool-usage.jsonl");
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"focus-12345678\",\"tool_name\":\"Edit\",\"input_summary\":\"Edit src/lib.rs\",\"output_summary\":\"updated lib\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"delegate-87654321\",\"tool_name\":\"Write\",\"input_summary\":\"Write src/lib.rs\",\"output_summary\":\"touched lib\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
+            ),
+        )?;
+        dashboard.db.sync_tool_activity_metrics(&metrics_path)?;
+        dashboard.sync_from_store();
+
+        let metrics_text = dashboard.selected_session_metrics_text();
+        assert!(metrics_text.contains("Potential overlaps"));
+        assert!(metrics_text.contains("modify src/lib.rs"));
+        assert!(metrics_text.contains("idle delegate"));
+        assert!(metrics_text.contains("as modify"));
 
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -6134,7 +6571,9 @@ mod tests {
                 "focus-12345678",
                 "bash",
                 "cargo test -q",
+                "{}",
                 "ok",
+                "",
                 240,
                 0.2,
                 &(now - chrono::Duration::minutes(3)).to_rfc3339(),
@@ -6193,7 +6632,9 @@ mod tests {
                 "focus-12345678",
                 "bash",
                 "cargo test -q",
+                "{}",
                 "ok",
+                "",
                 240,
                 0.2,
                 &(now - chrono::Duration::minutes(4)).to_rfc3339(),
@@ -6205,7 +6646,9 @@ mod tests {
                 "review-87654321",
                 "git",
                 "git status --short",
+                "{}",
                 "ok",
+                "",
                 120,
                 0.1,
                 &(now - chrono::Duration::minutes(2)).to_rfc3339(),
@@ -8551,6 +8994,55 @@ diff --git a/src/next.rs b/src/next.rs
         Ok(())
     }
 
+    #[tokio::test]
+    async fn prune_inactive_worktrees_reports_retained_sessions_within_retention() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!("ecc2-dashboard-{}.db", Uuid::new_v4()));
+        let db = StateStore::open(&db_path)?;
+        let now = Utc::now();
+        let retained_path = std::env::temp_dir().join(format!("ecc2-retained-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&retained_path)?;
+
+        db.insert_session(&Session {
+            id: "stopped-1".to_string(),
+            task: "retain me".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: retained_path.clone(),
+            state: SessionState::Stopped,
+            pid: None,
+            worktree: Some(WorktreeInfo {
+                path: retained_path.clone(),
+                branch: "ecc/stopped-1".to_string(),
+                base_branch: "main".to_string(),
+            }),
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let mut cfg = Config::default();
+        cfg.db_path = db_path.clone();
+        cfg.worktree_retention_secs = 3600;
+
+        let dashboard_store = StateStore::open(&db_path)?;
+        let mut dashboard = Dashboard::new(dashboard_store, cfg);
+        dashboard.prune_inactive_worktrees().await;
+
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("deferred 1 inactive worktree(s) within retention")
+        );
+        assert!(db
+            .get_session("stopped-1")?
+            .expect("stopped session should exist")
+            .worktree
+            .is_some());
+
+        let _ = std::fs::remove_dir_all(retained_path);
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn merge_selected_worktree_sets_operator_note_when_ready() -> Result<()> {
         let tempdir = std::env::temp_dir().join(format!("dashboard-merge-{}", Uuid::new_v4()));
@@ -9403,6 +9895,10 @@ diff --git a/src/next.rs b/src/next.rs
             selected_diff_summary: None,
             selected_diff_preview: Vec::new(),
             selected_diff_patch: None,
+            selected_diff_hunk_offsets_unified: Vec::new(),
+            selected_diff_hunk_offsets_split: Vec::new(),
+            selected_diff_hunk: 0,
+            diff_view_mode: DiffViewMode::Split,
             selected_conflict_protocol: None,
             selected_merge_readiness: None,
             output_mode: OutputMode::SessionOutput,
@@ -9439,8 +9935,10 @@ diff --git a/src/next.rs b/src/next.rs
         Config {
             db_path: root.join("state.db"),
             worktree_root: root.join("worktrees"),
+            worktree_branch_prefix: "ecc".to_string(),
             max_parallel_sessions: 4,
             max_parallel_worktrees: 4,
+            worktree_retention_secs: 0,
             session_timeout_secs: 60,
             heartbeat_interval_secs: 5,
             auto_terminate_stale_sessions: false,

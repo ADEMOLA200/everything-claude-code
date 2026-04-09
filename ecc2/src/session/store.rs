@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -11,10 +12,30 @@ use crate::config::Config;
 use crate::observability::{ToolCallEvent, ToolLogEntry, ToolLogPage};
 
 use super::output::{OutputLine, OutputStream, OUTPUT_BUFFER_LIMIT};
-use super::{FileActivityEntry, Session, SessionMessage, SessionMetrics, SessionState};
+use super::{
+    FileActivityAction, FileActivityEntry, Session, SessionMessage, SessionMetrics, SessionState,
+    WorktreeInfo,
+};
 
 pub struct StateStore {
     conn: Connection,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingWorktreeRequest {
+    pub session_id: String,
+    pub repo_root: PathBuf,
+    pub _requested_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileActivityOverlap {
+    pub path: String,
+    pub current_action: FileActivityAction,
+    pub other_action: FileActivityAction,
+    pub other_session_id: String,
+    pub other_session_state: SessionState,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -142,11 +163,14 @@ impl StateStore {
                 session_id TEXT NOT NULL REFERENCES sessions(id),
                 tool_name TEXT NOT NULL,
                 input_summary TEXT,
+                input_params_json TEXT NOT NULL DEFAULT '{}',
                 output_summary TEXT,
+                trigger_summary TEXT NOT NULL DEFAULT '',
                 duration_ms INTEGER,
                 risk_score REAL DEFAULT 0.0,
                 timestamp TEXT NOT NULL,
-                file_paths_json TEXT NOT NULL DEFAULT '[]'
+                file_paths_json TEXT NOT NULL DEFAULT '[]',
+                file_events_json TEXT NOT NULL DEFAULT '[]'
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -165,6 +189,12 @@ impl StateStore {
                 stream TEXT NOT NULL,
                 line TEXT NOT NULL,
                 timestamp TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_worktree_queue (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                repo_root TEXT NOT NULL,
+                requested_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS daemon_activity (
@@ -199,6 +229,8 @@ impl StateStore {
             CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_session, read);
             CREATE INDEX IF NOT EXISTS idx_session_output_session
                 ON session_output(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_pending_worktree_queue_requested_at
+                ON pending_worktree_queue(requested_at, session_id);
 
             INSERT OR IGNORE INTO daemon_activity (id) VALUES (1);
             ",
@@ -268,6 +300,33 @@ impl StateStore {
                     [],
                 )
                 .context("Failed to add file_paths_json column to tool_log table")?;
+        }
+
+        if !self.has_column("tool_log", "file_events_json")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE tool_log ADD COLUMN file_events_json TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                )
+                .context("Failed to add file_events_json column to tool_log table")?;
+        }
+
+        if !self.has_column("tool_log", "input_params_json")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE tool_log ADD COLUMN input_params_json TEXT NOT NULL DEFAULT '{}'",
+                    [],
+                )
+                .context("Failed to add input_params_json column to tool_log table")?;
+        }
+
+        if !self.has_column("tool_log", "trigger_summary")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE tool_log ADD COLUMN trigger_summary TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .context("Failed to add trigger_summary column to tool_log table")?;
         }
 
         if !self.has_column("daemon_activity", "last_dispatch_deferred")? {
@@ -532,15 +591,29 @@ impl StateStore {
     }
 
     pub fn clear_worktree(&self, session_id: &str) -> Result<()> {
+        let working_dir: String = self.conn.query_row(
+            "SELECT working_dir FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        self.clear_worktree_to_dir(session_id, Path::new(&working_dir))
+    }
+
+    pub fn clear_worktree_to_dir(&self, session_id: &str, working_dir: &Path) -> Result<()> {
         let updated = self.conn.execute(
             "UPDATE sessions
-             SET worktree_path = NULL,
+             SET working_dir = ?1,
+                 worktree_path = NULL,
                  worktree_branch = NULL,
                  worktree_base = NULL,
-                 updated_at = ?1,
-                 last_heartbeat_at = ?1
-             WHERE id = ?2",
-            rusqlite::params![chrono::Utc::now().to_rfc3339(), session_id],
+                 updated_at = ?2,
+                 last_heartbeat_at = ?2
+             WHERE id = ?3",
+            rusqlite::params![
+                working_dir.to_string_lossy().to_string(),
+                chrono::Utc::now().to_rfc3339(),
+                session_id
+            ],
         )?;
 
         if updated == 0 {
@@ -548,6 +621,90 @@ impl StateStore {
         }
 
         Ok(())
+    }
+
+    pub fn attach_worktree(&self, session_id: &str, worktree: &WorktreeInfo) -> Result<()> {
+        let updated = self.conn.execute(
+            "UPDATE sessions
+             SET working_dir = ?1,
+                 worktree_path = ?2,
+                 worktree_branch = ?3,
+                 worktree_base = ?4,
+                 updated_at = ?5,
+                 last_heartbeat_at = ?5
+             WHERE id = ?6",
+            rusqlite::params![
+                worktree.path.to_string_lossy().to_string(),
+                worktree.path.to_string_lossy().to_string(),
+                worktree.branch,
+                worktree.base_branch,
+                chrono::Utc::now().to_rfc3339(),
+                session_id
+            ],
+        )?;
+
+        if updated == 0 {
+            anyhow::bail!("Session not found: {session_id}");
+        }
+
+        Ok(())
+    }
+
+    pub fn enqueue_pending_worktree(&self, session_id: &str, repo_root: &Path) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pending_worktree_queue (session_id, repo_root, requested_at)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                session_id,
+                repo_root.to_string_lossy().to_string(),
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn dequeue_pending_worktree(&self, session_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pending_worktree_queue WHERE session_id = ?1",
+            [session_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn pending_worktree_queue_contains(&self, session_id: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM pending_worktree_queue WHERE session_id = ?1",
+                [session_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    pub fn pending_worktree_queue(&self, limit: usize) -> Result<Vec<PendingWorktreeRequest>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, repo_root, requested_at
+             FROM pending_worktree_queue
+             ORDER BY requested_at ASC, session_id ASC
+             LIMIT ?1",
+        )?;
+
+        let rows = stmt
+            .query_map([limit as i64], |row| {
+                let requested_at: String = row.get(2)?;
+                Ok(PendingWorktreeRequest {
+                    session_id: row.get(0)?,
+                    repo_root: PathBuf::from(row.get::<_, String>(1)?),
+                    _requested_at: chrono::DateTime::parse_from_rfc3339(&requested_at)
+                        .unwrap_or_default()
+                        .with_timezone(&chrono::Utc),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        Ok(rows)
     }
 
     pub fn update_metrics(&self, session_id: &str, metrics: &SessionMetrics) -> Result<()> {
@@ -731,6 +888,8 @@ impl StateStore {
             tool_name: String,
             #[serde(default)]
             input_summary: String,
+            #[serde(default = "default_input_params_json")]
+            input_params_json: String,
             #[serde(default)]
             output_summary: String,
             #[serde(default)]
@@ -738,7 +897,19 @@ impl StateStore {
             #[serde(default)]
             file_paths: Vec<String>,
             #[serde(default)]
+            file_events: Vec<ToolActivityFileEvent>,
+            #[serde(default)]
             timestamp: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ToolActivityFileEvent {
+            path: String,
+            action: String,
+            #[serde(default)]
+            diff_preview: Option<String>,
+            #[serde(default)]
+            patch_preview: Option<String>,
         }
 
         let file = File::open(metrics_path)
@@ -746,6 +917,11 @@ impl StateStore {
         let reader = BufReader::new(file);
         let mut aggregates: HashMap<String, ActivityAggregate> = HashMap::new();
         let mut seen_event_ids = HashSet::new();
+        let session_tasks = self
+            .list_sessions()?
+            .into_iter()
+            .map(|session| (session.id, session.task))
+            .collect::<HashMap<_, _>>();
 
         for line in reader.lines() {
             let line = line?;
@@ -773,8 +949,39 @@ impl StateStore {
                 .map(|path| path.trim().to_string())
                 .filter(|path| !path.is_empty())
                 .collect();
+            let file_events: Vec<PersistedFileEvent> = if row.file_events.is_empty() {
+                file_paths
+                    .iter()
+                    .cloned()
+                    .map(|path| PersistedFileEvent {
+                        path,
+                        action: infer_file_activity_action(&row.tool_name),
+                        diff_preview: None,
+                        patch_preview: None,
+                    })
+                    .collect()
+            } else {
+                row.file_events
+                    .into_iter()
+                    .filter_map(|event| {
+                        let path = event.path.trim().to_string();
+                        if path.is_empty() {
+                            return None;
+                        }
+                        Some(PersistedFileEvent {
+                            path,
+                            action: parse_file_activity_action(&event.action)
+                                .unwrap_or_else(|| infer_file_activity_action(&row.tool_name)),
+                            diff_preview: normalize_optional_string(event.diff_preview),
+                            patch_preview: normalize_optional_string(event.patch_preview),
+                        })
+                    })
+                    .collect()
+            };
             let file_paths_json =
                 serde_json::to_string(&file_paths).unwrap_or_else(|_| "[]".to_string());
+            let file_events_json =
+                serde_json::to_string(&file_events).unwrap_or_else(|_| "[]".to_string());
             let timestamp = if row.timestamp.trim().is_empty() {
                 chrono::Utc::now().to_rfc3339()
             } else {
@@ -787,6 +994,7 @@ impl StateStore {
             )
             .score;
             let session_id = row.session_id.clone();
+            let trigger_summary = session_tasks.get(&session_id).cloned().unwrap_or_default();
 
             self.conn.execute(
                 "INSERT OR IGNORE INTO tool_log (
@@ -794,23 +1002,29 @@ impl StateStore {
                     session_id,
                     tool_name,
                     input_summary,
+                    input_params_json,
                     output_summary,
+                    trigger_summary,
                     duration_ms,
                     risk_score,
                     timestamp,
-                    file_paths_json
+                    file_paths_json,
+                    file_events_json
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 rusqlite::params![
                     row.id,
                     row.session_id,
                     row.tool_name,
                     row.input_summary,
+                    row.input_params_json,
                     row.output_summary,
+                    trigger_summary,
                     row.duration_ms,
                     risk_score,
                     timestamp,
                     file_paths_json,
+                    file_events_json,
                 ],
             )?;
 
@@ -1404,19 +1618,23 @@ impl StateStore {
         session_id: &str,
         tool_name: &str,
         input_summary: &str,
+        input_params_json: &str,
         output_summary: &str,
+        trigger_summary: &str,
         duration_ms: u64,
         risk_score: f64,
         timestamp: &str,
     ) -> Result<ToolLogEntry> {
         self.conn.execute(
-            "INSERT INTO tool_log (session_id, tool_name, input_summary, output_summary, duration_ms, risk_score, timestamp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO tool_log (session_id, tool_name, input_summary, input_params_json, output_summary, trigger_summary, duration_ms, risk_score, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 session_id,
                 tool_name,
                 input_summary,
+                input_params_json,
                 output_summary,
+                trigger_summary,
                 duration_ms,
                 risk_score,
                 timestamp,
@@ -1428,7 +1646,9 @@ impl StateStore {
             session_id: session_id.to_string(),
             tool_name: tool_name.to_string(),
             input_summary: input_summary.to_string(),
+            input_params_json: input_params_json.to_string(),
             output_summary: output_summary.to_string(),
+            trigger_summary: trigger_summary.to_string(),
             duration_ms,
             risk_score,
             timestamp: timestamp.to_string(),
@@ -1451,7 +1671,7 @@ impl StateStore {
         )?;
 
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, tool_name, input_summary, output_summary, duration_ms, risk_score, timestamp
+            "SELECT id, session_id, tool_name, input_summary, input_params_json, output_summary, trigger_summary, duration_ms, risk_score, timestamp
              FROM tool_log
              WHERE session_id = ?1
              ORDER BY timestamp DESC, id DESC
@@ -1465,10 +1685,14 @@ impl StateStore {
                     session_id: row.get(1)?,
                     tool_name: row.get(2)?,
                     input_summary: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    output_summary: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                    duration_ms: row.get::<_, Option<u64>>(5)?.unwrap_or_default(),
-                    risk_score: row.get::<_, Option<f64>>(6)?.unwrap_or_default(),
-                    timestamp: row.get(7)?,
+                    input_params_json: row
+                        .get::<_, Option<String>>(4)?
+                        .unwrap_or_else(|| "{}".to_string()),
+                    output_summary: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    trigger_summary: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                    duration_ms: row.get::<_, Option<u64>>(7)?.unwrap_or_default(),
+                    risk_score: row.get::<_, Option<f64>>(8)?.unwrap_or_default(),
+                    timestamp: row.get(9)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -1487,11 +1711,13 @@ impl StateStore {
         limit: usize,
     ) -> Result<Vec<FileActivityEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, tool_name, input_summary, output_summary, timestamp, file_paths_json
+            "SELECT session_id, tool_name, input_summary, output_summary, timestamp, file_events_json, file_paths_json
              FROM tool_log
              WHERE session_id = ?1
-               AND file_paths_json IS NOT NULL
-               AND file_paths_json != '[]'
+               AND (
+                    (file_events_json IS NOT NULL AND file_events_json != '[]')
+                    OR (file_paths_json IS NOT NULL AND file_paths_json != '[]')
+               )
              ORDER BY timestamp DESC, id DESC",
         )?;
 
@@ -1505,17 +1731,23 @@ impl StateStore {
                     row.get::<_, String>(4)?,
                     row.get::<_, Option<String>>(5)?
                         .unwrap_or_else(|| "[]".to_string()),
+                    row.get::<_, Option<String>>(6)?
+                        .unwrap_or_else(|| "[]".to_string()),
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut events = Vec::new();
-        for (session_id, tool_name, input_summary, output_summary, timestamp, file_paths_json) in
-            rows
+        for (
+            session_id,
+            tool_name,
+            input_summary,
+            output_summary,
+            timestamp,
+            file_events_json,
+            file_paths_json,
+        ) in rows
         {
-            let Ok(paths) = serde_json::from_str::<Vec<String>>(&file_paths_json) else {
-                continue;
-            };
             let occurred_at = chrono::DateTime::parse_from_rfc3339(&timestamp)
                 .unwrap_or_default()
                 .with_timezone(&chrono::Utc);
@@ -1525,17 +1757,33 @@ impl StateStore {
                 output_summary
             };
 
-            for path in paths {
-                let path = path.trim().to_string();
-                if path.is_empty() {
-                    continue;
-                }
+            let persisted = parse_persisted_file_events(&file_events_json).unwrap_or_else(|| {
+                serde_json::from_str::<Vec<String>>(&file_paths_json)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|path| {
+                        let path = path.trim().to_string();
+                        if path.is_empty() {
+                            return None;
+                        }
+                        Some(PersistedFileEvent {
+                            path,
+                            action: infer_file_activity_action(&tool_name),
+                            diff_preview: None,
+                            patch_preview: None,
+                        })
+                    })
+                    .collect()
+            });
 
+            for event in persisted {
                 events.push(FileActivityEntry {
                     session_id: session_id.clone(),
-                    tool_name: tool_name.clone(),
-                    path,
+                    action: event.action,
+                    path: event.path,
                     summary: summary.clone(),
+                    diff_preview: event.diff_preview,
+                    patch_preview: event.patch_preview,
                     timestamp: occurred_at,
                 });
                 if events.len() >= limit {
@@ -1545,6 +1793,169 @@ impl StateStore {
         }
 
         Ok(events)
+    }
+
+    pub fn list_file_overlaps(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<FileActivityOverlap>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let current_activity = self.list_file_activity(session_id, 64)?;
+        if current_activity.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut current_by_path = HashMap::new();
+        for entry in current_activity {
+            current_by_path.entry(entry.path.clone()).or_insert(entry);
+        }
+
+        let mut overlaps = Vec::new();
+        let mut seen = HashSet::new();
+
+        for session in self.list_sessions()? {
+            if session.id == session_id || !session_state_supports_overlap(&session.state) {
+                continue;
+            }
+
+            for entry in self.list_file_activity(&session.id, 32)? {
+                let Some(current) = current_by_path.get(&entry.path) else {
+                    continue;
+                };
+                if !file_overlap_is_relevant(current, &entry) {
+                    continue;
+                }
+                if !seen.insert((session.id.clone(), entry.path.clone())) {
+                    continue;
+                }
+
+                overlaps.push(FileActivityOverlap {
+                    path: entry.path.clone(),
+                    current_action: current.action.clone(),
+                    other_action: entry.action.clone(),
+                    other_session_id: session.id.clone(),
+                    other_session_state: session.state.clone(),
+                    timestamp: entry.timestamp,
+                });
+            }
+        }
+
+        overlaps.sort_by_key(|entry| {
+            (
+                overlap_state_priority(&entry.other_session_state),
+                Reverse(entry.timestamp),
+                entry.other_session_id.clone(),
+                entry.path.clone(),
+            )
+        });
+        overlaps.truncate(limit);
+        Ok(overlaps)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PersistedFileEvent {
+    path: String,
+    action: FileActivityAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    patch_preview: Option<String>,
+}
+
+fn parse_persisted_file_events(value: &str) -> Option<Vec<PersistedFileEvent>> {
+    let events = serde_json::from_str::<Vec<PersistedFileEvent>>(value).ok()?;
+    let events: Vec<PersistedFileEvent> = events
+        .into_iter()
+        .filter_map(|event| {
+            let path = event.path.trim().to_string();
+            if path.is_empty() {
+                return None;
+            }
+            Some(PersistedFileEvent {
+                path,
+                action: event.action,
+                diff_preview: normalize_optional_string(event.diff_preview),
+                patch_preview: normalize_optional_string(event.patch_preview),
+            })
+        })
+        .collect();
+    if events.is_empty() {
+        return None;
+    }
+    Some(events)
+}
+
+fn parse_file_activity_action(value: &str) -> Option<FileActivityAction> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "read" => Some(FileActivityAction::Read),
+        "create" => Some(FileActivityAction::Create),
+        "modify" | "edit" | "write" => Some(FileActivityAction::Modify),
+        "move" | "rename" => Some(FileActivityAction::Move),
+        "delete" | "remove" => Some(FileActivityAction::Delete),
+        "touch" => Some(FileActivityAction::Touch),
+        _ => None,
+    }
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn default_input_params_json() -> String {
+    "{}".to_string()
+}
+
+fn infer_file_activity_action(tool_name: &str) -> FileActivityAction {
+    let tool_name = tool_name.trim().to_ascii_lowercase();
+    if tool_name.contains("read") {
+        FileActivityAction::Read
+    } else if tool_name.contains("write") {
+        FileActivityAction::Create
+    } else if tool_name.contains("edit") {
+        FileActivityAction::Modify
+    } else if tool_name.contains("delete") || tool_name.contains("remove") {
+        FileActivityAction::Delete
+    } else if tool_name.contains("move") || tool_name.contains("rename") {
+        FileActivityAction::Move
+    } else {
+        FileActivityAction::Touch
+    }
+}
+
+fn session_state_supports_overlap(state: &SessionState) -> bool {
+    matches!(
+        state,
+        SessionState::Pending | SessionState::Running | SessionState::Idle | SessionState::Stale
+    )
+}
+
+fn file_overlap_is_relevant(current: &FileActivityEntry, other: &FileActivityEntry) -> bool {
+    current.path == other.path
+        && !(matches!(current.action, FileActivityAction::Read)
+            && matches!(other.action, FileActivityAction::Read))
+}
+
+fn overlap_state_priority(state: &SessionState) -> u8 {
+    match state {
+        SessionState::Running => 0,
+        SessionState::Idle => 1,
+        SessionState::Pending => 2,
+        SessionState::Stale => 3,
+        SessionState::Completed => 4,
+        SessionState::Failed => 5,
+        SessionState::Stopped => 6,
     }
 }
 
@@ -1740,9 +2151,9 @@ mod tests {
         fs::write(
             &metrics_path,
             concat!(
-                "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Read\",\"input_summary\":\"Read src/lib.rs\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
-                "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Read\",\"input_summary\":\"Read src/lib.rs\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
-                "{\"id\":\"evt-2\",\"session_id\":\"session-1\",\"tool_name\":\"Write\",\"input_summary\":\"Write README.md\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\",\"README.md\"],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
+                "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Read\",\"input_summary\":\"Read src/lib.rs\",\"input_params_json\":\"{\\\"file_path\\\":\\\"src/lib.rs\\\"}\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Read\",\"input_summary\":\"Read src/lib.rs\",\"input_params_json\":\"{\\\"file_path\\\":\\\"src/lib.rs\\\"}\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"session-1\",\"tool_name\":\"Write\",\"input_summary\":\"Write README.md\",\"input_params_json\":\"{\\\"file_path\\\":\\\"README.md\\\",\\\"content\\\":\\\"hello\\\"}\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\",\"README.md\"],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
             ),
         )?;
 
@@ -1764,6 +2175,16 @@ mod tests {
         assert_eq!(logs.total, 2);
         assert_eq!(logs.entries[0].tool_name, "Write");
         assert_eq!(logs.entries[1].tool_name, "Read");
+        assert_eq!(
+            logs.entries[0].input_params_json,
+            "{\"file_path\":\"README.md\",\"content\":\"hello\"}"
+        );
+        assert_eq!(logs.entries[0].trigger_summary, "sync tools");
+        assert_eq!(
+            logs.entries[1].input_params_json,
+            "{\"file_path\":\"src/lib.rs\"}"
+        );
+        assert_eq!(logs.entries[1].trigger_summary, "sync tools");
 
         Ok(())
     }
@@ -1803,11 +2224,131 @@ mod tests {
 
         let activity = db.list_file_activity("session-1", 10)?;
         assert_eq!(activity.len(), 3);
-        assert_eq!(activity[0].tool_name, "Write");
+        assert_eq!(activity[0].action, FileActivityAction::Create);
         assert_eq!(activity[0].path, "README.md");
+        assert_eq!(activity[1].action, FileActivityAction::Create);
         assert_eq!(activity[1].path, "src/lib.rs");
-        assert_eq!(activity[2].tool_name, "Read");
+        assert_eq!(activity[2].action, FileActivityAction::Read);
         assert_eq!(activity[2].path, "src/lib.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn list_file_activity_preserves_diff_and_patch_previews() -> Result<()> {
+        let tempdir = TestDir::new("store-file-activity-diffs")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "sync tools".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let metrics_dir = tempdir.path().join("metrics");
+        fs::create_dir_all(&metrics_dir)?;
+        let metrics_path = metrics_dir.join("tool-usage.jsonl");
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Edit\",\"input_summary\":\"Edit src/config.ts\",\"output_summary\":\"updated config\",\"file_paths\":[\"src/config.ts\"],\"file_events\":[{\"path\":\"src/config.ts\",\"action\":\"modify\",\"diff_preview\":\"API_URL=http://localhost:3000 -> API_URL=https://api.example.com\",\"patch_preview\":\"@@\\n- API_URL=http://localhost:3000\\n+ API_URL=https://api.example.com\"}],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n"
+            ),
+        )?;
+
+        db.sync_tool_activity_metrics(&metrics_path)?;
+
+        let activity = db.list_file_activity("session-1", 10)?;
+        assert_eq!(activity.len(), 1);
+        assert_eq!(activity[0].action, FileActivityAction::Modify);
+        assert_eq!(activity[0].path, "src/config.ts");
+        assert_eq!(
+            activity[0].diff_preview.as_deref(),
+            Some("API_URL=http://localhost:3000 -> API_URL=https://api.example.com")
+        );
+        assert_eq!(
+            activity[0].patch_preview.as_deref(),
+            Some("@@\n- API_URL=http://localhost:3000\n+ API_URL=https://api.example.com")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn list_file_overlaps_reports_other_active_sessions_sharing_paths() -> Result<()> {
+        let tempdir = TestDir::new("store-file-overlaps")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "focus".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "session-2".to_string(),
+            task: "delegate".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Idle,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "session-3".to_string(),
+            task: "done".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Completed,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let metrics_dir = tempdir.path().join("metrics");
+        fs::create_dir_all(&metrics_dir)?;
+        let metrics_path = metrics_dir.join("tool-usage.jsonl");
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Edit\",\"input_summary\":\"Edit src/lib.rs\",\"output_summary\":\"updated lib\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:02:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"session-2\",\"tool_name\":\"Write\",\"input_summary\":\"Write src/lib.rs\",\"output_summary\":\"touched lib\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:03:00Z\"}\n",
+                "{\"id\":\"evt-3\",\"session_id\":\"session-3\",\"tool_name\":\"Write\",\"input_summary\":\"Write src/lib.rs\",\"output_summary\":\"completed overlap\",\"file_events\":[{\"path\":\"src/lib.rs\",\"action\":\"modify\"}],\"timestamp\":\"2026-04-09T00:04:00Z\"}\n"
+            ),
+        )?;
+
+        db.sync_tool_activity_metrics(&metrics_path)?;
+
+        let overlaps = db.list_file_overlaps("session-1", 10)?;
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!(overlaps[0].path, "src/lib.rs");
+        assert_eq!(overlaps[0].current_action, FileActivityAction::Modify);
+        assert_eq!(overlaps[0].other_action, FileActivityAction::Modify);
+        assert_eq!(overlaps[0].other_session_id, "session-2");
+        assert_eq!(overlaps[0].other_session_state, SessionState::Idle);
 
         Ok(())
     }
