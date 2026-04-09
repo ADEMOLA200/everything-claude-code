@@ -1,14 +1,17 @@
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::observability::{ToolLogEntry, ToolLogPage};
+use crate::config::Config;
+use crate::observability::{ToolCallEvent, ToolLogEntry, ToolLogPage};
 
 use super::output::{OutputLine, OutputStream, OUTPUT_BUFFER_LIMIT};
-use super::{Session, SessionMessage, SessionMetrics, SessionState};
+use super::{FileActivityEntry, Session, SessionMessage, SessionMetrics, SessionState};
 
 pub struct StateStore {
     conn: Connection,
@@ -121,24 +124,29 @@ impl StateStore {
                 worktree_path TEXT,
                 worktree_branch TEXT,
                 worktree_base TEXT,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
                 tokens_used INTEGER DEFAULT 0,
                 tool_calls INTEGER DEFAULT 0,
                 files_changed INTEGER DEFAULT 0,
                 duration_secs INTEGER DEFAULT 0,
                 cost_usd REAL DEFAULT 0.0,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                last_heartbeat_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS tool_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                hook_event_id TEXT UNIQUE,
                 session_id TEXT NOT NULL REFERENCES sessions(id),
                 tool_name TEXT NOT NULL,
                 input_summary TEXT,
                 output_summary TEXT,
                 duration_ms INTEGER,
                 risk_score REAL DEFAULT 0.0,
-                timestamp TEXT NOT NULL
+                timestamp TEXT NOT NULL,
+                file_paths_json TEXT NOT NULL DEFAULT '[]'
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -185,6 +193,9 @@ impl StateStore {
 
             CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
             CREATE INDEX IF NOT EXISTS idx_tool_log_session ON tool_log(session_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_log_hook_event
+                ON tool_log(hook_event_id)
+                WHERE hook_event_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_session, read);
             CREATE INDEX IF NOT EXISTS idx_session_output_session
                 ON session_output(session_id, id);
@@ -210,6 +221,53 @@ impl StateStore {
             self.conn
                 .execute("ALTER TABLE sessions ADD COLUMN pid INTEGER", [])
                 .context("Failed to add pid column to sessions table")?;
+        }
+
+        if !self.has_column("sessions", "input_tokens")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE sessions ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .context("Failed to add input_tokens column to sessions table")?;
+        }
+
+        if !self.has_column("sessions", "output_tokens")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE sessions ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .context("Failed to add output_tokens column to sessions table")?;
+        }
+
+        if !self.has_column("sessions", "last_heartbeat_at")? {
+            self.conn
+                .execute("ALTER TABLE sessions ADD COLUMN last_heartbeat_at TEXT", [])
+                .context("Failed to add last_heartbeat_at column to sessions table")?;
+            self.conn
+                .execute(
+                    "UPDATE sessions
+                     SET last_heartbeat_at = updated_at
+                     WHERE last_heartbeat_at IS NULL",
+                    [],
+                )
+                .context("Failed to backfill last_heartbeat_at column")?;
+        }
+
+        if !self.has_column("tool_log", "hook_event_id")? {
+            self.conn
+                .execute("ALTER TABLE tool_log ADD COLUMN hook_event_id TEXT", [])
+                .context("Failed to add hook_event_id column to tool_log table")?;
+        }
+
+        if !self.has_column("tool_log", "file_paths_json")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE tool_log ADD COLUMN file_paths_json TEXT NOT NULL DEFAULT '[]'",
+                    [],
+                )
+                .context("Failed to add file_paths_json column to tool_log table")?;
         }
 
         if !self.has_column("daemon_activity", "last_dispatch_deferred")? {
@@ -340,6 +398,12 @@ impl StateStore {
                 .context("Failed to add last_auto_prune_active_skipped column to daemon_activity table")?;
         }
 
+        self.conn.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_log_hook_event
+             ON tool_log(hook_event_id)
+             WHERE hook_event_id IS NOT NULL;",
+        )?;
+
         Ok(())
     }
 
@@ -355,8 +419,8 @@ impl StateStore {
 
     pub fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sessions (id, task, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO sessions (id, task, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base, created_at, updated_at, last_heartbeat_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
                 session.id,
                 session.task,
@@ -372,6 +436,7 @@ impl StateStore {
                 session.worktree.as_ref().map(|w| w.base_branch.clone()),
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
+                session.last_heartbeat_at.to_rfc3339(),
             ],
         )?;
         Ok(())
@@ -384,7 +449,12 @@ impl StateStore {
         pid: Option<u32>,
     ) -> Result<()> {
         let updated = self.conn.execute(
-            "UPDATE sessions SET state = ?1, pid = ?2, updated_at = ?3 WHERE id = ?4",
+            "UPDATE sessions
+             SET state = ?1,
+                 pid = ?2,
+                 updated_at = ?3,
+                 last_heartbeat_at = ?3
+             WHERE id = ?4",
             rusqlite::params![
                 state.to_string(),
                 pid.map(i64::from),
@@ -421,7 +491,11 @@ impl StateStore {
         }
 
         let updated = self.conn.execute(
-            "UPDATE sessions SET state = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE sessions
+             SET state = ?1,
+                 updated_at = ?2,
+                 last_heartbeat_at = ?2
+             WHERE id = ?3",
             rusqlite::params![
                 state.to_string(),
                 chrono::Utc::now().to_rfc3339(),
@@ -438,7 +512,11 @@ impl StateStore {
 
     pub fn update_pid(&self, session_id: &str, pid: Option<u32>) -> Result<()> {
         let updated = self.conn.execute(
-            "UPDATE sessions SET pid = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE sessions
+             SET pid = ?1,
+                 updated_at = ?2,
+                 last_heartbeat_at = ?2
+             WHERE id = ?3",
             rusqlite::params![
                 pid.map(i64::from),
                 chrono::Utc::now().to_rfc3339(),
@@ -456,7 +534,11 @@ impl StateStore {
     pub fn clear_worktree(&self, session_id: &str) -> Result<()> {
         let updated = self.conn.execute(
             "UPDATE sessions
-             SET worktree_path = NULL, worktree_branch = NULL, worktree_base = NULL, updated_at = ?1
+             SET worktree_path = NULL,
+                 worktree_branch = NULL,
+                 worktree_base = NULL,
+                 updated_at = ?1,
+                 last_heartbeat_at = ?1
              WHERE id = ?2",
             rusqlite::params![chrono::Utc::now().to_rfc3339(), session_id],
         )?;
@@ -470,8 +552,19 @@ impl StateStore {
 
     pub fn update_metrics(&self, session_id: &str, metrics: &SessionMetrics) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET tokens_used = ?1, tool_calls = ?2, files_changed = ?3, duration_secs = ?4, cost_usd = ?5, updated_at = ?6 WHERE id = ?7",
+            "UPDATE sessions
+             SET input_tokens = ?1,
+                 output_tokens = ?2,
+                 tokens_used = ?3,
+                 tool_calls = ?4,
+                 files_changed = ?5,
+                 duration_secs = ?6,
+                 cost_usd = ?7,
+                 updated_at = ?8
+             WHERE id = ?9",
             rusqlite::params![
+                metrics.input_tokens,
+                metrics.output_tokens,
                 metrics.tokens_used,
                 metrics.tool_calls,
                 metrics.files_changed,
@@ -484,9 +577,270 @@ impl StateStore {
         Ok(())
     }
 
+    pub fn refresh_session_durations(&self) -> Result<()> {
+        let now = chrono::Utc::now();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, state, created_at, updated_at, duration_secs
+             FROM sessions",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        for (session_id, state_raw, created_raw, updated_raw, current_duration) in rows {
+            let state = SessionState::from_db_value(&state_raw);
+            let created_at = chrono::DateTime::parse_from_rfc3339(&created_raw)
+                .unwrap_or_default()
+                .with_timezone(&chrono::Utc);
+            let updated_at = chrono::DateTime::parse_from_rfc3339(&updated_raw)
+                .unwrap_or_default()
+                .with_timezone(&chrono::Utc);
+            let effective_end = match state {
+                SessionState::Pending
+                | SessionState::Running
+                | SessionState::Idle
+                | SessionState::Stale => now,
+                SessionState::Completed | SessionState::Failed | SessionState::Stopped => {
+                    updated_at
+                }
+            };
+            let duration_secs = effective_end
+                .signed_duration_since(created_at)
+                .num_seconds()
+                .max(0) as u64;
+
+            if duration_secs != current_duration {
+                self.conn.execute(
+                    "UPDATE sessions SET duration_secs = ?1 WHERE id = ?2",
+                    rusqlite::params![duration_secs, session_id],
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn touch_heartbeat(&self, session_id: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let updated = self.conn.execute(
+            "UPDATE sessions SET last_heartbeat_at = ?1 WHERE id = ?2",
+            rusqlite::params![now, session_id],
+        )?;
+
+        if updated == 0 {
+            anyhow::bail!("Session not found: {session_id}");
+        }
+
+        Ok(())
+    }
+
+    pub fn sync_cost_tracker_metrics(&self, metrics_path: &Path) -> Result<()> {
+        if !metrics_path.exists() {
+            return Ok(());
+        }
+
+        #[derive(Default)]
+        struct UsageAggregate {
+            input_tokens: u64,
+            output_tokens: u64,
+            cost_usd: f64,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CostTrackerRow {
+            session_id: String,
+            #[serde(default)]
+            input_tokens: u64,
+            #[serde(default)]
+            output_tokens: u64,
+            #[serde(default)]
+            estimated_cost_usd: f64,
+        }
+
+        let file = File::open(metrics_path)
+            .with_context(|| format!("Failed to open {}", metrics_path.display()))?;
+        let reader = BufReader::new(file);
+        let mut aggregates: HashMap<String, UsageAggregate> = HashMap::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let Ok(row) = serde_json::from_str::<CostTrackerRow>(trimmed) else {
+                continue;
+            };
+            if row.session_id.trim().is_empty() {
+                continue;
+            }
+
+            let aggregate = aggregates.entry(row.session_id).or_default();
+            aggregate.input_tokens = aggregate.input_tokens.saturating_add(row.input_tokens);
+            aggregate.output_tokens = aggregate.output_tokens.saturating_add(row.output_tokens);
+            aggregate.cost_usd += row.estimated_cost_usd;
+        }
+
+        for (session_id, aggregate) in aggregates {
+            self.conn.execute(
+                "UPDATE sessions
+                 SET input_tokens = ?1,
+                     output_tokens = ?2,
+                     tokens_used = ?3,
+                     cost_usd = ?4
+                 WHERE id = ?5",
+                rusqlite::params![
+                    aggregate.input_tokens,
+                    aggregate.output_tokens,
+                    aggregate
+                        .input_tokens
+                        .saturating_add(aggregate.output_tokens),
+                    aggregate.cost_usd,
+                    session_id,
+                ],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub fn sync_tool_activity_metrics(&self, metrics_path: &Path) -> Result<()> {
+        if !metrics_path.exists() {
+            return Ok(());
+        }
+
+        #[derive(Default)]
+        struct ActivityAggregate {
+            tool_calls: u64,
+            file_paths: HashSet<String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct ToolActivityRow {
+            id: String,
+            session_id: String,
+            tool_name: String,
+            #[serde(default)]
+            input_summary: String,
+            #[serde(default)]
+            output_summary: String,
+            #[serde(default)]
+            duration_ms: u64,
+            #[serde(default)]
+            file_paths: Vec<String>,
+            #[serde(default)]
+            timestamp: String,
+        }
+
+        let file = File::open(metrics_path)
+            .with_context(|| format!("Failed to open {}", metrics_path.display()))?;
+        let reader = BufReader::new(file);
+        let mut aggregates: HashMap<String, ActivityAggregate> = HashMap::new();
+        let mut seen_event_ids = HashSet::new();
+
+        for line in reader.lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let Ok(row) = serde_json::from_str::<ToolActivityRow>(trimmed) else {
+                continue;
+            };
+            if row.id.trim().is_empty()
+                || row.session_id.trim().is_empty()
+                || row.tool_name.trim().is_empty()
+            {
+                continue;
+            }
+            if !seen_event_ids.insert(row.id.clone()) {
+                continue;
+            }
+
+            let file_paths: Vec<String> = row
+                .file_paths
+                .into_iter()
+                .map(|path| path.trim().to_string())
+                .filter(|path| !path.is_empty())
+                .collect();
+            let file_paths_json =
+                serde_json::to_string(&file_paths).unwrap_or_else(|_| "[]".to_string());
+            let timestamp = if row.timestamp.trim().is_empty() {
+                chrono::Utc::now().to_rfc3339()
+            } else {
+                row.timestamp
+            };
+            let risk_score = ToolCallEvent::compute_risk(
+                &row.tool_name,
+                &row.input_summary,
+                &Config::RISK_THRESHOLDS,
+            )
+            .score;
+            let session_id = row.session_id.clone();
+
+            self.conn.execute(
+                "INSERT OR IGNORE INTO tool_log (
+                    hook_event_id,
+                    session_id,
+                    tool_name,
+                    input_summary,
+                    output_summary,
+                    duration_ms,
+                    risk_score,
+                    timestamp,
+                    file_paths_json
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                rusqlite::params![
+                    row.id,
+                    row.session_id,
+                    row.tool_name,
+                    row.input_summary,
+                    row.output_summary,
+                    row.duration_ms,
+                    risk_score,
+                    timestamp,
+                    file_paths_json,
+                ],
+            )?;
+
+            let aggregate = aggregates.entry(session_id).or_default();
+            aggregate.tool_calls = aggregate.tool_calls.saturating_add(1);
+            for file_path in file_paths {
+                aggregate.file_paths.insert(file_path);
+            }
+        }
+
+        for session in self.list_sessions()? {
+            let mut metrics = session.metrics.clone();
+            let aggregate = aggregates.get(&session.id);
+            metrics.tool_calls = aggregate.map(|item| item.tool_calls).unwrap_or(0);
+            metrics.files_changed = aggregate
+                .map(|item| item.file_paths.len().min(u32::MAX as usize) as u32)
+                .unwrap_or(0);
+            self.update_metrics(&session.id, &metrics)?;
+        }
+
+        Ok(())
+    }
+
     pub fn increment_tool_calls(&self, session_id: &str) -> Result<()> {
         self.conn.execute(
-            "UPDATE sessions SET tool_calls = tool_calls + 1, updated_at = ?1 WHERE id = ?2",
+            "UPDATE sessions
+             SET tool_calls = tool_calls + 1,
+                 updated_at = ?1,
+                 last_heartbeat_at = ?1
+             WHERE id = ?2",
             rusqlite::params![chrono::Utc::now().to_rfc3339(), session_id],
         )?;
         Ok(())
@@ -495,8 +849,8 @@ impl StateStore {
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, task, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base,
-                    tokens_used, tool_calls, files_changed, duration_secs, cost_usd,
-                    created_at, updated_at
+                    input_tokens, output_tokens, tokens_used, tool_calls, files_changed, duration_secs, cost_usd,
+                    created_at, updated_at, last_heartbeat_at
              FROM sessions ORDER BY updated_at DESC",
         )?;
 
@@ -512,8 +866,9 @@ impl StateStore {
                     base_branch: row.get::<_, String>(8).unwrap_or_default(),
                 });
 
-                let created_str: String = row.get(14)?;
-                let updated_str: String = row.get(15)?;
+                let created_str: String = row.get(16)?;
+                let updated_str: String = row.get(17)?;
+                let heartbeat_str: String = row.get(18)?;
 
                 Ok(Session {
                     id: row.get(0)?,
@@ -529,12 +884,19 @@ impl StateStore {
                     updated_at: chrono::DateTime::parse_from_rfc3339(&updated_str)
                         .unwrap_or_default()
                         .with_timezone(&chrono::Utc),
+                    last_heartbeat_at: chrono::DateTime::parse_from_rfc3339(&heartbeat_str)
+                        .unwrap_or_else(|_| {
+                            chrono::DateTime::parse_from_rfc3339(&updated_str).unwrap_or_default()
+                        })
+                        .with_timezone(&chrono::Utc),
                     metrics: SessionMetrics {
-                        tokens_used: row.get(9)?,
-                        tool_calls: row.get(10)?,
-                        files_changed: row.get(11)?,
-                        duration_secs: row.get(12)?,
-                        cost_usd: row.get(13)?,
+                        input_tokens: row.get(9)?,
+                        output_tokens: row.get(10)?,
+                        tokens_used: row.get(11)?,
+                        tool_calls: row.get(12)?,
+                        files_changed: row.get(13)?,
+                        duration_secs: row.get(14)?,
+                        cost_usd: row.get(15)?,
                     },
                 })
             })?
@@ -997,7 +1359,10 @@ impl StateStore {
         )?;
 
         self.conn.execute(
-            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            "UPDATE sessions
+             SET updated_at = ?1,
+                 last_heartbeat_at = ?1
+             WHERE id = ?2",
             rusqlite::params![chrono::Utc::now().to_rfc3339(), session_id],
         )?;
 
@@ -1115,6 +1480,72 @@ impl StateStore {
             total,
         })
     }
+
+    pub fn list_file_activity(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<FileActivityEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, tool_name, input_summary, output_summary, timestamp, file_paths_json
+             FROM tool_log
+             WHERE session_id = ?1
+               AND file_paths_json IS NOT NULL
+               AND file_paths_json != '[]'
+             ORDER BY timestamp DESC, id DESC",
+        )?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?
+                        .unwrap_or_else(|| "[]".to_string()),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut events = Vec::new();
+        for (session_id, tool_name, input_summary, output_summary, timestamp, file_paths_json) in
+            rows
+        {
+            let Ok(paths) = serde_json::from_str::<Vec<String>>(&file_paths_json) else {
+                continue;
+            };
+            let occurred_at = chrono::DateTime::parse_from_rfc3339(&timestamp)
+                .unwrap_or_default()
+                .with_timezone(&chrono::Utc);
+            let summary = if output_summary.trim().is_empty() {
+                input_summary
+            } else {
+                output_summary
+            };
+
+            for path in paths {
+                let path = path.trim().to_string();
+                if path.is_empty() {
+                    continue;
+                }
+
+                events.push(FileActivityEntry {
+                    session_id: session_id.clone(),
+                    tool_name: tool_name.clone(),
+                    path,
+                    summary: summary.clone(),
+                    timestamp: occurred_at,
+                });
+                if events.len() >= limit {
+                    return Ok(events);
+                }
+            }
+        }
+
+        Ok(events)
+    }
 }
 
 #[cfg(test)]
@@ -1158,6 +1589,7 @@ mod tests {
             worktree: None,
             created_at: now - ChronoDuration::minutes(1),
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         }
     }
@@ -1216,6 +1648,245 @@ mod tests {
 
         assert!(column_names.iter().any(|column| column == "working_dir"));
         assert!(column_names.iter().any(|column| column == "pid"));
+        assert!(column_names.iter().any(|column| column == "input_tokens"));
+        assert!(column_names.iter().any(|column| column == "output_tokens"));
+        assert!(column_names
+            .iter()
+            .any(|column| column == "last_heartbeat_at"));
+        Ok(())
+    }
+
+    #[test]
+    fn sync_cost_tracker_metrics_aggregates_usage_into_sessions() -> Result<()> {
+        let tempdir = TestDir::new("store-cost-metrics")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "sync usage".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let metrics_dir = tempdir.path().join("metrics");
+        fs::create_dir_all(&metrics_dir)?;
+        let metrics_path = metrics_dir.join("costs.jsonl");
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"session_id\":\"session-1\",\"input_tokens\":100,\"output_tokens\":25,\"estimated_cost_usd\":0.11}\n",
+                "{\"session_id\":\"session-1\",\"input_tokens\":40,\"output_tokens\":10,\"estimated_cost_usd\":0.05}\n",
+                "{\"session_id\":\"other-session\",\"input_tokens\":999,\"output_tokens\":1,\"estimated_cost_usd\":9.99}\n"
+            ),
+        )?;
+
+        db.sync_cost_tracker_metrics(&metrics_path)?;
+
+        let session = db
+            .get_session("session-1")?
+            .expect("session should still exist");
+        assert_eq!(session.metrics.input_tokens, 140);
+        assert_eq!(session.metrics.output_tokens, 35);
+        assert_eq!(session.metrics.tokens_used, 175);
+        assert!((session.metrics.cost_usd - 0.16).abs() < f64::EPSILON);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_tool_activity_metrics_aggregates_usage_and_logs() -> Result<()> {
+        let tempdir = TestDir::new("store-tool-activity")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "sync tools".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "session-2".to_string(),
+            task: "no activity".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Pending,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let metrics_dir = tempdir.path().join("metrics");
+        fs::create_dir_all(&metrics_dir)?;
+        let metrics_path = metrics_dir.join("tool-usage.jsonl");
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Read\",\"input_summary\":\"Read src/lib.rs\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Read\",\"input_summary\":\"Read src/lib.rs\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"session-1\",\"tool_name\":\"Write\",\"input_summary\":\"Write README.md\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\",\"README.md\"],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
+            ),
+        )?;
+
+        db.sync_tool_activity_metrics(&metrics_path)?;
+
+        let session = db
+            .get_session("session-1")?
+            .expect("session should still exist");
+        assert_eq!(session.metrics.tool_calls, 2);
+        assert_eq!(session.metrics.files_changed, 2);
+
+        let inactive = db
+            .get_session("session-2")?
+            .expect("session should still exist");
+        assert_eq!(inactive.metrics.tool_calls, 0);
+        assert_eq!(inactive.metrics.files_changed, 0);
+
+        let logs = db.query_tool_logs("session-1", 1, 10)?;
+        assert_eq!(logs.total, 2);
+        assert_eq!(logs.entries[0].tool_name, "Write");
+        assert_eq!(logs.entries[1].tool_name, "Read");
+
+        Ok(())
+    }
+
+    #[test]
+    fn list_file_activity_expands_logged_file_paths() -> Result<()> {
+        let tempdir = TestDir::new("store-file-activity")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "sync tools".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        let metrics_dir = tempdir.path().join("metrics");
+        fs::create_dir_all(&metrics_dir)?;
+        let metrics_path = metrics_dir.join("tool-usage.jsonl");
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"session-1\",\"tool_name\":\"Read\",\"input_summary\":\"Read src/lib.rs\",\"output_summary\":\"ok\",\"file_paths\":[\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"session-1\",\"tool_name\":\"Write\",\"input_summary\":\"Write README.md\",\"output_summary\":\"updated readme\",\"file_paths\":[\"README.md\",\"src/lib.rs\"],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
+            ),
+        )?;
+
+        db.sync_tool_activity_metrics(&metrics_path)?;
+
+        let activity = db.list_file_activity("session-1", 10)?;
+        assert_eq!(activity.len(), 3);
+        assert_eq!(activity[0].tool_name, "Write");
+        assert_eq!(activity[0].path, "README.md");
+        assert_eq!(activity[1].path, "src/lib.rs");
+        assert_eq!(activity[2].tool_name, "Read");
+        assert_eq!(activity[2].path, "src/lib.rs");
+
+        Ok(())
+    }
+
+    #[test]
+    fn refresh_session_durations_updates_running_and_terminal_sessions() -> Result<()> {
+        let tempdir = TestDir::new("store-duration-metrics")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "running-1".to_string(),
+            task: "live run".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: Some(1234),
+            worktree: None,
+            created_at: now - ChronoDuration::seconds(95),
+            updated_at: now - ChronoDuration::seconds(1),
+            last_heartbeat_at: now - ChronoDuration::seconds(1),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "done-1".to_string(),
+            task: "finished run".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Completed,
+            pid: None,
+            worktree: None,
+            created_at: now - ChronoDuration::seconds(80),
+            updated_at: now - ChronoDuration::seconds(5),
+            last_heartbeat_at: now - ChronoDuration::seconds(5),
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.refresh_session_durations()?;
+
+        let running = db
+            .get_session("running-1")?
+            .expect("running session should exist");
+        let completed = db
+            .get_session("done-1")?
+            .expect("completed session should exist");
+
+        assert!(running.metrics.duration_secs >= 95);
+        assert!(completed.metrics.duration_secs >= 75);
+
+        Ok(())
+    }
+
+    #[test]
+    fn touch_heartbeat_updates_last_heartbeat_timestamp() -> Result<()> {
+        let tempdir = TestDir::new("store-touch-heartbeat")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now() - ChronoDuration::seconds(30);
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "heartbeat".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: Some(1234),
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.touch_heartbeat("session-1")?;
+
+        let session = db
+            .get_session("session-1")?
+            .expect("session should still exist");
+        assert!(session.last_heartbeat_at > now);
+
         Ok(())
     }
 
@@ -1235,6 +1906,7 @@ mod tests {
             worktree: None,
             created_at: now,
             updated_at: now,
+            last_heartbeat_at: now,
             metrics: SessionMetrics::default(),
         })?;
 
