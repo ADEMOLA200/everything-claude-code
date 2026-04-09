@@ -45,9 +45,17 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     continue;
                 }
 
+                if dashboard.is_pane_command_mode() {
+                    if dashboard.handle_pane_command_key(key) {
+                        continue;
+                    }
+                }
+
                 match (key.modifiers, key.code) {
                     (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
+                    (KeyModifiers::CONTROL, KeyCode::Char('w')) => dashboard.begin_pane_command_mode(),
                     (_, KeyCode::Char('q')) => break,
+                    _ if dashboard.handle_pane_navigation_key(key) => {}
                     (_, KeyCode::Tab) => dashboard.next_pane(),
                     (KeyModifiers::SHIFT, KeyCode::BackTab) => dashboard.prev_pane(),
                     (_, KeyCode::Char('+')) | (_, KeyCode::Char('=')) => {
@@ -56,6 +64,9 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     (_, KeyCode::Char('-')) => dashboard.decrease_pane_size(),
                     (_, KeyCode::Char('j')) | (_, KeyCode::Down) => dashboard.scroll_down(),
                     (_, KeyCode::Char('k')) | (_, KeyCode::Up) => dashboard.scroll_up(),
+                    (_, KeyCode::Char('[')) => dashboard.focus_previous_delegate(),
+                    (_, KeyCode::Char(']')) => dashboard.focus_next_delegate(),
+                    (_, KeyCode::Enter) => dashboard.open_focused_delegate(),
                     (_, KeyCode::Char('/')) => dashboard.begin_search(),
                     (_, KeyCode::Esc) => dashboard.clear_search(),
                     (_, KeyCode::Char('n')) if dashboard.has_active_search() => {
@@ -70,8 +81,13 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     (_, KeyCode::Char('b')) => dashboard.rebalance_selected_team().await,
                     (_, KeyCode::Char('B')) => dashboard.rebalance_all_teams().await,
                     (_, KeyCode::Char('i')) => dashboard.drain_inbox_selected().await,
+                    (_, KeyCode::Char('I')) => dashboard.focus_next_approval_target(),
                     (_, KeyCode::Char('g')) => dashboard.auto_dispatch_backlog().await,
                     (_, KeyCode::Char('G')) => dashboard.coordinate_backlog().await,
+                    (_, KeyCode::Char('h')) => dashboard.collapse_selected_pane(),
+                    (_, KeyCode::Char('H')) => dashboard.restore_collapsed_panes(),
+                    (_, KeyCode::Char('y')) => dashboard.toggle_timeline_mode(),
+                    (_, KeyCode::Char('E')) => dashboard.cycle_timeline_event_filter(),
                     (_, KeyCode::Char('v')) => dashboard.toggle_output_mode(),
                     (_, KeyCode::Char('c')) => dashboard.toggle_conflict_protocol_mode(),
                     (_, KeyCode::Char('e')) => dashboard.toggle_output_filter(),
