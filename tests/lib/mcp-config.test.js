@@ -1,6 +1,8 @@
 'use strict';
 
 const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
 
 const { filterMcpConfig, parseDisabledMcpServers } = require('../../scripts/lib/mcp-config');
 
@@ -53,6 +55,17 @@ function runTests() {
 
     assert.deepStrictEqual(result.removed, []);
     assert.deepStrictEqual(Object.keys(result.config.mcpServers), ['github']);
+  })) passed++; else failed++;
+
+  if (test('shared mcp server catalog includes clarvia discovery config', () => {
+    const catalogPath = path.join(__dirname, '..', '..', 'mcp-configs', 'mcp-servers.json');
+    const catalog = JSON.parse(fs.readFileSync(catalogPath, 'utf8'));
+
+    assert.ok(catalog.mcpServers && typeof catalog.mcpServers === 'object', 'Expected mcpServers object in shared catalog');
+    assert.ok(catalog.mcpServers.clarvia, 'Expected clarvia server entry in shared catalog');
+    assert.strictEqual(catalog.mcpServers.clarvia.command, 'npx');
+    assert.deepStrictEqual(catalog.mcpServers.clarvia.args, ['-y', 'clarvia-mcp-server@latest']);
+    assert.match(catalog.mcpServers.clarvia.description, /discovery/i, 'Expected clarvia description to mention discovery');
   })) passed++; else failed++;
 
   console.log(`\nResults: Passed: ${passed}, Failed: ${failed}`);

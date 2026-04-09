@@ -709,6 +709,8 @@ Copy the hooks from `hooks/hooks.json` to your `~/.claude/settings.json`.
 
 Copy desired MCP server definitions from `mcp-configs/mcp-servers.json` into your official Claude Code config in `~/.claude/settings.json`, or into a project-scoped `.mcp.json` if you want repo-local MCP access.
 
+The shared catalog includes optional discovery servers too, such as `clarvia` for ranked MCP search and AEO-style tool comparison when you want Claude to help find the best external MCP for a job.
+
 If you already run your own copies of ECC-bundled MCPs, set:
 
 ```bash

@@ -94,6 +94,11 @@
       "args": ["-y", "@upstash/context7-mcp@latest"],
       "description": "Live documentation lookup — use with /docs command and documentation-lookup skill (resolve-library-id, query-docs)."
     },
+    "clarvia": {
+      "command": "npx",
+      "args": ["-y", "clarvia-mcp-server@latest"],
+      "description": "AEO scoring and MCP discovery for ranked tool search, comparisons, alternatives, and trending MCP servers."
+    },
     "magic": {
       "command": "npx",
       "args": ["-y", "@magicuidesign/mcp@latest"],
