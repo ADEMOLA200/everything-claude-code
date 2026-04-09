@@ -9,7 +9,7 @@ use tokio::sync::broadcast;
 
 use super::widgets::{budget_state, format_currency, format_token_count, BudgetState, TokenMeter};
 use crate::comms;
-use crate::config::{Config, PaneLayout};
+use crate::config::{Config, PaneLayout, Theme};
 use crate::observability::ToolLogEntry;
 use crate::session::manager;
 use crate::session::output::{OutputEvent, OutputLine, SessionOutputStore, OUTPUT_BUFFER_LIMIT};
@@ -22,7 +22,6 @@ use crate::session::output::OutputStream;
 #[cfg(test)]
 use crate::session::{SessionMetrics, WorktreeInfo};
 
-const DEFAULT_PANE_SIZE_PERCENT: u16 = 35;
 const DEFAULT_GRID_SIZE_PERCENT: u16 = 50;
 const OUTPUT_PANE_PERCENT: u16 = 70;
 const MIN_PANE_SIZE_PERCENT: u16 = 20;
@@ -36,6 +35,14 @@ const MAX_DIFF_PATCH_LINES: usize = 80;
 struct WorktreeDiffColumns {
     removals: String,
     additions: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThemePalette {
+    accent: Color,
+    row_highlight_bg: Color,
+    muted: Color,
+    help_border: Color,
 }
 
 pub struct Dashboard {
@@ -148,10 +155,7 @@ impl Dashboard {
         cfg: Config,
         output_store: SessionOutputStore,
     ) -> Self {
-        let pane_size_percent = match cfg.pane_layout {
-            PaneLayout::Grid => DEFAULT_GRID_SIZE_PERCENT,
-            PaneLayout::Horizontal | PaneLayout::Vertical => DEFAULT_PANE_SIZE_PERCENT,
-        };
+        let pane_size_percent = configured_pane_size(&cfg, cfg.pane_layout);
         let sessions = db.list_sessions().unwrap_or_default();
         let output_rx = output_store.subscribe();
         let mut session_table_state = TableState::default();
@@ -240,11 +244,13 @@ impl Dashboard {
             .filter(|session| session.state == SessionState::Running)
             .count();
         let total = self.sessions.len();
+        let palette = self.theme_palette();
 
         let title = format!(
-            " ECC 2.0 | {running} running / {total} total | {} {}% ",
+            " ECC 2.0 | {running} running / {total} total | {} {}% | {} ",
             self.layout_label(),
-            self.pane_size_percent
+            self.pane_size_percent,
+            self.theme_label()
         );
         let tabs = Tabs::new(
             self.visible_panes()
@@ -256,7 +262,7 @@ impl Dashboard {
         .select(self.selected_pane_index())
         .highlight_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette.accent)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -328,7 +334,7 @@ impl Dashboard {
             .highlight_spacing(HighlightSpacing::Always)
             .row_highlight_style(
                 Style::default()
-                    .bg(Color::DarkGray)
+                    .bg(self.theme_palette().row_highlight_bg)
                     .add_modifier(Modifier::BOLD),
             );
 
@@ -526,8 +532,9 @@ impl Dashboard {
 
     fn render_status_bar(&self, frame: &mut Frame, area: Rect) {
         let text = format!(
-            " [n]ew session  [a]ssign  re[b]alance  global re[B]alance  dra[i]n inbox  [g]lobal dispatch  coordinate [G]lobal  [v]iew diff  conflict proto[c]ol  [m]erge  merge ready [M]  auto-worktree [t]  auto-merge [w]  toggle [p]olicy  [,/.] dispatch limit  [s]top  [u]resume  [x]cleanup  prune inactive [X]  [d]elete  [r]efresh  [Tab] switch pane  [j/k] scroll  [+/-] resize  [{}] layout  [?] help  [q]uit ",
-            self.layout_label()
+            " [n]ew session  [a]ssign  re[b]alance  global re[B]alance  dra[i]n inbox  [g]lobal dispatch  coordinate [G]lobal  [v]iew diff  conflict proto[c]ol  [m]erge  merge ready [M]  auto-worktree [t]  auto-merge [w]  toggle [p]olicy  [,/.] dispatch limit  [s]top  [u]resume  [x]cleanup  prune inactive [X]  [d]elete  [r]efresh  [Tab] switch pane  [j/k] scroll  [+/-] resize  [l]ayout {}  [T]heme {}  [?] help  [q]uit ",
+            self.layout_label(),
+            self.theme_label()
         );
         let text = if let Some(note) = self.operator_note.as_ref() {
             format!(" {} |{}", truncate_for_dashboard(note, 96), text)
@@ -555,7 +562,7 @@ impl Dashboard {
             .split(inner);
 
         frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+            Paragraph::new(text).style(Style::default().fg(self.theme_palette().muted)),
             chunks[0],
         );
         frame.render_widget(
@@ -581,6 +588,8 @@ impl Dashboard {
             "  c       Show conflict-resolution protocol for selected conflicted worktree",
             "  m       Merge selected ready worktree into base and clean it up",
             "  M       Merge all ready inactive worktrees and clean them up",
+            "  l       Cycle pane layout and persist it",
+            "  T       Toggle theme and persist it",
             "  t       Toggle default worktree creation for new sessions and delegated work",
             "  p       Toggle daemon auto-dispatch policy and persist config",
             "  w       Toggle daemon auto-merge for ready inactive worktrees",
@@ -594,8 +603,8 @@ impl Dashboard {
             "  S-Tab   Previous pane",
             "  j/↓     Scroll down",
             "  k/↑     Scroll up",
-            "  +/=     Increase pane size",
-            "  -       Decrease pane size",
+            "  +/=     Increase pane size and persist it",
+            "  -       Decrease pane size and persist it",
             "  r       Refresh",
             "  ?       Toggle help",
             "  q/C-c   Quit",
@@ -605,7 +614,7 @@ impl Dashboard {
             Block::default()
                 .borders(Borders::ALL)
                 .title(" Help ")
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(self.theme_palette().help_border)),
         );
         frame.render_widget(paragraph, area);
     }
@@ -632,16 +641,140 @@ impl Dashboard {
         self.selected_pane = visible_panes[previous_index];
     }
 
+    pub fn cycle_pane_layout(&mut self) {
+        let config_path = crate::config::Config::config_path();
+        self.cycle_pane_layout_with_save(&config_path, |cfg| cfg.save());
+    }
+
+    fn cycle_pane_layout_with_save<F>(&mut self, config_path: &std::path::Path, save: F)
+    where
+        F: FnOnce(&Config) -> anyhow::Result<()>,
+    {
+        let previous_layout = self.cfg.pane_layout;
+        let previous_pane_size = self.pane_size_percent;
+        let previous_selected_pane = self.selected_pane;
+
+        self.cfg.pane_layout = match self.cfg.pane_layout {
+            PaneLayout::Horizontal => PaneLayout::Vertical,
+            PaneLayout::Vertical => PaneLayout::Grid,
+            PaneLayout::Grid => PaneLayout::Horizontal,
+        };
+        self.pane_size_percent = configured_pane_size(&self.cfg, self.cfg.pane_layout);
+        self.persist_current_pane_size();
+        self.ensure_selected_pane_visible();
+
+        match save(&self.cfg) {
+            Ok(()) => self.set_operator_note(format!(
+                "pane layout set to {} | saved to {}",
+                self.layout_label(),
+                config_path.display()
+            )),
+            Err(error) => {
+                self.cfg.pane_layout = previous_layout;
+                self.pane_size_percent = previous_pane_size;
+                self.selected_pane = previous_selected_pane;
+                self.set_operator_note(format!("failed to persist pane layout: {error}"));
+            }
+        }
+    }
+
+    fn adjust_pane_size_with_save<F>(
+        &mut self,
+        delta: isize,
+        config_path: &std::path::Path,
+        save: F,
+    ) where
+        F: FnOnce(&Config) -> anyhow::Result<()>,
+    {
+        let previous_size = self.pane_size_percent;
+        let previous_linear = self.cfg.linear_pane_size_percent;
+        let previous_grid = self.cfg.grid_pane_size_percent;
+        let next = (self.pane_size_percent as isize + delta).clamp(
+            MIN_PANE_SIZE_PERCENT as isize,
+            MAX_PANE_SIZE_PERCENT as isize,
+        ) as u16;
+
+        if next == self.pane_size_percent {
+            self.set_operator_note(format!(
+                "pane size unchanged at {}% for {} layout",
+                self.pane_size_percent,
+                self.layout_label()
+            ));
+            return;
+        }
+
+        self.pane_size_percent = next;
+        self.persist_current_pane_size();
+
+        match save(&self.cfg) {
+            Ok(()) => self.set_operator_note(format!(
+                "pane size set to {}% for {} layout | saved to {}",
+                self.pane_size_percent,
+                self.layout_label(),
+                config_path.display()
+            )),
+            Err(error) => {
+                self.pane_size_percent = previous_size;
+                self.cfg.linear_pane_size_percent = previous_linear;
+                self.cfg.grid_pane_size_percent = previous_grid;
+                self.set_operator_note(format!("failed to persist pane size: {error}"));
+            }
+        }
+    }
+
+    fn persist_current_pane_size(&mut self) {
+        match self.cfg.pane_layout {
+            PaneLayout::Horizontal | PaneLayout::Vertical => {
+                self.cfg.linear_pane_size_percent = self.pane_size_percent;
+            }
+            PaneLayout::Grid => {
+                self.cfg.grid_pane_size_percent = self.pane_size_percent;
+            }
+        }
+    }
+
+    pub fn toggle_theme(&mut self) {
+        let config_path = crate::config::Config::config_path();
+        self.toggle_theme_with_save(&config_path, |cfg| cfg.save());
+    }
+
+    fn toggle_theme_with_save<F>(&mut self, config_path: &std::path::Path, save: F)
+    where
+        F: FnOnce(&Config) -> anyhow::Result<()>,
+    {
+        let previous_theme = self.cfg.theme;
+        self.cfg.theme = match self.cfg.theme {
+            Theme::Dark => Theme::Light,
+            Theme::Light => Theme::Dark,
+        };
+
+        match save(&self.cfg) {
+            Ok(()) => self.set_operator_note(format!(
+                "theme set to {} | saved to {}",
+                self.theme_label(),
+                config_path.display()
+            )),
+            Err(error) => {
+                self.cfg.theme = previous_theme;
+                self.set_operator_note(format!("failed to persist theme: {error}"));
+            }
+        }
+    }
+
     pub fn increase_pane_size(&mut self) {
-        self.pane_size_percent =
-            (self.pane_size_percent + PANE_RESIZE_STEP_PERCENT).min(MAX_PANE_SIZE_PERCENT);
+        let config_path = crate::config::Config::config_path();
+        self.adjust_pane_size_with_save(PANE_RESIZE_STEP_PERCENT as isize, &config_path, |cfg| {
+            cfg.save()
+        });
     }
 
     pub fn decrease_pane_size(&mut self) {
-        self.pane_size_percent = self
-            .pane_size_percent
-            .saturating_sub(PANE_RESIZE_STEP_PERCENT)
-            .max(MIN_PANE_SIZE_PERCENT);
+        let config_path = crate::config::Config::config_path();
+        self.adjust_pane_size_with_save(
+            -(PANE_RESIZE_STEP_PERCENT as isize),
+            &config_path,
+            |cfg| cfg.save(),
+        );
     }
 
     pub fn scroll_down(&mut self) {
@@ -2330,7 +2463,7 @@ impl Dashboard {
 
     fn pane_border_style(&self, pane: Pane) -> Style {
         if self.selected_pane == pane {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(self.theme_palette().accent)
         } else {
             Style::default()
         }
@@ -2341,6 +2474,30 @@ impl Dashboard {
             PaneLayout::Horizontal => "horizontal",
             PaneLayout::Vertical => "vertical",
             PaneLayout::Grid => "grid",
+        }
+    }
+
+    fn theme_label(&self) -> &'static str {
+        match self.cfg.theme {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+        }
+    }
+
+    fn theme_palette(&self) -> ThemePalette {
+        match self.cfg.theme {
+            Theme::Dark => ThemePalette {
+                accent: Color::Cyan,
+                row_highlight_bg: Color::DarkGray,
+                muted: Color::DarkGray,
+                help_border: Color::Yellow,
+            },
+            Theme::Light => ThemePalette {
+                accent: Color::Blue,
+                row_highlight_bg: Color::Gray,
+                muted: Color::Black,
+                help_border: Color::Blue,
+            },
         }
     }
 
@@ -2570,6 +2727,15 @@ fn truncate_for_dashboard(value: &str, max_chars: usize) -> String {
 
     let truncated: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
     format!("{truncated}…")
+}
+
+fn configured_pane_size(cfg: &Config, layout: PaneLayout) -> u16 {
+    let configured = match layout {
+        PaneLayout::Horizontal | PaneLayout::Vertical => cfg.linear_pane_size_percent,
+        PaneLayout::Grid => cfg.grid_pane_size_percent,
+    };
+
+    configured.clamp(MIN_PANE_SIZE_PERCENT, MAX_PANE_SIZE_PERCENT)
 }
 
 fn build_worktree_diff_columns(patch: &str) -> WorktreeDiffColumns {
@@ -4164,12 +4330,12 @@ diff --git a/src/next.rs b/src/next.rs
         dashboard.pane_size_percent = DEFAULT_GRID_SIZE_PERCENT;
 
         for _ in 0..20 {
-            dashboard.increase_pane_size();
+            dashboard.adjust_pane_size_with_save(5, Path::new("/tmp/ecc2-noop.toml"), |_| Ok(()));
         }
         assert_eq!(dashboard.pane_size_percent, MAX_PANE_SIZE_PERCENT);
 
         for _ in 0..40 {
-            dashboard.decrease_pane_size();
+            dashboard.adjust_pane_size_with_save(-5, Path::new("/tmp/ecc2-noop.toml"), |_| Ok(()));
         }
         assert_eq!(dashboard.pane_size_percent, MIN_PANE_SIZE_PERCENT);
     }
@@ -4190,6 +4356,123 @@ diff --git a/src/next.rs b/src/next.rs
         assert_eq!(dashboard.selected_pane, Pane::Log);
     }
 
+    #[test]
+    fn cycle_pane_layout_rotates_and_hides_log_when_leaving_grid() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.pane_layout = PaneLayout::Grid;
+        dashboard.cfg.linear_pane_size_percent = 44;
+        dashboard.cfg.grid_pane_size_percent = 77;
+        dashboard.pane_size_percent = 77;
+        dashboard.selected_pane = Pane::Log;
+
+        dashboard.cycle_pane_layout();
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Horizontal);
+        assert_eq!(dashboard.pane_size_percent, 44);
+        assert_eq!(dashboard.selected_pane, Pane::Sessions);
+    }
+
+    #[test]
+    fn cycle_pane_layout_persists_config() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        let tempdir = std::env::temp_dir().join(format!("ecc2-layout-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tempdir).unwrap();
+        let config_path = tempdir.join("ecc2.toml");
+
+        dashboard.cycle_pane_layout_with_save(&config_path, |cfg| cfg.save_to_path(&config_path));
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Vertical);
+        let expected_note = format!(
+            "pane layout set to vertical | saved to {}",
+            config_path.display()
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some(expected_note.as_str())
+        );
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.pane_layout, PaneLayout::Vertical);
+        let _ = std::fs::remove_dir_all(tempdir);
+    }
+
+    #[test]
+    fn pane_resize_persists_linear_setting() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        let tempdir = std::env::temp_dir().join(format!("ecc2-pane-size-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tempdir).unwrap();
+        let config_path = tempdir.join("ecc2.toml");
+
+        dashboard.adjust_pane_size_with_save(5, &config_path, |cfg| cfg.save_to_path(&config_path));
+
+        assert_eq!(dashboard.pane_size_percent, 40);
+        assert_eq!(dashboard.cfg.linear_pane_size_percent, 40);
+        let expected_note = format!(
+            "pane size set to 40% for horizontal layout | saved to {}",
+            config_path.display()
+        );
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some(expected_note.as_str())
+        );
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.linear_pane_size_percent, 40);
+        assert_eq!(loaded.grid_pane_size_percent, 50);
+        let _ = std::fs::remove_dir_all(tempdir);
+    }
+
+    #[test]
+    fn cycle_pane_layout_uses_persisted_grid_size() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.pane_layout = PaneLayout::Vertical;
+        dashboard.cfg.linear_pane_size_percent = 41;
+        dashboard.cfg.grid_pane_size_percent = 63;
+        dashboard.pane_size_percent = 41;
+
+        dashboard.cycle_pane_layout_with_save(Path::new("/tmp/ecc2-noop.toml"), |_| Ok(()));
+
+        assert_eq!(dashboard.cfg.pane_layout, PaneLayout::Grid);
+        assert_eq!(dashboard.pane_size_percent, 63);
+    }
+
+    #[test]
+    fn toggle_theme_persists_config() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        let tempdir = std::env::temp_dir().join(format!("ecc2-theme-policy-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&tempdir).unwrap();
+        let config_path = tempdir.join("ecc2.toml");
+
+        dashboard.toggle_theme_with_save(&config_path, |cfg| cfg.save_to_path(&config_path));
+
+        assert_eq!(dashboard.cfg.theme, Theme::Light);
+        let expected_note = format!("theme set to light | saved to {}", config_path.display());
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some(expected_note.as_str())
+        );
+
+        let saved = std::fs::read_to_string(&config_path).unwrap();
+        let loaded: Config = toml::from_str(&saved).unwrap();
+        assert_eq!(loaded.theme, Theme::Light);
+        let _ = std::fs::remove_dir_all(tempdir);
+    }
+
+    #[test]
+    fn light_theme_uses_light_palette_accent() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.theme = Theme::Light;
+        dashboard.selected_pane = Pane::Sessions;
+
+        assert_eq!(
+            dashboard.pane_border_style(Pane::Sessions),
+            Style::default().fg(Color::Blue)
+        );
+        assert_eq!(dashboard.theme_palette().row_highlight_bg, Color::Gray);
+    }
+
     fn test_dashboard(sessions: Vec<Session>, selected_session: usize) -> Dashboard {
         let selected_session = selected_session.min(sessions.len().saturating_sub(1));
         let cfg = Config::default();
@@ -4202,10 +4485,7 @@ diff --git a/src/next.rs b/src/next.rs
 
         Dashboard {
             db: StateStore::open(Path::new(":memory:")).expect("open test db"),
-            pane_size_percent: match cfg.pane_layout {
-                PaneLayout::Grid => DEFAULT_GRID_SIZE_PERCENT,
-                PaneLayout::Horizontal | PaneLayout::Vertical => DEFAULT_PANE_SIZE_PERCENT,
-            },
+            pane_size_percent: configured_pane_size(&cfg, cfg.pane_layout),
             cfg,
             output_store,
             output_rx,
@@ -4257,6 +4537,8 @@ diff --git a/src/next.rs b/src/next.rs
             token_budget: 500_000,
             theme: Theme::Dark,
             pane_layout: PaneLayout::Horizontal,
+            linear_pane_size_percent: 35,
+            grid_pane_size_percent: 50,
             risk_thresholds: Config::RISK_THRESHOLDS,
         }
     }
