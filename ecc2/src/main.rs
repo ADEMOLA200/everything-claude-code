@@ -6,11 +6,13 @@ mod session;
 mod tui;
 mod worktree;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
@@ -320,6 +322,11 @@ enum Commands {
         #[command(subcommand)]
         command: GraphCommands,
     },
+    /// Manage persistent scheduled task dispatch
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommands,
+    },
     /// Export sessions, tool spans, and metrics in OTLP-compatible JSON
     ExportOtel {
         /// Session ID or alias. Omit to export all sessions.
@@ -372,6 +379,8 @@ enum MessageCommands {
         text: String,
         #[arg(long)]
         context: Option<String>,
+        #[arg(long, value_enum, default_value_t = TaskPriorityArg::Normal)]
+        priority: TaskPriorityArg,
         #[arg(long)]
         file: Vec<String>,
     },
@@ -380,6 +389,56 @@ enum MessageCommands {
         session_id: String,
         #[arg(long, default_value_t = 10)]
         limit: usize,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum ScheduleCommands {
+    /// Add a persistent scheduled task
+    Add {
+        /// Cron expression in 5, 6, or 7-field form
+        #[arg(long)]
+        cron: String,
+        /// Task description to run on each schedule
+        #[arg(short, long)]
+        task: String,
+        /// Agent type (claude, codex, gemini, opencode)
+        #[arg(short, long)]
+        agent: Option<String>,
+        /// Agent profile defined in ecc2.toml
+        #[arg(long)]
+        profile: Option<String>,
+        #[command(flatten)]
+        worktree: WorktreePolicyArgs,
+        /// Optional project grouping override
+        #[arg(long)]
+        project: Option<String>,
+        /// Optional task-group grouping override
+        #[arg(long)]
+        task_group: Option<String>,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// List scheduled tasks
+    List {
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a scheduled task
+    Remove {
+        /// Schedule ID
+        schedule_id: i64,
+    },
+    /// Dispatch currently due scheduled tasks
+    RunDue {
+        /// Maximum due schedules to dispatch in one pass
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -457,6 +516,110 @@ enum GraphCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Record an observation against a context graph entity
+    AddObservation {
+        /// Optional source session ID or alias for provenance
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Entity ID
+        #[arg(long)]
+        entity_id: i64,
+        /// Observation type such as completion_summary, incident_note, or reminder
+        #[arg(long = "type")]
+        observation_type: String,
+        /// Observation priority
+        #[arg(long, value_enum, default_value_t = ObservationPriorityArg::Normal)]
+        priority: ObservationPriorityArg,
+        /// Keep this observation across aggressive compaction
+        #[arg(long)]
+        pinned: bool,
+        /// Observation summary
+        #[arg(long)]
+        summary: String,
+        /// Details in key=value form
+        #[arg(long = "detail")]
+        details: Vec<String>,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Pin an existing observation so compaction preserves it
+    PinObservation {
+        /// Observation ID
+        #[arg(long)]
+        observation_id: i64,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove the pin from an existing observation
+    UnpinObservation {
+        /// Observation ID
+        #[arg(long)]
+        observation_id: i64,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// List observations in the shared context graph
+    Observations {
+        /// Filter to observations for a specific entity ID
+        #[arg(long)]
+        entity_id: Option<i64>,
+        /// Maximum observations to return
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compact stored observations in the shared context graph
+    Compact {
+        /// Filter by source session ID or alias
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Maximum observations to retain per entity after compaction
+        #[arg(long, default_value_t = 12)]
+        keep_observations_per_entity: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import external memory from a configured connector
+    ConnectorSync {
+        /// Connector name from ecc2.toml
+        #[arg(required_unless_present = "all", conflicts_with = "all")]
+        name: Option<String>,
+        /// Sync every configured memory connector
+        #[arg(long, required_unless_present = "name")]
+        all: bool,
+        /// Maximum non-empty records to process
+        #[arg(long, default_value_t = 256)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show configured memory connectors plus checkpoint status
+    Connectors {
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recall relevant context graph entities for a query
+    Recall {
+        /// Filter by source session ID or alias
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Natural-language query used for recall scoring
+        query: String,
+        /// Maximum entities to return
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
     /// Show one entity plus its incoming and outgoing relations
     Show {
         /// Entity ID
@@ -491,6 +654,119 @@ enum MessageKindArg {
     Response,
     Completed,
     Conflict,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskPriorityArg {
+    Low,
+    Normal,
+    High,
+    Critical,
+}
+
+impl From<TaskPriorityArg> for comms::TaskPriority {
+    fn from(value: TaskPriorityArg) -> Self {
+        match value {
+            TaskPriorityArg::Low => Self::Low,
+            TaskPriorityArg::Normal => Self::Normal,
+            TaskPriorityArg::High => Self::High,
+            TaskPriorityArg::Critical => Self::Critical,
+        }
+    }
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum ObservationPriorityArg {
+    Low,
+    Normal,
+    High,
+    Critical,
+}
+
+impl From<ObservationPriorityArg> for session::ContextObservationPriority {
+    fn from(value: ObservationPriorityArg) -> Self {
+        match value {
+            ObservationPriorityArg::Low => Self::Low,
+            ObservationPriorityArg::Normal => Self::Normal,
+            ObservationPriorityArg::High => Self::High,
+            ObservationPriorityArg::Critical => Self::Critical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphConnectorSyncStats {
+    connector_name: String,
+    records_read: usize,
+    entities_upserted: usize,
+    observations_added: usize,
+    skipped_records: usize,
+    skipped_unchanged_sources: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphConnectorSyncReport {
+    connectors_synced: usize,
+    records_read: usize,
+    entities_upserted: usize,
+    observations_added: usize,
+    skipped_records: usize,
+    skipped_unchanged_sources: usize,
+    connectors: Vec<GraphConnectorSyncStats>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphConnectorStatus {
+    connector_name: String,
+    connector_kind: String,
+    source_path: String,
+    recurse: bool,
+    default_session_id: Option<String>,
+    default_entity_type: Option<String>,
+    default_observation_type: Option<String>,
+    synced_sources: usize,
+    last_synced_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct GraphConnectorStatusReport {
+    configured_connectors: usize,
+    connectors: Vec<GraphConnectorStatus>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct JsonlMemoryConnectorRecord {
+    session_id: Option<String>,
+    entity_type: Option<String>,
+    entity_name: String,
+    path: Option<String>,
+    entity_summary: Option<String>,
+    metadata: BTreeMap<String, String>,
+    observation_type: Option<String>,
+    summary: String,
+    details: BTreeMap<String, String>,
+}
+
+const MARKDOWN_CONNECTOR_SUMMARY_LIMIT: usize = 160;
+const MARKDOWN_CONNECTOR_BODY_LIMIT: usize = 4000;
+const DOTENV_CONNECTOR_VALUE_LIMIT: usize = 160;
+
+#[derive(Debug, Clone)]
+struct MarkdownMemorySection {
+    heading: String,
+    path: String,
+    summary: String,
+    body: String,
+    line_number: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DotenvMemoryEntry {
+    key: String,
+    path: String,
+    summary: String,
+    details: BTreeMap<String, String>,
 }
 
 #[tokio::main]
@@ -950,8 +1226,13 @@ async fn main() -> Result<()> {
         Some(Commands::Sessions) => {
             sync_runtime_session_metrics(&db, &cfg)?;
             let sessions = session::manager::list_sessions(&db)?;
+            let harnesses = db.list_session_harnesses().unwrap_or_default();
             for s in sessions {
-                println!("{} [{}] {}", s.id, s.state, s.task);
+                let harness = harnesses
+                    .get(&s.id)
+                    .map(|info| info.primary_label.clone())
+                    .unwrap_or_else(|| session::SessionHarnessInfo::runner_key(&s.agent_type));
+                println!("{} [{}] [{}] {}", s.id, s.state, harness, s.task);
             }
         }
         Some(Commands::Status { session_id }) => {
@@ -1229,6 +1510,160 @@ async fn main() -> Result<()> {
                     println!("{}", format_graph_relations_human(&relations));
                 }
             }
+            GraphCommands::AddObservation {
+                session_id,
+                entity_id,
+                observation_type,
+                priority,
+                pinned,
+                summary,
+                details,
+                json,
+            } => {
+                let resolved_session_id = session_id
+                    .as_deref()
+                    .map(|value| resolve_session_id(&db, value))
+                    .transpose()?;
+                let details = parse_key_value_pairs(&details, "graph observation details")?;
+                let observation = db.add_context_observation(
+                    resolved_session_id.as_deref(),
+                    entity_id,
+                    &observation_type,
+                    priority.into(),
+                    pinned,
+                    &summary,
+                    &details,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&observation)?);
+                } else {
+                    println!("{}", format_graph_observation_human(&observation));
+                }
+            }
+            GraphCommands::PinObservation {
+                observation_id,
+                json,
+            } => {
+                let Some(observation) = db.set_context_observation_pinned(observation_id, true)?
+                else {
+                    return Err(anyhow::anyhow!(
+                        "Context graph observation #{observation_id} was not found"
+                    ));
+                };
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&observation)?);
+                } else {
+                    println!("{}", format_graph_observation_human(&observation));
+                }
+            }
+            GraphCommands::UnpinObservation {
+                observation_id,
+                json,
+            } => {
+                let Some(observation) = db.set_context_observation_pinned(observation_id, false)?
+                else {
+                    return Err(anyhow::anyhow!(
+                        "Context graph observation #{observation_id} was not found"
+                    ));
+                };
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&observation)?);
+                } else {
+                    println!("{}", format_graph_observation_human(&observation));
+                }
+            }
+            GraphCommands::Observations {
+                entity_id,
+                limit,
+                json,
+            } => {
+                let observations = db.list_context_observations(entity_id, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&observations)?);
+                } else {
+                    println!("{}", format_graph_observations_human(&observations));
+                }
+            }
+            GraphCommands::Compact {
+                session_id,
+                keep_observations_per_entity,
+                json,
+            } => {
+                let resolved_session_id = session_id
+                    .as_deref()
+                    .map(|value| resolve_session_id(&db, value))
+                    .transpose()?;
+                let stats = db.compact_context_graph(
+                    resolved_session_id.as_deref(),
+                    keep_observations_per_entity,
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&stats)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_graph_compaction_stats_human(
+                            &stats,
+                            resolved_session_id.as_deref(),
+                            keep_observations_per_entity,
+                        )
+                    );
+                }
+            }
+            GraphCommands::ConnectorSync {
+                name,
+                all,
+                limit,
+                json,
+            } => {
+                if all {
+                    let report = sync_all_memory_connectors(&db, &cfg, limit)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    } else {
+                        println!("{}", format_graph_connector_sync_report_human(&report));
+                    }
+                } else {
+                    let name = name.as_deref().ok_or_else(|| {
+                        anyhow::anyhow!("connector name required unless --all is set")
+                    })?;
+                    let stats = sync_memory_connector(&db, &cfg, name, limit)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&stats)?);
+                    } else {
+                        println!("{}", format_graph_connector_sync_stats_human(&stats));
+                    }
+                }
+            }
+            GraphCommands::Connectors { json } => {
+                let report = memory_connector_status_report(&db, &cfg)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_graph_connector_status_report_human(&report));
+                }
+            }
+            GraphCommands::Recall {
+                session_id,
+                query,
+                limit,
+                json,
+            } => {
+                let resolved_session_id = session_id
+                    .as_deref()
+                    .map(|value| resolve_session_id(&db, value))
+                    .transpose()?;
+                let entries =
+                    db.recall_context_entities(resolved_session_id.as_deref(), &query, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                } else {
+                    println!(
+                        "{}",
+                        format_graph_recall_human(&entries, resolved_session_id.as_deref(), &query)
+                    );
+                }
+            }
             GraphCommands::Show {
                 entity_id,
                 limit,
@@ -1306,11 +1741,12 @@ async fn main() -> Result<()> {
                 kind,
                 text,
                 context,
+                priority,
                 file,
             } => {
                 let from = resolve_session_id(&db, &from)?;
                 let to = resolve_session_id(&db, &to)?;
-                let message = build_message(kind, text, context, file)?;
+                let message = build_message(kind, text, context, priority, file)?;
                 comms::send(&db, &from, &to, &message)?;
                 println!(
                     "Message sent: {} -> {}",
@@ -1341,6 +1777,90 @@ async fn main() -> Result<()> {
                             short_session(&message.from_session),
                             short_session(&message.to_session),
                             comms::preview(&message.msg_type, &message.content)
+                        );
+                    }
+                }
+            }
+        },
+        Some(Commands::Schedule { command }) => match command {
+            ScheduleCommands::Add {
+                cron,
+                task,
+                agent,
+                profile,
+                worktree,
+                project,
+                task_group,
+                json,
+            } => {
+                let schedule = session::manager::create_scheduled_task(
+                    &db,
+                    &cfg,
+                    &cron,
+                    &task,
+                    agent.as_deref().unwrap_or(&cfg.default_agent),
+                    profile.as_deref(),
+                    worktree.resolve(&cfg),
+                    session::SessionGrouping {
+                        project,
+                        task_group,
+                    },
+                )?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&schedule)?);
+                } else {
+                    println!(
+                        "Scheduled task {} next runs at {}",
+                        schedule.id,
+                        schedule.next_run_at.to_rfc3339()
+                    );
+                    println!(
+                        "- {} [{}] | {}",
+                        schedule.task, schedule.agent_type, schedule.cron_expr
+                    );
+                }
+            }
+            ScheduleCommands::List { json } => {
+                let schedules = session::manager::list_scheduled_tasks(&db)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&schedules)?);
+                } else if schedules.is_empty() {
+                    println!("No scheduled tasks");
+                } else {
+                    println!("Scheduled tasks");
+                    for schedule in schedules {
+                        println!(
+                            "#{} {} [{}] | {} | next {}",
+                            schedule.id,
+                            schedule.task,
+                            schedule.agent_type,
+                            schedule.cron_expr,
+                            schedule.next_run_at.to_rfc3339()
+                        );
+                    }
+                }
+            }
+            ScheduleCommands::Remove { schedule_id } => {
+                if !session::manager::delete_scheduled_task(&db, schedule_id)? {
+                    anyhow::bail!("Scheduled task not found: {schedule_id}");
+                }
+                println!("Removed scheduled task {schedule_id}");
+            }
+            ScheduleCommands::RunDue { limit, json } => {
+                let outcomes = session::manager::run_due_schedules(&db, &cfg, limit).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcomes)?);
+                } else if outcomes.is_empty() {
+                    println!("No due scheduled tasks");
+                } else {
+                    println!("Dispatched {} scheduled task(s)", outcomes.len());
+                    for outcome in outcomes {
+                        println!(
+                            "#{} -> {} | {} | next {}",
+                            outcome.schedule_id,
+                            short_session(&outcome.session_id),
+                            outcome.task,
+                            outcome.next_run_at.to_rfc3339()
                         );
                     }
                 }
@@ -1388,16 +1908,968 @@ fn sync_runtime_session_metrics(
     Ok(())
 }
 
+fn sync_memory_connector(
+    db: &session::store::StateStore,
+    cfg: &config::Config,
+    name: &str,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    let connector = cfg
+        .memory_connectors
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("Unknown memory connector: {name}"))?;
+
+    match connector {
+        config::MemoryConnectorConfig::JsonlFile(settings) => {
+            sync_jsonl_memory_connector(db, name, settings, limit)
+        }
+        config::MemoryConnectorConfig::JsonlDirectory(settings) => {
+            sync_jsonl_directory_memory_connector(db, name, settings, limit)
+        }
+        config::MemoryConnectorConfig::MarkdownFile(settings) => {
+            sync_markdown_memory_connector(db, name, settings, limit)
+        }
+        config::MemoryConnectorConfig::MarkdownDirectory(settings) => {
+            sync_markdown_directory_memory_connector(db, name, settings, limit)
+        }
+        config::MemoryConnectorConfig::DotenvFile(settings) => {
+            sync_dotenv_memory_connector(db, name, settings, limit)
+        }
+    }
+}
+
+fn sync_all_memory_connectors(
+    db: &session::store::StateStore,
+    cfg: &config::Config,
+    limit: usize,
+) -> Result<GraphConnectorSyncReport> {
+    let mut report = GraphConnectorSyncReport::default();
+
+    for name in cfg.memory_connectors.keys() {
+        let stats = sync_memory_connector(db, cfg, name, limit)?;
+        report.connectors_synced += 1;
+        report.records_read += stats.records_read;
+        report.entities_upserted += stats.entities_upserted;
+        report.observations_added += stats.observations_added;
+        report.skipped_records += stats.skipped_records;
+        report.skipped_unchanged_sources += stats.skipped_unchanged_sources;
+        report.connectors.push(stats);
+    }
+
+    Ok(report)
+}
+
+fn memory_connector_status_report(
+    db: &session::store::StateStore,
+    cfg: &config::Config,
+) -> Result<GraphConnectorStatusReport> {
+    let mut report = GraphConnectorStatusReport {
+        configured_connectors: cfg.memory_connectors.len(),
+        connectors: Vec::with_capacity(cfg.memory_connectors.len()),
+    };
+
+    for (name, connector) in &cfg.memory_connectors {
+        let checkpoint = db.connector_checkpoint_summary(name)?;
+        let (
+            connector_kind,
+            source_path,
+            recurse,
+            default_session_id,
+            default_entity_type,
+            default_observation_type,
+        ) = describe_memory_connector(connector);
+        report.connectors.push(GraphConnectorStatus {
+            connector_name: name.to_string(),
+            connector_kind,
+            source_path,
+            recurse,
+            default_session_id,
+            default_entity_type,
+            default_observation_type,
+            synced_sources: checkpoint.synced_sources,
+            last_synced_at: checkpoint.last_synced_at,
+        });
+    }
+
+    Ok(report)
+}
+
+fn describe_memory_connector(
+    connector: &config::MemoryConnectorConfig,
+) -> (
+    String,
+    String,
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    match connector {
+        config::MemoryConnectorConfig::JsonlFile(settings) => (
+            "jsonl_file".to_string(),
+            settings.path.display().to_string(),
+            false,
+            settings.session_id.clone(),
+            settings.default_entity_type.clone(),
+            settings.default_observation_type.clone(),
+        ),
+        config::MemoryConnectorConfig::JsonlDirectory(settings) => (
+            "jsonl_directory".to_string(),
+            settings.path.display().to_string(),
+            settings.recurse,
+            settings.session_id.clone(),
+            settings.default_entity_type.clone(),
+            settings.default_observation_type.clone(),
+        ),
+        config::MemoryConnectorConfig::MarkdownFile(settings) => (
+            "markdown_file".to_string(),
+            settings.path.display().to_string(),
+            false,
+            settings.session_id.clone(),
+            settings.default_entity_type.clone(),
+            settings.default_observation_type.clone(),
+        ),
+        config::MemoryConnectorConfig::MarkdownDirectory(settings) => (
+            "markdown_directory".to_string(),
+            settings.path.display().to_string(),
+            settings.recurse,
+            settings.session_id.clone(),
+            settings.default_entity_type.clone(),
+            settings.default_observation_type.clone(),
+        ),
+        config::MemoryConnectorConfig::DotenvFile(settings) => (
+            "dotenv_file".to_string(),
+            settings.path.display().to_string(),
+            false,
+            settings.session_id.clone(),
+            settings.default_entity_type.clone(),
+            settings.default_observation_type.clone(),
+        ),
+    }
+}
+
+fn sync_jsonl_memory_connector(
+    db: &session::store::StateStore,
+    name: &str,
+    settings: &config::MemoryConnectorJsonlFileConfig,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    if settings.path.as_os_str().is_empty() {
+        anyhow::bail!("memory connector {name} has no path configured");
+    }
+
+    let file = File::open(&settings.path)
+        .with_context(|| format!("open memory connector file {}", settings.path.display()))?;
+    let reader = BufReader::new(file);
+    let default_session_id = settings
+        .session_id
+        .as_deref()
+        .map(|value| resolve_session_id(db, value))
+        .transpose()?;
+    let source_path = settings.path.display().to_string();
+    let signature = connector_source_signature(&settings.path)?;
+    if db.connector_source_is_unchanged(name, &source_path, &signature)? {
+        return Ok(GraphConnectorSyncStats {
+            connector_name: name.to_string(),
+            skipped_unchanged_sources: 1,
+            ..Default::default()
+        });
+    }
+
+    let stats = sync_jsonl_memory_reader(
+        db,
+        name,
+        reader,
+        default_session_id.as_deref(),
+        settings.default_entity_type.as_deref(),
+        settings.default_observation_type.as_deref(),
+        limit,
+    )?;
+    if stats.records_read < limit {
+        db.upsert_connector_source_checkpoint(name, &source_path, &signature)?;
+    }
+    Ok(stats)
+}
+
+fn sync_jsonl_directory_memory_connector(
+    db: &session::store::StateStore,
+    name: &str,
+    settings: &config::MemoryConnectorJsonlDirectoryConfig,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    if settings.path.as_os_str().is_empty() {
+        anyhow::bail!("memory connector {name} has no path configured");
+    }
+    if !settings.path.is_dir() {
+        anyhow::bail!(
+            "memory connector {name} path is not a directory: {}",
+            settings.path.display()
+        );
+    }
+
+    let paths = collect_jsonl_paths(&settings.path, settings.recurse)?;
+    let default_session_id = settings
+        .session_id
+        .as_deref()
+        .map(|value| resolve_session_id(db, value))
+        .transpose()?;
+
+    let mut stats = GraphConnectorSyncStats {
+        connector_name: name.to_string(),
+        ..Default::default()
+    };
+
+    let mut remaining = limit;
+    for path in paths {
+        if remaining == 0 {
+            break;
+        }
+        let source_path = path.display().to_string();
+        let signature = connector_source_signature(&path)?;
+        if db.connector_source_is_unchanged(name, &source_path, &signature)? {
+            stats.skipped_unchanged_sources += 1;
+            continue;
+        }
+        let file = File::open(&path)
+            .with_context(|| format!("open memory connector file {}", path.display()))?;
+        let reader = BufReader::new(file);
+        let remaining_before = remaining;
+        let file_stats = sync_jsonl_memory_reader(
+            db,
+            name,
+            reader,
+            default_session_id.as_deref(),
+            settings.default_entity_type.as_deref(),
+            settings.default_observation_type.as_deref(),
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(file_stats.records_read);
+        stats.records_read += file_stats.records_read;
+        stats.entities_upserted += file_stats.entities_upserted;
+        stats.observations_added += file_stats.observations_added;
+        stats.skipped_records += file_stats.skipped_records;
+        stats.skipped_unchanged_sources += file_stats.skipped_unchanged_sources;
+        if file_stats.records_read < remaining_before {
+            db.upsert_connector_source_checkpoint(name, &source_path, &signature)?;
+        }
+    }
+
+    Ok(stats)
+}
+
+fn sync_jsonl_memory_reader<R: BufRead>(
+    db: &session::store::StateStore,
+    name: &str,
+    reader: R,
+    default_session_id: Option<&str>,
+    default_entity_type: Option<&str>,
+    default_observation_type: Option<&str>,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    let default_session_id = default_session_id.map(str::to_string);
+    let mut stats = GraphConnectorSyncStats {
+        connector_name: name.to_string(),
+        ..Default::default()
+    };
+
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if stats.records_read >= limit {
+            break;
+        }
+        stats.records_read += 1;
+
+        let record: JsonlMemoryConnectorRecord = match serde_json::from_str(trimmed) {
+            Ok(record) => record,
+            Err(_) => {
+                stats.skipped_records += 1;
+                continue;
+            }
+        };
+
+        import_memory_connector_record(
+            db,
+            &mut stats,
+            default_session_id.as_deref(),
+            default_entity_type,
+            default_observation_type,
+            record,
+        )?;
+    }
+
+    Ok(stats)
+}
+
+fn sync_markdown_memory_connector(
+    db: &session::store::StateStore,
+    name: &str,
+    settings: &config::MemoryConnectorMarkdownFileConfig,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    if settings.path.as_os_str().is_empty() {
+        anyhow::bail!("memory connector {name} has no path configured");
+    }
+
+    let default_session_id = settings
+        .session_id
+        .as_deref()
+        .map(|value| resolve_session_id(db, value))
+        .transpose()?;
+    let source_path = settings.path.display().to_string();
+    let signature = connector_source_signature(&settings.path)?;
+    if db.connector_source_is_unchanged(name, &source_path, &signature)? {
+        return Ok(GraphConnectorSyncStats {
+            connector_name: name.to_string(),
+            skipped_unchanged_sources: 1,
+            ..Default::default()
+        });
+    }
+    let stats = sync_markdown_memory_path(
+        db,
+        name,
+        "markdown_file",
+        &settings.path,
+        default_session_id.as_deref(),
+        settings.default_entity_type.as_deref(),
+        settings.default_observation_type.as_deref(),
+        limit,
+    )?;
+    if stats.records_read < limit {
+        db.upsert_connector_source_checkpoint(name, &source_path, &signature)?;
+    }
+    Ok(stats)
+}
+
+fn sync_markdown_directory_memory_connector(
+    db: &session::store::StateStore,
+    name: &str,
+    settings: &config::MemoryConnectorMarkdownDirectoryConfig,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    if settings.path.as_os_str().is_empty() {
+        anyhow::bail!("memory connector {name} has no path configured");
+    }
+    if !settings.path.is_dir() {
+        anyhow::bail!(
+            "memory connector {name} path is not a directory: {}",
+            settings.path.display()
+        );
+    }
+
+    let paths = collect_markdown_paths(&settings.path, settings.recurse)?;
+    let default_session_id = settings
+        .session_id
+        .as_deref()
+        .map(|value| resolve_session_id(db, value))
+        .transpose()?;
+
+    let mut stats = GraphConnectorSyncStats {
+        connector_name: name.to_string(),
+        ..Default::default()
+    };
+
+    let mut remaining = limit;
+    for path in paths {
+        if remaining == 0 {
+            break;
+        }
+        let source_path = path.display().to_string();
+        let signature = connector_source_signature(&path)?;
+        if db.connector_source_is_unchanged(name, &source_path, &signature)? {
+            stats.skipped_unchanged_sources += 1;
+            continue;
+        }
+        let remaining_before = remaining;
+        let file_stats = sync_markdown_memory_path(
+            db,
+            name,
+            "markdown_directory",
+            &path,
+            default_session_id.as_deref(),
+            settings.default_entity_type.as_deref(),
+            settings.default_observation_type.as_deref(),
+            remaining,
+        )?;
+        remaining = remaining.saturating_sub(file_stats.records_read);
+        stats.records_read += file_stats.records_read;
+        stats.entities_upserted += file_stats.entities_upserted;
+        stats.observations_added += file_stats.observations_added;
+        stats.skipped_records += file_stats.skipped_records;
+        stats.skipped_unchanged_sources += file_stats.skipped_unchanged_sources;
+        if file_stats.records_read < remaining_before {
+            db.upsert_connector_source_checkpoint(name, &source_path, &signature)?;
+        }
+    }
+
+    Ok(stats)
+}
+
+fn sync_markdown_memory_path(
+    db: &session::store::StateStore,
+    name: &str,
+    connector_kind: &str,
+    path: &Path,
+    default_session_id: Option<&str>,
+    default_entity_type: Option<&str>,
+    default_observation_type: Option<&str>,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    let body = std::fs::read_to_string(path)
+        .with_context(|| format!("read memory connector file {}", path.display()))?;
+    let sections = parse_markdown_memory_sections(path, &body, limit);
+    let mut stats = GraphConnectorSyncStats {
+        connector_name: name.to_string(),
+        ..Default::default()
+    };
+
+    for section in sections {
+        stats.records_read += 1;
+        let mut details = BTreeMap::new();
+        if !section.body.is_empty() {
+            details.insert("body".to_string(), section.body.clone());
+        }
+        details.insert("source_path".to_string(), path.display().to_string());
+        details.insert("line".to_string(), section.line_number.to_string());
+
+        let mut metadata = BTreeMap::new();
+        metadata.insert("connector".to_string(), connector_kind.to_string());
+
+        import_memory_connector_record(
+            db,
+            &mut stats,
+            default_session_id,
+            default_entity_type,
+            default_observation_type,
+            JsonlMemoryConnectorRecord {
+                session_id: None,
+                entity_type: None,
+                entity_name: section.heading,
+                path: Some(section.path),
+                entity_summary: Some(section.summary.clone()),
+                metadata,
+                observation_type: None,
+                summary: section.summary,
+                details,
+            },
+        )?;
+    }
+
+    Ok(stats)
+}
+
+fn sync_dotenv_memory_connector(
+    db: &session::store::StateStore,
+    name: &str,
+    settings: &config::MemoryConnectorDotenvFileConfig,
+    limit: usize,
+) -> Result<GraphConnectorSyncStats> {
+    if settings.path.as_os_str().is_empty() {
+        anyhow::bail!("memory connector {name} has no path configured");
+    }
+
+    let body = std::fs::read_to_string(&settings.path)
+        .with_context(|| format!("read memory connector file {}", settings.path.display()))?;
+    let default_session_id = settings
+        .session_id
+        .as_deref()
+        .map(|value| resolve_session_id(db, value))
+        .transpose()?;
+    let source_path = settings.path.display().to_string();
+    let signature = connector_source_signature(&settings.path)?;
+    if db.connector_source_is_unchanged(name, &source_path, &signature)? {
+        return Ok(GraphConnectorSyncStats {
+            connector_name: name.to_string(),
+            skipped_unchanged_sources: 1,
+            ..Default::default()
+        });
+    }
+    let entries = parse_dotenv_memory_entries(&settings.path, &body, settings, limit);
+    let mut stats = GraphConnectorSyncStats {
+        connector_name: name.to_string(),
+        ..Default::default()
+    };
+
+    for entry in entries {
+        stats.records_read += 1;
+        import_memory_connector_record(
+            db,
+            &mut stats,
+            default_session_id.as_deref(),
+            settings.default_entity_type.as_deref(),
+            settings.default_observation_type.as_deref(),
+            JsonlMemoryConnectorRecord {
+                session_id: None,
+                entity_type: None,
+                entity_name: entry.key,
+                path: Some(entry.path),
+                entity_summary: Some(entry.summary.clone()),
+                metadata: BTreeMap::from([("connector".to_string(), "dotenv_file".to_string())]),
+                observation_type: None,
+                summary: entry.summary,
+                details: entry.details,
+            },
+        )?;
+    }
+
+    if stats.records_read < limit {
+        db.upsert_connector_source_checkpoint(name, &source_path, &signature)?;
+    }
+
+    Ok(stats)
+}
+
+fn import_memory_connector_record(
+    db: &session::store::StateStore,
+    stats: &mut GraphConnectorSyncStats,
+    default_session_id: Option<&str>,
+    default_entity_type: Option<&str>,
+    default_observation_type: Option<&str>,
+    record: JsonlMemoryConnectorRecord,
+) -> Result<()> {
+    let session_id = match record.session_id.as_deref() {
+        Some(value) => match resolve_session_id(db, value) {
+            Ok(resolved) => Some(resolved),
+            Err(_) => {
+                stats.skipped_records += 1;
+                return Ok(());
+            }
+        },
+        None => default_session_id.map(str::to_string),
+    };
+    let entity_type = record
+        .entity_type
+        .as_deref()
+        .or(default_entity_type)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let observation_type = record
+        .observation_type
+        .as_deref()
+        .or(default_observation_type)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let entity_name = record.entity_name.trim();
+    let summary = record.summary.trim();
+
+    let Some(entity_type) = entity_type else {
+        stats.skipped_records += 1;
+        return Ok(());
+    };
+    let Some(observation_type) = observation_type else {
+        stats.skipped_records += 1;
+        return Ok(());
+    };
+    if entity_name.is_empty() || summary.is_empty() {
+        stats.skipped_records += 1;
+        return Ok(());
+    }
+
+    let entity_summary = record
+        .entity_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(summary);
+    let entity = db.upsert_context_entity(
+        session_id.as_deref(),
+        entity_type,
+        entity_name,
+        record.path.as_deref(),
+        entity_summary,
+        &record.metadata,
+    )?;
+    db.add_context_observation(
+        session_id.as_deref(),
+        entity.id,
+        observation_type,
+        session::ContextObservationPriority::Normal,
+        false,
+        summary,
+        &record.details,
+    )?;
+    stats.entities_upserted += 1;
+    stats.observations_added += 1;
+    Ok(())
+}
+
+fn collect_jsonl_paths(root: &Path, recurse: bool) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    collect_jsonl_paths_inner(root, recurse, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_markdown_paths(root: &Path, recurse: bool) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    collect_markdown_paths_inner(root, recurse, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn connector_source_signature(path: &Path) -> Result<String> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("read memory connector metadata {}", path.display()))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|timestamp| timestamp.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    Ok(format!("{}:{modified}", metadata.len()))
+}
+
+fn collect_jsonl_paths_inner(root: &Path, recurse: bool, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("read memory connector directory {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if recurse {
+                collect_jsonl_paths_inner(&path, recurse, paths)?;
+            }
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
+        {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_markdown_paths_inner(
+    root: &Path,
+    recurse: bool,
+    paths: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("read memory connector directory {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if recurse {
+                collect_markdown_paths_inner(&path, recurse, paths)?;
+            }
+            continue;
+        }
+        let is_markdown = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                value.eq_ignore_ascii_case("md") || value.eq_ignore_ascii_case("markdown")
+            });
+        if is_markdown {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn parse_dotenv_memory_entries(
+    path: &Path,
+    body: &str,
+    settings: &config::MemoryConnectorDotenvFileConfig,
+    limit: usize,
+) -> Vec<DotenvMemoryEntry> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut entries = Vec::new();
+    let source_path = path.display().to_string();
+
+    for (index, raw_line) in body.lines().enumerate() {
+        if entries.len() >= limit {
+            break;
+        }
+
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, value)) = parse_dotenv_assignment(line) else {
+            continue;
+        };
+        if !dotenv_key_included(key, settings) {
+            continue;
+        }
+
+        let value = parse_dotenv_value(value);
+        let secret_like = dotenv_key_is_secret(key);
+        let mut details = BTreeMap::new();
+        details.insert("source_path".to_string(), source_path.clone());
+        details.insert("line".to_string(), (index + 1).to_string());
+        details.insert("key".to_string(), key.to_string());
+        details.insert("secret_redacted".to_string(), secret_like.to_string());
+        if settings.include_safe_values && !secret_like && !value.is_empty() {
+            details.insert(
+                "value".to_string(),
+                truncate_connector_text(&value, DOTENV_CONNECTOR_VALUE_LIMIT),
+            );
+        }
+
+        let summary = if secret_like {
+            format!("{key} configured (secret redacted)")
+        } else if settings.include_safe_values && !value.is_empty() {
+            format!(
+                "{key}={}",
+                truncate_connector_text(&value, DOTENV_CONNECTOR_VALUE_LIMIT)
+            )
+        } else {
+            format!("{key} configured")
+        };
+
+        entries.push(DotenvMemoryEntry {
+            key: key.to_string(),
+            path: format!("{source_path}#{key}"),
+            summary,
+            details,
+        });
+    }
+
+    entries
+}
+
+fn parse_markdown_memory_sections(
+    path: &Path,
+    body: &str,
+    limit: usize,
+) -> Vec<MarkdownMemorySection> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let source_path = path.display().to_string();
+    let fallback_heading = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("note")
+        .trim()
+        .to_string();
+
+    let mut sections = Vec::new();
+    let mut preamble = Vec::new();
+    let mut current_heading: Option<(String, usize)> = None;
+    let mut current_body = Vec::new();
+
+    for (index, line) in body.lines().enumerate() {
+        let line_number = index + 1;
+        if let Some(heading) = markdown_heading_title(line) {
+            if let Some((title, start_line)) = current_heading.take() {
+                if let Some(section) = markdown_memory_section(
+                    &source_path,
+                    &title,
+                    start_line,
+                    &current_body.join("\n"),
+                ) {
+                    sections.push(section);
+                }
+            } else if !preamble.join("\n").trim().is_empty() {
+                if let Some(section) = markdown_memory_section(
+                    &source_path,
+                    &fallback_heading,
+                    1,
+                    &preamble.join("\n"),
+                ) {
+                    sections.push(section);
+                }
+            }
+
+            current_heading = Some((heading.to_string(), line_number));
+            current_body.clear();
+            continue;
+        }
+
+        if current_heading.is_some() {
+            current_body.push(line.to_string());
+        } else {
+            preamble.push(line.to_string());
+        }
+    }
+
+    if let Some((title, start_line)) = current_heading {
+        if let Some(section) =
+            markdown_memory_section(&source_path, &title, start_line, &current_body.join("\n"))
+        {
+            sections.push(section);
+        }
+    } else if let Some(section) =
+        markdown_memory_section(&source_path, &fallback_heading, 1, &preamble.join("\n"))
+    {
+        sections.push(section);
+    }
+
+    sections.truncate(limit);
+    sections
+}
+
+fn markdown_heading_title(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let title = trimmed[hashes..].trim_start();
+    if title.is_empty() {
+        return None;
+    }
+    Some(title.trim())
+}
+
+fn markdown_memory_section(
+    source_path: &str,
+    heading: &str,
+    line_number: usize,
+    body: &str,
+) -> Option<MarkdownMemorySection> {
+    let heading = heading.trim();
+    if heading.is_empty() {
+        return None;
+    }
+    let normalized_body = body.trim();
+    let summary = markdown_section_summary(heading, normalized_body);
+    if summary.is_empty() {
+        return None;
+    }
+    let slug = markdown_heading_slug(heading);
+    let path = if slug.is_empty() {
+        source_path.to_string()
+    } else {
+        format!("{source_path}#{slug}")
+    };
+
+    Some(MarkdownMemorySection {
+        heading: truncate_connector_text(heading, MARKDOWN_CONNECTOR_SUMMARY_LIMIT),
+        path,
+        summary,
+        body: truncate_connector_text(normalized_body, MARKDOWN_CONNECTOR_BODY_LIMIT),
+        line_number,
+    })
+}
+
+fn markdown_section_summary(heading: &str, body: &str) -> String {
+    let candidate = body
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(heading);
+    truncate_connector_text(candidate, MARKDOWN_CONNECTOR_SUMMARY_LIMIT)
+}
+
+fn markdown_heading_slug(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn truncate_connector_text(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let truncated: String = trimmed.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{truncated}…")
+}
+
+fn parse_dotenv_assignment(line: &str) -> Option<(&str, &str)> {
+    let trimmed = line.strip_prefix("export ").unwrap_or(line).trim();
+    let (key, value) = trimmed.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, value.trim()))
+}
+
+fn parse_dotenv_value(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(unquoted) = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        return unquoted.to_string();
+    }
+    if let Some(unquoted) = trimmed
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        return unquoted.to_string();
+    }
+    trimmed.to_string()
+}
+
+fn dotenv_key_included(key: &str, settings: &config::MemoryConnectorDotenvFileConfig) -> bool {
+    if settings
+        .exclude_keys
+        .iter()
+        .any(|candidate| candidate == key)
+    {
+        return false;
+    }
+    if !settings.include_keys.is_empty()
+        && settings
+            .include_keys
+            .iter()
+            .any(|candidate| candidate == key)
+    {
+        return true;
+    }
+    if settings.key_prefixes.is_empty() {
+        return settings.include_keys.is_empty();
+    }
+    settings
+        .key_prefixes
+        .iter()
+        .any(|prefix| !prefix.is_empty() && key.starts_with(prefix))
+}
+
+fn dotenv_key_is_secret(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    [
+        "SECRET",
+        "TOKEN",
+        "PASSWORD",
+        "PRIVATE_KEY",
+        "API_KEY",
+        "CLIENT_SECRET",
+        "ACCESS_KEY",
+    ]
+    .iter()
+    .any(|marker| upper.contains(marker))
+}
+
 fn build_message(
     kind: MessageKindArg,
     text: String,
     context: Option<String>,
+    priority: TaskPriorityArg,
     files: Vec<String>,
 ) -> Result<comms::MessageType> {
     Ok(match kind {
         MessageKindArg::Handoff => comms::MessageType::TaskHandoff {
             task: text,
             context: context.unwrap_or_default(),
+            priority: priority.into(),
         },
         MessageKindArg::Query => comms::MessageType::Query { question: text },
         MessageKindArg::Response => comms::MessageType::Response { answer: text },
@@ -2214,6 +3686,230 @@ fn format_graph_relations_human(relations: &[session::ContextGraphRelation]) -> 
     lines.join("\n")
 }
 
+fn format_graph_observation_human(observation: &session::ContextGraphObservation) -> String {
+    let mut lines = vec![
+        format!("Context graph observation #{}", observation.id),
+        format!(
+            "Entity: #{} [{}] {}",
+            observation.entity_id, observation.entity_type, observation.entity_name
+        ),
+        format!("Type: {}", observation.observation_type),
+        format!("Priority: {}", observation.priority),
+        format!("Pinned: {}", if observation.pinned { "yes" } else { "no" }),
+        format!("Summary: {}", observation.summary),
+    ];
+    if let Some(session_id) = observation.session_id.as_deref() {
+        lines.push(format!("Session: {}", short_session(session_id)));
+    }
+    if observation.details.is_empty() {
+        lines.push("Details: none recorded".to_string());
+    } else {
+        lines.push("Details:".to_string());
+        for (key, value) in &observation.details {
+            lines.push(format!("- {key}={value}"));
+        }
+    }
+    lines.push(format!(
+        "Created: {}",
+        observation.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
+    lines.join("\n")
+}
+
+fn format_graph_observations_human(observations: &[session::ContextGraphObservation]) -> String {
+    if observations.is_empty() {
+        return "No context graph observations found.".to_string();
+    }
+
+    let mut lines = vec![format!(
+        "Context graph observations: {}",
+        observations.len()
+    )];
+    for observation in observations {
+        let mut line = format!(
+            "- #{} [{}/{}{}] {}",
+            observation.id,
+            observation.observation_type,
+            observation.priority,
+            if observation.pinned { "/pinned" } else { "" },
+            observation.entity_name
+        );
+        if let Some(session_id) = observation.session_id.as_deref() {
+            line.push_str(&format!(" | {}", short_session(session_id)));
+        }
+        lines.push(line);
+        lines.push(format!("  summary {}", observation.summary));
+    }
+
+    lines.join("\n")
+}
+
+fn format_graph_recall_human(
+    entries: &[session::ContextGraphRecallEntry],
+    session_id: Option<&str>,
+    query: &str,
+) -> String {
+    if entries.is_empty() {
+        return format!("No relevant context graph entities found for query: {query}");
+    }
+
+    let scope = session_id
+        .map(short_session)
+        .unwrap_or_else(|| "all sessions".to_string());
+    let mut lines = vec![format!(
+        "Relevant memory: {} entries for \"{}\" ({scope})",
+        entries.len(),
+        query
+    )];
+    for entry in entries {
+        let mut line = format!(
+            "- #{} [{}] {} | score {} | relations {} | observations {} | priority {}",
+            entry.entity.id,
+            entry.entity.entity_type,
+            entry.entity.name,
+            entry.score,
+            entry.relation_count,
+            entry.observation_count,
+            entry.max_observation_priority
+        );
+        if entry.has_pinned_observation {
+            line.push_str(" | pinned");
+        }
+        if let Some(session_id) = entry.entity.session_id.as_deref() {
+            line.push_str(&format!(" | {}", short_session(session_id)));
+        }
+        lines.push(line);
+        if !entry.matched_terms.is_empty() {
+            lines.push(format!("  matches {}", entry.matched_terms.join(", ")));
+        }
+        if let Some(path) = entry.entity.path.as_deref() {
+            lines.push(format!("  path {path}"));
+        }
+        if !entry.entity.summary.is_empty() {
+            lines.push(format!("  summary {}", entry.entity.summary));
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_graph_compaction_stats_human(
+    stats: &session::ContextGraphCompactionStats,
+    session_id: Option<&str>,
+    keep_observations_per_entity: usize,
+) -> String {
+    let scope = session_id
+        .map(short_session)
+        .unwrap_or_else(|| "all sessions".to_string());
+    [
+        format!(
+            "Context graph compaction complete for {scope} (keep {keep_observations_per_entity} observations per entity)"
+        ),
+        format!("- entities scanned {}", stats.entities_scanned),
+        format!(
+            "- duplicate observations deleted {}",
+            stats.duplicate_observations_deleted
+        ),
+        format!(
+            "- overflow observations deleted {}",
+            stats.overflow_observations_deleted
+        ),
+        format!("- observations retained {}", stats.observations_retained),
+    ]
+    .join("\n")
+}
+
+fn format_graph_connector_sync_stats_human(stats: &GraphConnectorSyncStats) -> String {
+    [
+        format!("Memory connector sync complete: {}", stats.connector_name),
+        format!("- records read {}", stats.records_read),
+        format!("- entities upserted {}", stats.entities_upserted),
+        format!("- observations added {}", stats.observations_added),
+        format!("- skipped records {}", stats.skipped_records),
+        format!(
+            "- skipped unchanged sources {}",
+            stats.skipped_unchanged_sources
+        ),
+    ]
+    .join("\n")
+}
+
+fn format_graph_connector_sync_report_human(report: &GraphConnectorSyncReport) -> String {
+    let mut lines = vec![
+        format!(
+            "Memory connector sync complete: {} connector(s)",
+            report.connectors_synced
+        ),
+        format!("- records read {}", report.records_read),
+        format!("- entities upserted {}", report.entities_upserted),
+        format!("- observations added {}", report.observations_added),
+        format!("- skipped records {}", report.skipped_records),
+        format!(
+            "- skipped unchanged sources {}",
+            report.skipped_unchanged_sources
+        ),
+    ];
+
+    if !report.connectors.is_empty() {
+        lines.push(String::new());
+        lines.push("Connectors:".to_string());
+        for stats in &report.connectors {
+            lines.push(format!("- {}", stats.connector_name));
+            lines.push(format!("  records read {}", stats.records_read));
+            lines.push(format!("  entities upserted {}", stats.entities_upserted));
+            lines.push(format!("  observations added {}", stats.observations_added));
+            lines.push(format!("  skipped records {}", stats.skipped_records));
+            lines.push(format!(
+                "  skipped unchanged sources {}",
+                stats.skipped_unchanged_sources
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_graph_connector_status_report_human(report: &GraphConnectorStatusReport) -> String {
+    let mut lines = vec![format!(
+        "Memory connectors: {} configured",
+        report.configured_connectors
+    )];
+
+    if report.connectors.is_empty() {
+        lines.push("- none".to_string());
+        return lines.join("\n");
+    }
+
+    for connector in &report.connectors {
+        lines.push(format!(
+            "- {} [{}]",
+            connector.connector_name, connector.connector_kind
+        ));
+        lines.push(format!("  source {}", connector.source_path));
+        if connector.recurse {
+            lines.push("  recurse true".to_string());
+        }
+        lines.push(format!("  synced sources {}", connector.synced_sources));
+        lines.push(format!(
+            "  last synced {}",
+            connector
+                .last_synced_at
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_else(|| "never".to_string())
+        ));
+        if let Some(session_id) = &connector.default_session_id {
+            lines.push(format!("  default session {}", session_id));
+        }
+        if let Some(entity_type) = &connector.default_entity_type {
+            lines.push(format!("  default entity type {}", entity_type));
+        }
+        if let Some(observation_type) = &connector.default_observation_type {
+            lines.push(format!("  default observation type {}", observation_type));
+        }
+    }
+
+    lines.join("\n")
+}
+
 fn format_graph_entity_detail_human(detail: &session::ContextGraphEntityDetail) -> String {
     let mut lines = vec![format_graph_entity_human(&detail.entity)];
     lines.push(String::new());
@@ -2635,6 +4331,7 @@ fn send_handoff_message(db: &session::store::StateStore, from_id: &str, to_id: &
         &comms::MessageType::TaskHandoff {
             task: from_session.task,
             context,
+            priority: comms::TaskPriority::Normal,
         },
     )
 }
@@ -2812,6 +4509,7 @@ mod tests {
                         to,
                         kind,
                         text,
+                        priority,
                         ..
                     },
             }) => {
@@ -2819,8 +4517,54 @@ mod tests {
                 assert_eq!(to, "worker");
                 assert!(matches!(kind, MessageKindArg::Query));
                 assert_eq!(text, "Need context");
+                assert_eq!(priority, TaskPriorityArg::Normal);
             }
             _ => panic!("expected messages send subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_schedule_add_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "schedule",
+            "add",
+            "--cron",
+            "*/15 * * * *",
+            "--task",
+            "Check backlog health",
+            "--agent",
+            "codex",
+            "--profile",
+            "planner",
+            "--project",
+            "ecc-core",
+            "--task-group",
+            "scheduled maintenance",
+        ])
+        .expect("schedule add should parse");
+
+        match cli.command {
+            Some(Commands::Schedule {
+                command:
+                    ScheduleCommands::Add {
+                        cron,
+                        task,
+                        agent,
+                        profile,
+                        project,
+                        task_group,
+                        ..
+                    },
+            }) => {
+                assert_eq!(cron, "*/15 * * * *");
+                assert_eq!(task, "Check backlog health");
+                assert_eq!(agent.as_deref(), Some("codex"));
+                assert_eq!(profile.as_deref(), Some("planner"));
+                assert_eq!(project.as_deref(), Some("ecc-core"));
+                assert_eq!(task_group.as_deref(), Some("scheduled maintenance"));
+            }
+            _ => panic!("expected schedule add subcommand"),
         }
     }
 
@@ -4115,6 +5859,252 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_graph_recall_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "recall",
+            "--session-id",
+            "latest",
+            "--limit",
+            "4",
+            "--json",
+            "auth callback recovery",
+        ])
+        .expect("graph recall should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::Recall {
+                        session_id,
+                        query,
+                        limit,
+                        json,
+                    },
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("latest"));
+                assert_eq!(query, "auth callback recovery");
+                assert_eq!(limit, 4);
+                assert!(json);
+            }
+            _ => panic!("expected graph recall subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_add_observation_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "add-observation",
+            "--session-id",
+            "latest",
+            "--entity-id",
+            "7",
+            "--type",
+            "completion_summary",
+            "--pinned",
+            "--summary",
+            "Finished auth callback recovery",
+            "--detail",
+            "tests_run=2",
+            "--json",
+        ])
+        .expect("graph add-observation should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::AddObservation {
+                        session_id,
+                        entity_id,
+                        observation_type,
+                        priority,
+                        pinned,
+                        summary,
+                        details,
+                        json,
+                    },
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("latest"));
+                assert_eq!(entity_id, 7);
+                assert_eq!(observation_type, "completion_summary");
+                assert!(matches!(priority, ObservationPriorityArg::Normal));
+                assert!(pinned);
+                assert_eq!(summary, "Finished auth callback recovery");
+                assert_eq!(details, vec!["tests_run=2"]);
+                assert!(json);
+            }
+            _ => panic!("expected graph add-observation subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_pin_observation_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "pin-observation",
+            "--observation-id",
+            "42",
+            "--json",
+        ])
+        .expect("graph pin-observation should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::PinObservation {
+                        observation_id,
+                        json,
+                    },
+            }) => {
+                assert_eq!(observation_id, 42);
+                assert!(json);
+            }
+            _ => panic!("expected graph pin-observation subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_unpin_observation_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "unpin-observation",
+            "--observation-id",
+            "42",
+            "--json",
+        ])
+        .expect("graph unpin-observation should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::UnpinObservation {
+                        observation_id,
+                        json,
+                    },
+            }) => {
+                assert_eq!(observation_id, 42);
+                assert!(json);
+            }
+            _ => panic!("expected graph unpin-observation subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_compact_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "compact",
+            "--session-id",
+            "latest",
+            "--keep-observations-per-entity",
+            "6",
+            "--json",
+        ])
+        .expect("graph compact should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::Compact {
+                        session_id,
+                        keep_observations_per_entity,
+                        json,
+                    },
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("latest"));
+                assert_eq!(keep_observations_per_entity, 6);
+                assert!(json);
+            }
+            _ => panic!("expected graph compact subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_connector_sync_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "connector-sync",
+            "hermes_notes",
+            "--limit",
+            "32",
+            "--json",
+        ])
+        .expect("graph connector-sync should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::ConnectorSync {
+                        name,
+                        all,
+                        limit,
+                        json,
+                    },
+            }) => {
+                assert_eq!(name.as_deref(), Some("hermes_notes"));
+                assert!(!all);
+                assert_eq!(limit, 32);
+                assert!(json);
+            }
+            _ => panic!("expected graph connector-sync subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_connector_sync_all_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "graph",
+            "connector-sync",
+            "--all",
+            "--limit",
+            "16",
+            "--json",
+        ])
+        .expect("graph connector-sync --all should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command:
+                    GraphCommands::ConnectorSync {
+                        name,
+                        all,
+                        limit,
+                        json,
+                    },
+            }) => {
+                assert_eq!(name, None);
+                assert!(all);
+                assert_eq!(limit, 16);
+                assert!(json);
+            }
+            _ => panic!("expected graph connector-sync --all subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_graph_connectors_command() {
+        let cli = Cli::try_parse_from(["ecc", "graph", "connectors", "--json"])
+            .expect("graph connectors should parse");
+
+        match cli.command {
+            Some(Commands::Graph {
+                command: GraphCommands::Connectors { json },
+            }) => {
+                assert!(json);
+            }
+            _ => panic!("expected graph connectors subcommand"),
+        }
+    }
+
+    #[test]
     fn format_decisions_human_renders_details() {
         let text = format_decisions_human(
             &[session::DecisionLogEntry {
@@ -4194,6 +6184,863 @@ mod tests {
         assert!(text.contains("[returns] render_metrics -> #10 MetricsSnapshot"));
         assert!(text.contains("Incoming relations: 1"));
         assert!(text.contains("[contains] #6 dashboard.rs -> render_metrics"));
+    }
+
+    #[test]
+    fn format_graph_recall_human_renders_scores_and_matches() {
+        let text = format_graph_recall_human(
+            &[session::ContextGraphRecallEntry {
+                entity: session::ContextGraphEntity {
+                    id: 11,
+                    session_id: Some("sess-12345678".to_string()),
+                    entity_type: "file".to_string(),
+                    name: "callback.ts".to_string(),
+                    path: Some("src/routes/auth/callback.ts".to_string()),
+                    summary: "Handles auth callback recovery".to_string(),
+                    metadata: BTreeMap::new(),
+                    created_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                    updated_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                        .unwrap()
+                        .with_timezone(&chrono::Utc),
+                },
+                score: 319,
+                matched_terms: vec![
+                    "auth".to_string(),
+                    "callback".to_string(),
+                    "recovery".to_string(),
+                ],
+                relation_count: 2,
+                observation_count: 1,
+                max_observation_priority: session::ContextObservationPriority::High,
+                has_pinned_observation: true,
+            }],
+            Some("sess-12345678"),
+            "auth callback recovery",
+        );
+
+        assert!(text.contains("Relevant memory: 1 entries"));
+        assert!(text.contains("[file] callback.ts | score 319 | relations 2 | observations 1"));
+        assert!(text.contains("priority high"));
+        assert!(text.contains("| pinned"));
+        assert!(text.contains("matches auth, callback, recovery"));
+        assert!(text.contains("path src/routes/auth/callback.ts"));
+    }
+
+    #[test]
+    fn format_graph_observations_human_renders_summaries() {
+        let text = format_graph_observations_human(&[session::ContextGraphObservation {
+            id: 5,
+            session_id: Some("sess-12345678".to_string()),
+            entity_id: 11,
+            entity_type: "session".to_string(),
+            entity_name: "sess-12345678".to_string(),
+            observation_type: "completion_summary".to_string(),
+            priority: session::ContextObservationPriority::High,
+            pinned: true,
+            summary: "Finished auth callback recovery with 2 tests".to_string(),
+            details: BTreeMap::from([("tests_run".to_string(), "2".to_string())]),
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-04-10T01:02:03Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc),
+        }]);
+
+        assert!(text.contains("Context graph observations: 1"));
+        assert!(text.contains("[completion_summary/high/pinned] sess-12345678"));
+        assert!(text.contains("summary Finished auth callback recovery with 2 tests"));
+    }
+
+    #[test]
+    fn format_graph_compaction_stats_human_renders_counts() {
+        let text = format_graph_compaction_stats_human(
+            &session::ContextGraphCompactionStats {
+                entities_scanned: 3,
+                duplicate_observations_deleted: 2,
+                overflow_observations_deleted: 4,
+                observations_retained: 9,
+            },
+            Some("sess-12345678"),
+            6,
+        );
+
+        assert!(text.contains("Context graph compaction complete for sess-123"));
+        assert!(text.contains("keep 6 observations per entity"));
+        assert!(text.contains("- entities scanned 3"));
+        assert!(text.contains("- duplicate observations deleted 2"));
+        assert!(text.contains("- overflow observations deleted 4"));
+        assert!(text.contains("- observations retained 9"));
+    }
+
+    #[test]
+    fn format_graph_connector_sync_stats_human_renders_counts() {
+        let text = format_graph_connector_sync_stats_human(&GraphConnectorSyncStats {
+            connector_name: "hermes_notes".to_string(),
+            records_read: 4,
+            entities_upserted: 3,
+            observations_added: 3,
+            skipped_records: 1,
+            skipped_unchanged_sources: 2,
+        });
+
+        assert!(text.contains("Memory connector sync complete: hermes_notes"));
+        assert!(text.contains("- records read 4"));
+        assert!(text.contains("- entities upserted 3"));
+        assert!(text.contains("- observations added 3"));
+        assert!(text.contains("- skipped records 1"));
+        assert!(text.contains("- skipped unchanged sources 2"));
+    }
+
+    #[test]
+    fn format_graph_connector_sync_report_human_renders_totals_and_connectors() {
+        let text = format_graph_connector_sync_report_human(&GraphConnectorSyncReport {
+            connectors_synced: 2,
+            records_read: 7,
+            entities_upserted: 5,
+            observations_added: 5,
+            skipped_records: 2,
+            skipped_unchanged_sources: 3,
+            connectors: vec![
+                GraphConnectorSyncStats {
+                    connector_name: "hermes_notes".to_string(),
+                    records_read: 4,
+                    entities_upserted: 3,
+                    observations_added: 3,
+                    skipped_records: 1,
+                    skipped_unchanged_sources: 2,
+                },
+                GraphConnectorSyncStats {
+                    connector_name: "workspace_note".to_string(),
+                    records_read: 3,
+                    entities_upserted: 2,
+                    observations_added: 2,
+                    skipped_records: 1,
+                    skipped_unchanged_sources: 1,
+                },
+            ],
+        });
+
+        assert!(text.contains("Memory connector sync complete: 2 connector(s)"));
+        assert!(text.contains("- records read 7"));
+        assert!(text.contains("- skipped unchanged sources 3"));
+        assert!(text.contains("Connectors:"));
+        assert!(text.contains("- hermes_notes"));
+        assert!(text.contains("- workspace_note"));
+        assert!(text.contains("  skipped unchanged sources 2"));
+    }
+
+    #[test]
+    fn format_graph_connector_status_report_human_renders_connector_details() {
+        let text = format_graph_connector_status_report_human(&GraphConnectorStatusReport {
+            configured_connectors: 2,
+            connectors: vec![
+                GraphConnectorStatus {
+                    connector_name: "hermes_notes".to_string(),
+                    connector_kind: "jsonl_directory".to_string(),
+                    source_path: "/tmp/hermes-notes".to_string(),
+                    recurse: true,
+                    default_session_id: Some("latest".to_string()),
+                    default_entity_type: Some("incident".to_string()),
+                    default_observation_type: Some("external_note".to_string()),
+                    synced_sources: 3,
+                    last_synced_at: Some(
+                        chrono::DateTime::parse_from_rfc3339("2026-04-10T12:34:56Z")
+                            .unwrap()
+                            .with_timezone(&chrono::Utc),
+                    ),
+                },
+                GraphConnectorStatus {
+                    connector_name: "workspace_env".to_string(),
+                    connector_kind: "dotenv_file".to_string(),
+                    source_path: "/tmp/.env".to_string(),
+                    recurse: false,
+                    default_session_id: None,
+                    default_entity_type: None,
+                    default_observation_type: None,
+                    synced_sources: 0,
+                    last_synced_at: None,
+                },
+            ],
+        });
+
+        assert!(text.contains("Memory connectors: 2 configured"));
+        assert!(text.contains("- hermes_notes [jsonl_directory]"));
+        assert!(text.contains("  source /tmp/hermes-notes"));
+        assert!(text.contains("  recurse true"));
+        assert!(text.contains("  synced sources 3"));
+        assert!(text.contains("  last synced 2026-04-10T12:34:56+00:00"));
+        assert!(text.contains("  default session latest"));
+        assert!(text.contains("  default entity type incident"));
+        assert!(text.contains("  default observation type external_note"));
+        assert!(text.contains("- workspace_env [dotenv_file]"));
+        assert!(text.contains("  last synced never"));
+    }
+
+    #[test]
+    fn memory_connector_status_report_includes_checkpoint_state() -> Result<()> {
+        let tempdir = TestDir::new("graph-connector-status-report")?;
+        let db = session::store::StateStore::open(&tempdir.path().join("state.db"))?;
+
+        let markdown_path = tempdir.path().join("workspace-memory.md");
+        fs::write(
+            &markdown_path,
+            r#"# Billing incident
+Customer wiped setup and got charged twice after reinstalling.
+"#,
+        )?;
+
+        let mut cfg = config::Config::default();
+        cfg.memory_connectors.insert(
+            "workspace_note".to_string(),
+            config::MemoryConnectorConfig::MarkdownFile(
+                config::MemoryConnectorMarkdownFileConfig {
+                    path: markdown_path.clone(),
+                    session_id: Some("latest".to_string()),
+                    default_entity_type: Some("note_section".to_string()),
+                    default_observation_type: Some("external_note".to_string()),
+                },
+            ),
+        );
+        cfg.memory_connectors.insert(
+            "workspace_env".to_string(),
+            config::MemoryConnectorConfig::DotenvFile(config::MemoryConnectorDotenvFileConfig {
+                path: tempdir.path().join(".env"),
+                session_id: None,
+                default_entity_type: Some("service_config".to_string()),
+                default_observation_type: Some("external_config".to_string()),
+                key_prefixes: vec!["PUBLIC_".to_string()],
+                include_keys: Vec::new(),
+                exclude_keys: Vec::new(),
+                include_safe_values: true,
+            }),
+        );
+
+        db.upsert_connector_source_checkpoint(
+            "workspace_note",
+            &markdown_path.display().to_string(),
+            "sig-a",
+        )?;
+
+        let report = memory_connector_status_report(&db, &cfg)?;
+        assert_eq!(report.configured_connectors, 2);
+        assert_eq!(
+            report
+                .connectors
+                .iter()
+                .map(|connector| connector.connector_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspace_env", "workspace_note"]
+        );
+
+        let workspace_env = report
+            .connectors
+            .iter()
+            .find(|connector| connector.connector_name == "workspace_env")
+            .expect("workspace_env connector should exist");
+        assert_eq!(workspace_env.connector_kind, "dotenv_file");
+        assert_eq!(workspace_env.synced_sources, 0);
+        assert!(workspace_env.last_synced_at.is_none());
+
+        let workspace_note = report
+            .connectors
+            .iter()
+            .find(|connector| connector.connector_name == "workspace_note")
+            .expect("workspace_note connector should exist");
+        assert_eq!(workspace_note.connector_kind, "markdown_file");
+        assert_eq!(
+            workspace_note.source_path,
+            markdown_path.display().to_string()
+        );
+        assert_eq!(workspace_note.default_session_id.as_deref(), Some("latest"));
+        assert_eq!(
+            workspace_note.default_entity_type.as_deref(),
+            Some("note_section")
+        );
+        assert_eq!(
+            workspace_note.default_observation_type.as_deref(),
+            Some("external_note")
+        );
+        assert_eq!(workspace_note.synced_sources, 1);
+        assert!(workspace_note.last_synced_at.is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_memory_connector_imports_jsonl_observations() -> Result<()> {
+        let tempdir = TestDir::new("graph-connector-sync")?;
+        let db = session::store::StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = chrono::Utc::now();
+        db.insert_session(&session::Session {
+            id: "session-1".to_string(),
+            task: "recovery incident".to_string(),
+            project: "ecc-tools".to_string(),
+            task_group: "incident".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: session::SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: session::SessionMetrics::default(),
+        })?;
+
+        let connector_path = tempdir.path().join("hermes-memory.jsonl");
+        std::fs::write(
+            &connector_path,
+            [
+                serde_json::json!({
+                    "entity_name": "Auth callback recovery",
+                    "summary": "Customer wiped setup and got charged twice",
+                    "details": {"customer": "viktor"}
+                })
+                .to_string(),
+                serde_json::json!({
+                    "session_id": "latest",
+                    "entity_type": "file",
+                    "entity_name": "callback.ts",
+                    "path": "src/routes/auth/callback.ts",
+                    "observation_type": "incident_note",
+                    "summary": "Recovery flow needs portal-first routing"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )?;
+
+        let mut cfg = config::Config::default();
+        cfg.memory_connectors.insert(
+            "hermes_notes".to_string(),
+            config::MemoryConnectorConfig::JsonlFile(config::MemoryConnectorJsonlFileConfig {
+                path: connector_path,
+                session_id: Some("latest".to_string()),
+                default_entity_type: Some("incident".to_string()),
+                default_observation_type: Some("external_note".to_string()),
+            }),
+        );
+
+        let stats = sync_memory_connector(&db, &cfg, "hermes_notes", 10)?;
+        assert_eq!(stats.records_read, 2);
+        assert_eq!(stats.entities_upserted, 2);
+        assert_eq!(stats.observations_added, 2);
+        assert_eq!(stats.skipped_records, 0);
+
+        let recalled = db.recall_context_entities(None, "charged twice routing", 5)?;
+        assert_eq!(recalled.len(), 2);
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Auth callback recovery"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "callback.ts"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_memory_connector_skips_unchanged_jsonl_sources() -> Result<()> {
+        let tempdir = TestDir::new("graph-connector-sync-unchanged")?;
+        let db = session::store::StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = chrono::Utc::now();
+        db.insert_session(&session::Session {
+            id: "session-1".to_string(),
+            task: "recovery incident".to_string(),
+            project: "ecc-tools".to_string(),
+            task_group: "incident".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: session::SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: session::SessionMetrics::default(),
+        })?;
+
+        let connector_path = tempdir.path().join("hermes-memory.jsonl");
+        fs::write(
+            &connector_path,
+            serde_json::json!({
+                "entity_name": "Portal routing",
+                "summary": "Route reinstalls to portal before checkout",
+            })
+            .to_string(),
+        )?;
+
+        let mut cfg = config::Config::default();
+        cfg.memory_connectors.insert(
+            "hermes_notes".to_string(),
+            config::MemoryConnectorConfig::JsonlFile(config::MemoryConnectorJsonlFileConfig {
+                path: connector_path,
+                session_id: Some("latest".to_string()),
+                default_entity_type: Some("incident".to_string()),
+                default_observation_type: Some("external_note".to_string()),
+            }),
+        );
+
+        let first = sync_memory_connector(&db, &cfg, "hermes_notes", 10)?;
+        assert_eq!(first.records_read, 1);
+        assert_eq!(first.skipped_unchanged_sources, 0);
+
+        let second = sync_memory_connector(&db, &cfg, "hermes_notes", 10)?;
+        assert_eq!(second.records_read, 0);
+        assert_eq!(second.entities_upserted, 0);
+        assert_eq!(second.observations_added, 0);
+        assert_eq!(second.skipped_unchanged_sources, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_memory_connector_imports_jsonl_directory_observations() -> Result<()> {
+        let tempdir = TestDir::new("graph-connector-sync-dir")?;
+        let db = session::store::StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = chrono::Utc::now();
+        db.insert_session(&session::Session {
+            id: "session-1".to_string(),
+            task: "recovery incident".to_string(),
+            project: "ecc-tools".to_string(),
+            task_group: "incident".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: session::SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: session::SessionMetrics::default(),
+        })?;
+
+        let connector_dir = tempdir.path().join("hermes-memory");
+        fs::create_dir_all(connector_dir.join("nested"))?;
+        fs::write(
+            connector_dir.join("a.jsonl"),
+            [
+                serde_json::json!({
+                    "entity_name": "Auth callback recovery",
+                    "summary": "Customer wiped setup and got charged twice",
+                })
+                .to_string(),
+                serde_json::json!({
+                    "entity_name": "Portal routing",
+                    "summary": "Route existing installs to portal first",
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )?;
+        fs::write(
+            connector_dir.join("nested").join("b.jsonl"),
+            [
+                serde_json::json!({
+                    "entity_name": "Billing UX note",
+                    "summary": "Warn against buying twice after wiping setup",
+                })
+                .to_string(),
+                "{invalid json}".to_string(),
+            ]
+            .join("\n"),
+        )?;
+        fs::write(connector_dir.join("ignore.txt"), "not imported")?;
+
+        let mut cfg = config::Config::default();
+        cfg.memory_connectors.insert(
+            "hermes_dir".to_string(),
+            config::MemoryConnectorConfig::JsonlDirectory(
+                config::MemoryConnectorJsonlDirectoryConfig {
+                    path: connector_dir,
+                    recurse: true,
+                    session_id: Some("latest".to_string()),
+                    default_entity_type: Some("incident".to_string()),
+                    default_observation_type: Some("external_note".to_string()),
+                },
+            ),
+        );
+
+        let stats = sync_memory_connector(&db, &cfg, "hermes_dir", 10)?;
+        assert_eq!(stats.records_read, 4);
+        assert_eq!(stats.entities_upserted, 3);
+        assert_eq!(stats.observations_added, 3);
+        assert_eq!(stats.skipped_records, 1);
+
+        let recalled = db.recall_context_entities(None, "charged twice portal billing", 10)?;
+        assert_eq!(recalled.len(), 3);
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Auth callback recovery"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Portal routing"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Billing UX note"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_memory_connector_imports_markdown_file_sections() -> Result<()> {
+        let tempdir = TestDir::new("graph-connector-sync-markdown")?;
+        let db = session::store::StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = chrono::Utc::now();
+        db.insert_session(&session::Session {
+            id: "session-1".to_string(),
+            task: "knowledge import".to_string(),
+            project: "everything-claude-code".to_string(),
+            task_group: "memory".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: session::SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: session::SessionMetrics::default(),
+        })?;
+
+        let connector_path = tempdir.path().join("workspace-memory.md");
+        fs::write(
+            &connector_path,
+            r#"# Billing incident
+Customer wiped setup and got charged twice after reinstalling.
+
+## Portal routing
+Route existing installs to portal first before presenting checkout again.
+
+## Docs fix
+Guide users to repair before reinstall so wiped setups do not buy twice.
+"#,
+        )?;
+
+        let mut cfg = config::Config::default();
+        cfg.memory_connectors.insert(
+            "workspace_note".to_string(),
+            config::MemoryConnectorConfig::MarkdownFile(
+                config::MemoryConnectorMarkdownFileConfig {
+                    path: connector_path.clone(),
+                    session_id: Some("latest".to_string()),
+                    default_entity_type: Some("note_section".to_string()),
+                    default_observation_type: Some("external_note".to_string()),
+                },
+            ),
+        );
+
+        let stats = sync_memory_connector(&db, &cfg, "workspace_note", 10)?;
+        assert_eq!(stats.records_read, 3);
+        assert_eq!(stats.entities_upserted, 3);
+        assert_eq!(stats.observations_added, 3);
+        assert_eq!(stats.skipped_records, 0);
+
+        let recalled = db.recall_context_entities(None, "charged twice reinstall", 10)?;
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Billing incident"));
+        assert!(recalled.iter().any(|entry| entry.entity.name == "Docs fix"));
+
+        let billing = recalled
+            .iter()
+            .find(|entry| entry.entity.name == "Billing incident")
+            .expect("billing section should exist");
+        let expected_anchor_path = format!("{}#billing-incident", connector_path.display());
+        assert_eq!(
+            billing.entity.path.as_deref(),
+            Some(expected_anchor_path.as_str())
+        );
+        let observations = db.list_context_observations(Some(billing.entity.id), 5)?;
+        assert_eq!(observations.len(), 1);
+        let expected_source_path = connector_path.display().to_string();
+        assert_eq!(
+            observations[0]
+                .details
+                .get("source_path")
+                .map(String::as_str),
+            Some(expected_source_path.as_str())
+        );
+        assert!(observations[0]
+            .details
+            .get("body")
+            .is_some_and(|value: &String| value.contains("charged twice")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_memory_connector_imports_markdown_directory_sections() -> Result<()> {
+        let tempdir = TestDir::new("graph-connector-sync-markdown-dir")?;
+        let db = session::store::StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = chrono::Utc::now();
+        db.insert_session(&session::Session {
+            id: "session-1".to_string(),
+            task: "knowledge import".to_string(),
+            project: "everything-claude-code".to_string(),
+            task_group: "memory".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: session::SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: session::SessionMetrics::default(),
+        })?;
+
+        let connector_dir = tempdir.path().join("workspace-notes");
+        fs::create_dir_all(connector_dir.join("nested"))?;
+        fs::write(
+            connector_dir.join("incident.md"),
+            r#"# Billing incident
+Customer wiped setup and got charged twice after reinstalling.
+
+## Portal routing
+Route existing installs to portal first before presenting checkout again.
+"#,
+        )?;
+        fs::write(
+            connector_dir.join("nested").join("docs.markdown"),
+            r#"# Docs fix
+Guide users to repair before reinstall so wiped setups do not buy twice.
+"#,
+        )?;
+        fs::write(connector_dir.join("ignore.txt"), "not imported")?;
+
+        let mut cfg = config::Config::default();
+        cfg.memory_connectors.insert(
+            "workspace_notes".to_string(),
+            config::MemoryConnectorConfig::MarkdownDirectory(
+                config::MemoryConnectorMarkdownDirectoryConfig {
+                    path: connector_dir.clone(),
+                    recurse: true,
+                    session_id: Some("latest".to_string()),
+                    default_entity_type: Some("note_section".to_string()),
+                    default_observation_type: Some("external_note".to_string()),
+                },
+            ),
+        );
+
+        let stats = sync_memory_connector(&db, &cfg, "workspace_notes", 10)?;
+        assert_eq!(stats.records_read, 3);
+        assert_eq!(stats.entities_upserted, 3);
+        assert_eq!(stats.observations_added, 3);
+        assert_eq!(stats.skipped_records, 0);
+
+        let recalled = db.recall_context_entities(None, "charged twice portal docs", 10)?;
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Billing incident"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Portal routing"));
+        assert!(recalled.iter().any(|entry| entry.entity.name == "Docs fix"));
+
+        let docs_fix = recalled
+            .iter()
+            .find(|entry| entry.entity.name == "Docs fix")
+            .expect("docs section should exist");
+        let expected_anchor_path = format!(
+            "{}#docs-fix",
+            connector_dir.join("nested").join("docs.markdown").display()
+        );
+        assert_eq!(
+            docs_fix.entity.path.as_deref(),
+            Some(expected_anchor_path.as_str())
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_memory_connector_imports_dotenv_entries_safely() -> Result<()> {
+        let tempdir = TestDir::new("graph-connector-sync-dotenv")?;
+        let db = session::store::StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = chrono::Utc::now();
+        db.insert_session(&session::Session {
+            id: "session-1".to_string(),
+            task: "service config import".to_string(),
+            project: "ecc-tools".to_string(),
+            task_group: "memory".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: session::SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: session::SessionMetrics::default(),
+        })?;
+
+        let connector_path = tempdir.path().join("hermes.env");
+        fs::write(
+            &connector_path,
+            r#"# Hermes service config
+STRIPE_SECRET_KEY=sk_test_secret
+STRIPE_PRO_PRICE_ID=price_pro_monthly
+PUBLIC_BASE_URL="https://ecc.tools"
+STRIPE_WEBHOOK_SECRET=whsec_secret
+GITHUB_TOKEN=ghp_should_not_import
+INVALID LINE
+"#,
+        )?;
+
+        let mut cfg = config::Config::default();
+        cfg.memory_connectors.insert(
+            "hermes_env".to_string(),
+            config::MemoryConnectorConfig::DotenvFile(config::MemoryConnectorDotenvFileConfig {
+                path: connector_path.clone(),
+                session_id: Some("latest".to_string()),
+                default_entity_type: Some("service_config".to_string()),
+                default_observation_type: Some("external_config".to_string()),
+                key_prefixes: vec!["STRIPE_".to_string(), "PUBLIC_".to_string()],
+                include_keys: Vec::new(),
+                exclude_keys: vec!["STRIPE_WEBHOOK_SECRET".to_string()],
+                include_safe_values: true,
+            }),
+        );
+
+        let stats = sync_memory_connector(&db, &cfg, "hermes_env", 10)?;
+        assert_eq!(stats.records_read, 3);
+        assert_eq!(stats.entities_upserted, 3);
+        assert_eq!(stats.observations_added, 3);
+        assert_eq!(stats.skipped_records, 0);
+
+        let recalled = db.recall_context_entities(None, "stripe ecc.tools", 10)?;
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "STRIPE_SECRET_KEY"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "STRIPE_PRO_PRICE_ID"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "PUBLIC_BASE_URL"));
+        assert!(!recalled
+            .iter()
+            .any(|entry| entry.entity.name == "STRIPE_WEBHOOK_SECRET"));
+        assert!(!recalled
+            .iter()
+            .any(|entry| entry.entity.name == "GITHUB_TOKEN"));
+
+        let secret = recalled
+            .iter()
+            .find(|entry| entry.entity.name == "STRIPE_SECRET_KEY")
+            .expect("secret entry should exist");
+        let secret_observations = db.list_context_observations(Some(secret.entity.id), 5)?;
+        assert_eq!(secret_observations.len(), 1);
+        assert_eq!(
+            secret_observations[0]
+                .details
+                .get("secret_redacted")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(!secret_observations[0].details.contains_key("value"));
+
+        let public_base = recalled
+            .iter()
+            .find(|entry| entry.entity.name == "PUBLIC_BASE_URL")
+            .expect("public base url should exist");
+        let public_observations = db.list_context_observations(Some(public_base.entity.id), 5)?;
+        assert_eq!(public_observations.len(), 1);
+        assert_eq!(
+            public_observations[0]
+                .details
+                .get("value")
+                .map(String::as_str),
+            Some("https://ecc.tools")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn sync_all_memory_connectors_aggregates_results() -> Result<()> {
+        let tempdir = TestDir::new("graph-connector-sync-all")?;
+        let db = session::store::StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = chrono::Utc::now();
+        db.insert_session(&session::Session {
+            id: "session-1".to_string(),
+            task: "memory import".to_string(),
+            project: "everything-claude-code".to_string(),
+            task_group: "memory".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: session::SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: session::SessionMetrics::default(),
+        })?;
+
+        let jsonl_path = tempdir.path().join("hermes-memory.jsonl");
+        fs::write(
+            &jsonl_path,
+            serde_json::json!({
+                "entity_name": "Portal routing",
+                "summary": "Route reinstalls to portal before checkout",
+            })
+            .to_string(),
+        )?;
+
+        let markdown_path = tempdir.path().join("workspace-memory.md");
+        fs::write(
+            &markdown_path,
+            r#"# Billing incident
+Customer wiped setup and got charged twice after reinstalling.
+
+## Docs fix
+Guide users to repair before reinstall.
+"#,
+        )?;
+
+        let mut cfg = config::Config::default();
+        cfg.memory_connectors.insert(
+            "hermes_notes".to_string(),
+            config::MemoryConnectorConfig::JsonlFile(config::MemoryConnectorJsonlFileConfig {
+                path: jsonl_path,
+                session_id: Some("latest".to_string()),
+                default_entity_type: Some("incident".to_string()),
+                default_observation_type: Some("external_note".to_string()),
+            }),
+        );
+        cfg.memory_connectors.insert(
+            "workspace_note".to_string(),
+            config::MemoryConnectorConfig::MarkdownFile(
+                config::MemoryConnectorMarkdownFileConfig {
+                    path: markdown_path,
+                    session_id: Some("latest".to_string()),
+                    default_entity_type: Some("note_section".to_string()),
+                    default_observation_type: Some("external_note".to_string()),
+                },
+            ),
+        );
+
+        let report = sync_all_memory_connectors(&db, &cfg, 10)?;
+        assert_eq!(report.connectors_synced, 2);
+        assert_eq!(report.records_read, 3);
+        assert_eq!(report.entities_upserted, 3);
+        assert_eq!(report.observations_added, 3);
+        assert_eq!(report.skipped_records, 0);
+        assert_eq!(
+            report
+                .connectors
+                .iter()
+                .map(|stats| stats.connector_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["hermes_notes", "workspace_note"]
+        );
+
+        let recalled = db.recall_context_entities(None, "charged twice portal reinstall", 10)?;
+        assert_eq!(recalled.len(), 3);
+
+        Ok(())
     }
 
     #[test]

@@ -13,6 +13,204 @@ use std::path::PathBuf;
 
 pub type SessionAgentProfile = crate::config::ResolvedAgentProfile;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum HarnessKind {
+    #[default]
+    Unknown,
+    Claude,
+    Codex,
+    OpenCode,
+    Gemini,
+    Cursor,
+    Kiro,
+    Trae,
+    Zed,
+    FactoryDroid,
+    Windsurf,
+}
+
+impl HarnessKind {
+    pub fn from_agent_type(agent_type: &str) -> Self {
+        match agent_type.trim().to_ascii_lowercase().as_str() {
+            "claude" | "claude-code" => Self::Claude,
+            "codex" => Self::Codex,
+            "opencode" => Self::OpenCode,
+            "gemini" | "gemini-cli" => Self::Gemini,
+            "cursor" => Self::Cursor,
+            "kiro" => Self::Kiro,
+            "trae" => Self::Trae,
+            "zed" => Self::Zed,
+            "factory-droid" | "factory_droid" | "factorydroid" => Self::FactoryDroid,
+            "windsurf" => Self::Windsurf,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn from_db_value(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "claude" => Self::Claude,
+            "codex" => Self::Codex,
+            "opencode" => Self::OpenCode,
+            "gemini" => Self::Gemini,
+            "cursor" => Self::Cursor,
+            "kiro" => Self::Kiro,
+            "trae" => Self::Trae,
+            "zed" => Self::Zed,
+            "factory_droid" => Self::FactoryDroid,
+            "windsurf" => Self::Windsurf,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+            Self::Cursor => "cursor",
+            Self::Kiro => "kiro",
+            Self::Trae => "trae",
+            Self::Zed => "zed",
+            Self::FactoryDroid => "factory_droid",
+            Self::Windsurf => "windsurf",
+        }
+    }
+
+    pub fn canonical_agent_type(agent_type: &str) -> String {
+        match Self::from_agent_type(agent_type) {
+            Self::Unknown => agent_type.trim().to_ascii_lowercase(),
+            harness => harness.as_str().to_string(),
+        }
+    }
+
+    fn project_markers(self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => &[".claude"],
+            Self::Codex => &[".codex", ".codex-plugin"],
+            Self::OpenCode => &[".opencode"],
+            Self::Gemini => &[".gemini"],
+            Self::Cursor => &[".cursor"],
+            Self::Kiro => &[".kiro"],
+            Self::Trae => &[".trae"],
+            Self::Unknown | Self::Zed | Self::FactoryDroid | Self::Windsurf => &[],
+        }
+    }
+}
+
+impl fmt::Display for HarnessKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionHarnessInfo {
+    pub primary: HarnessKind,
+    pub primary_label: String,
+    pub detected: Vec<HarnessKind>,
+}
+
+impl SessionHarnessInfo {
+    pub fn runner_key(agent_type: &str) -> String {
+        let canonical = HarnessKind::canonical_agent_type(agent_type);
+        match HarnessKind::from_agent_type(&canonical) {
+            HarnessKind::Unknown if canonical.is_empty() => {
+                HarnessKind::Unknown.as_str().to_string()
+            }
+            HarnessKind::Unknown => canonical,
+            harness => harness.as_str().to_string(),
+        }
+    }
+
+    fn primary_label_for(agent_type: &str, primary: HarnessKind) -> String {
+        match primary {
+            HarnessKind::Unknown => {
+                let label = Self::runner_key(agent_type);
+                if label.is_empty() {
+                    HarnessKind::Unknown.as_str().to_string()
+                } else {
+                    label
+                }
+            }
+            harness => harness.as_str().to_string(),
+        }
+    }
+
+    pub fn detect(agent_type: &str, working_dir: &Path) -> Self {
+        let runner_key = Self::runner_key(agent_type);
+        let detected = [
+            HarnessKind::Claude,
+            HarnessKind::Codex,
+            HarnessKind::OpenCode,
+            HarnessKind::Gemini,
+            HarnessKind::Cursor,
+            HarnessKind::Kiro,
+            HarnessKind::Trae,
+        ]
+        .into_iter()
+        .filter(|harness| {
+            harness
+                .project_markers()
+                .iter()
+                .any(|marker| working_dir.join(marker).exists())
+        })
+        .collect::<Vec<_>>();
+
+        let primary = match HarnessKind::from_agent_type(&runner_key) {
+            HarnessKind::Unknown if runner_key == HarnessKind::Unknown.as_str() => {
+                detected.first().copied().unwrap_or(HarnessKind::Unknown)
+            }
+            HarnessKind::Unknown => HarnessKind::Unknown,
+            harness => harness,
+        };
+
+        Self {
+            primary,
+            primary_label: Self::primary_label_for(agent_type, primary),
+            detected,
+        }
+    }
+
+    pub fn from_persisted(
+        harness_label: &str,
+        agent_type: &str,
+        working_dir: &Path,
+        detected: Vec<HarnessKind>,
+    ) -> Self {
+        let primary = HarnessKind::from_db_value(harness_label);
+        if primary == HarnessKind::Unknown && detected.is_empty() && harness_label.trim().is_empty()
+        {
+            return Self::detect(agent_type, working_dir);
+        }
+
+        let normalized_label = harness_label.trim().to_ascii_lowercase();
+        Self {
+            primary,
+            primary_label: if normalized_label.is_empty() {
+                Self::primary_label_for(agent_type, primary)
+            } else {
+                normalized_label
+            },
+            detected,
+        }
+    }
+
+    pub fn detected_summary(&self) -> String {
+        if self.detected.is_empty() {
+            "none detected".to_string()
+        } else {
+            self.detected
+                .iter()
+                .map(|harness| harness.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -135,6 +333,23 @@ pub struct SessionMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ScheduledTask {
+    pub id: i64,
+    pub cron_expr: String,
+    pub task: String,
+    pub agent_type: String,
+    pub profile_name: Option<String>,
+    pub working_dir: PathBuf,
+    pub project: String,
+    pub task_group: String,
+    pub use_worktree: bool,
+    pub last_run_at: Option<DateTime<Utc>>,
+    pub next_run_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FileActivityEntry {
     pub session_id: String,
     pub action: FileActivityAction,
@@ -190,12 +405,92 @@ pub struct ContextGraphEntityDetail {
     pub incoming: Vec<ContextGraphRelation>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextGraphObservation {
+    pub id: i64,
+    pub session_id: Option<String>,
+    pub entity_id: i64,
+    pub entity_type: String,
+    pub entity_name: String,
+    pub observation_type: String,
+    pub priority: ContextObservationPriority,
+    pub pinned: bool,
+    pub summary: String,
+    pub details: BTreeMap<String, String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextGraphRecallEntry {
+    pub entity: ContextGraphEntity,
+    pub score: u64,
+    pub matched_terms: Vec<String>,
+    pub relation_count: usize,
+    pub observation_count: usize,
+    pub max_observation_priority: ContextObservationPriority,
+    pub has_pinned_observation: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextObservationPriority {
+    Low,
+    Normal,
+    High,
+    Critical,
+}
+
+impl Default for ContextObservationPriority {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+impl fmt::Display for ContextObservationPriority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Low => write!(f, "low"),
+            Self::Normal => write!(f, "normal"),
+            Self::High => write!(f, "high"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+impl ContextObservationPriority {
+    pub fn from_db_value(value: i64) -> Self {
+        match value {
+            0 => Self::Low,
+            2 => Self::High,
+            3 => Self::Critical,
+            _ => Self::Normal,
+        }
+    }
+
+    pub fn as_db_value(self) -> i64 {
+        match self {
+            Self::Low => 0,
+            Self::Normal => 1,
+            Self::High => 2,
+            Self::Critical => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextGraphSyncStats {
     pub sessions_scanned: usize,
     pub decisions_processed: usize,
     pub file_events_processed: usize,
     pub messages_processed: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextGraphCompactionStats {
+    pub entities_scanned: usize,
+    pub duplicate_observations_deleted: usize,
+    pub overflow_observations_deleted: usize,
+    pub observations_retained: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -234,4 +529,112 @@ pub fn default_task_group_label(task: &str) -> String {
 pub struct SessionGrouping {
     pub project: Option<String>,
     pub task_group: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(label: &str) -> Result<Self, Box<dyn std::error::Error>> {
+            let path =
+                std::env::temp_dir().join(format!("ecc2-{}-{}", label, uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path)?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[test]
+    fn detect_session_harness_prefers_agent_type_and_collects_project_markers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let repo = TestDir::new("session-harness-detect")?;
+        fs::create_dir_all(repo.path().join(".codex"))?;
+        fs::create_dir_all(repo.path().join(".claude"))?;
+
+        let harness = SessionHarnessInfo::detect("claude", repo.path());
+        assert_eq!(harness.primary, HarnessKind::Claude);
+        assert_eq!(harness.primary_label, "claude");
+        assert_eq!(
+            harness.detected,
+            vec![HarnessKind::Claude, HarnessKind::Codex]
+        );
+        assert_eq!(harness.detected_summary(), "claude, codex");
+        Ok(())
+    }
+
+    #[test]
+    fn detect_session_harness_falls_back_to_project_markers_when_agent_unspecified(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let repo = TestDir::new("session-harness-markers")?;
+        fs::create_dir_all(repo.path().join(".gemini"))?;
+
+        let harness = SessionHarnessInfo::detect("", repo.path());
+        assert_eq!(harness.primary, HarnessKind::Gemini);
+        assert_eq!(harness.primary_label, "gemini");
+        assert_eq!(harness.detected, vec![HarnessKind::Gemini]);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_agent_type_normalizes_known_aliases() {
+        assert_eq!(HarnessKind::canonical_agent_type("claude-code"), "claude");
+        assert_eq!(HarnessKind::canonical_agent_type("gemini-cli"), "gemini");
+        assert_eq!(
+            HarnessKind::canonical_agent_type("factory-droid"),
+            "factory_droid"
+        );
+        assert_eq!(
+            HarnessKind::canonical_agent_type(" custom-runner "),
+            "custom-runner"
+        );
+    }
+
+    #[test]
+    fn detect_session_harness_preserves_custom_agent_label_without_markers() {
+        let harness = SessionHarnessInfo::detect(" custom-runner ", Path::new("."));
+        assert_eq!(harness.primary, HarnessKind::Unknown);
+        assert_eq!(harness.primary_label, "custom-runner");
+        assert!(harness.detected.is_empty());
+    }
+
+    #[test]
+    fn detect_session_harness_preserves_custom_agent_label_with_project_markers(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let repo = TestDir::new("session-harness-custom-markers")?;
+        fs::create_dir_all(repo.path().join(".claude"))?;
+        fs::create_dir_all(repo.path().join(".codex"))?;
+
+        let harness = SessionHarnessInfo::detect("custom-runner", repo.path());
+        assert_eq!(harness.primary, HarnessKind::Unknown);
+        assert_eq!(harness.primary_label, "custom-runner");
+        assert_eq!(
+            harness.detected,
+            vec![HarnessKind::Claude, HarnessKind::Codex]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runner_key_uses_canonical_label_for_unknown_harnesses() {
+        assert_eq!(
+            SessionHarnessInfo::runner_key(" custom-runner "),
+            "custom-runner"
+        );
+        assert_eq!(SessionHarnessInfo::runner_key("claude-code"), "claude");
+    }
 }

@@ -23,7 +23,8 @@ use crate::session::output::{
 };
 use crate::session::store::{DaemonActivity, FileActivityOverlap, StateStore};
 use crate::session::{
-    DecisionLogEntry, FileActivityEntry, Session, SessionGrouping, SessionMessage, SessionState,
+    ContextObservationPriority, DecisionLogEntry, FileActivityEntry, Session, SessionGrouping,
+    SessionHarnessInfo, SessionMessage, SessionState,
 };
 use crate::worktree;
 
@@ -86,6 +87,7 @@ pub struct Dashboard {
     notifier: DesktopNotifier,
     webhook_notifier: WebhookNotifier,
     sessions: Vec<Session>,
+    session_harnesses: HashMap<String, SessionHarnessInfo>,
     session_output_cache: HashMap<String, Vec<OutputLine>>,
     unread_message_counts: HashMap<String, usize>,
     approval_queue_counts: HashMap<String, usize>,
@@ -496,6 +498,7 @@ impl Dashboard {
             let _ = db.sync_tool_activity_metrics(&cfg.tool_activity_metrics_path());
         }
         let sessions = db.list_sessions().unwrap_or_default();
+        let session_harnesses = db.list_session_harnesses().unwrap_or_default();
         let initial_session_states = sessions
             .iter()
             .map(|session| (session.id.clone(), session.state.clone()))
@@ -521,6 +524,7 @@ impl Dashboard {
             notifier,
             webhook_notifier,
             sessions,
+            session_harnesses,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
             approval_queue_counts: HashMap::new(),
@@ -844,7 +848,8 @@ impl Dashboard {
                         self.render_searchable_graph(&lines)
                     } else {
                         Text::from(
-                            lines.into_iter()
+                            lines
+                                .into_iter()
                                 .map(|line| Line::from(line.text))
                                 .collect::<Vec<_>>(),
                         )
@@ -1228,7 +1233,7 @@ impl Dashboard {
                         self.theme_palette(),
                     )
                 })
-            .collect::<Vec<_>>(),
+                .collect::<Vec<_>>(),
         )
     }
 
@@ -2169,6 +2174,7 @@ impl Dashboard {
                 &comms::MessageType::TaskHandoff {
                     task: source_session.task.clone(),
                     context,
+                    priority: comms::TaskPriority::Normal,
                 },
             ) {
                 tracing::warn!(
@@ -3296,7 +3302,10 @@ impl Dashboard {
             return;
         }
 
-        if !matches!(self.output_mode, OutputMode::SessionOutput | OutputMode::ContextGraph) {
+        if !matches!(
+            self.output_mode,
+            OutputMode::SessionOutput | OutputMode::ContextGraph
+        ) {
             self.set_operator_note(
                 "search is only available in session output or graph view".to_string(),
             );
@@ -3647,6 +3656,7 @@ impl Dashboard {
                             &comms::MessageType::TaskHandoff {
                                 task: task.clone(),
                                 context: context.clone(),
+                                priority: comms::TaskPriority::Normal,
                             },
                         ) {
                             tracing::warn!(
@@ -4030,6 +4040,13 @@ impl Dashboard {
                 Vec::new()
             }
         };
+        self.session_harnesses = match self.db.list_session_harnesses() {
+            Ok(harnesses) => harnesses,
+            Err(error) => {
+                tracing::warn!("Failed to refresh session harnesses: {error}");
+                HashMap::new()
+            }
+        };
         self.unread_message_counts = match self.db.unread_message_counts() {
             Ok(counts) => counts,
             Err(error) => {
@@ -4149,6 +4166,11 @@ impl Dashboard {
                         }
                         SessionState::Completed => {
                             let summary = self.build_completion_summary(session);
+                            self.persist_completion_summary_observation(
+                                session,
+                                &summary,
+                                "completion_summary",
+                            );
                             if self.cfg.completion_summary_notifications.enabled {
                                 completion_summaries.push(summary.clone());
                             } else if self.cfg.desktop_notifications.session_completed {
@@ -4170,6 +4192,11 @@ impl Dashboard {
                         }
                         SessionState::Failed => {
                             let summary = self.build_completion_summary(session);
+                            self.persist_completion_summary_observation(
+                                session,
+                                &summary,
+                                "failure_summary",
+                            );
                             failed_notifications.push((
                                 "ECC 2.0: Session failed".to_string(),
                                 format!(
@@ -4220,6 +4247,41 @@ impl Dashboard {
         }
 
         self.last_session_states = next_states;
+    }
+
+    fn persist_completion_summary_observation(
+        &self,
+        session: &Session,
+        summary: &SessionCompletionSummary,
+        observation_type: &str,
+    ) {
+        let observation_summary = format!(
+            "{} | files {} | tests {}/{} | warnings {}",
+            truncate_for_dashboard(&summary.task, 72),
+            summary.files_changed,
+            summary.tests_passed,
+            summary.tests_run,
+            summary.warnings.len()
+        );
+        let details = completion_summary_observation_details(summary, session);
+        let priority = if observation_type == "failure_summary" {
+            ContextObservationPriority::High
+        } else {
+            ContextObservationPriority::Normal
+        };
+        if let Err(error) = self.db.add_session_observation(
+            &session.id,
+            observation_type,
+            priority,
+            false,
+            &observation_summary,
+            &details,
+        ) {
+            tracing::warn!(
+                "Failed to persist completion observation for {}: {error}",
+                session.id
+            );
+        }
     }
 
     fn sync_approval_notifications(&mut self) {
@@ -4914,8 +4976,12 @@ impl Dashboard {
                     .selected_agent_type()
                     .unwrap_or(self.cfg.default_agent.as_str())
                     .to_string();
-                self.selected_route_preview =
-                    self.build_route_preview(&session_id, &selected_agent_type, team.total, &route_candidates);
+                self.selected_route_preview = self.build_route_preview(
+                    &session_id,
+                    &selected_agent_type,
+                    team.total,
+                    &route_candidates,
+                );
                 delegated.sort_by_key(|delegate| {
                     (
                         delegate_attention_priority(delegate),
@@ -5027,8 +5093,7 @@ impl Dashboard {
                 if message.to_session != session_id || message.msg_type != "task_handoff" {
                     return None;
                 }
-                manager::parse_task_handoff_task(&message.content)
-                    .or_else(|| Some(message.content))
+                manager::parse_task_handoff_task(&message.content).or_else(|| Some(message.content))
             })
     }
 
@@ -5284,6 +5349,75 @@ impl Dashboard {
                 relation.from_entity_type,
                 truncate_for_dashboard(&relation.from_entity_name, 72)
             ));
+        }
+
+        lines
+    }
+
+    fn session_graph_recall_lines(&self, session: &Session) -> Vec<String> {
+        let query = session.task.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(entries) = self.db.recall_context_entities(None, query, 4) else {
+            return Vec::new();
+        };
+
+        let entries = entries
+            .into_iter()
+            .filter(|entry| {
+                !(entry.entity.entity_type == "session" && entry.entity.name == session.id)
+            })
+            .take(3)
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lines = vec!["Relevant memory".to_string()];
+        for entry in entries {
+            let mut line = format!(
+                "- #{} [{}] {} | score {} | relations {} | observations {} | priority {}",
+                entry.entity.id,
+                entry.entity.entity_type,
+                truncate_for_dashboard(&entry.entity.name, 60),
+                entry.score,
+                entry.relation_count,
+                entry.observation_count,
+                entry.max_observation_priority
+            );
+            if entry.has_pinned_observation {
+                line.push_str(" | pinned");
+            }
+            if let Some(session_id) = entry.entity.session_id.as_deref() {
+                if session_id != session.id {
+                    line.push_str(&format!(" | {}", format_session_id(session_id)));
+                }
+            }
+            lines.push(line);
+            if !entry.matched_terms.is_empty() {
+                lines.push(format!("  matches {}", entry.matched_terms.join(", ")));
+            }
+            if let Some(path) = entry.entity.path.as_deref() {
+                lines.push(format!("  path {}", truncate_for_dashboard(path, 72)));
+            }
+            if !entry.entity.summary.is_empty() {
+                lines.push(format!(
+                    "  summary {}",
+                    truncate_for_dashboard(&entry.entity.summary, 72)
+                ));
+            }
+            if let Ok(observations) = self.db.list_context_observations(Some(entry.entity.id), 1) {
+                if let Some(observation) = observations.first() {
+                    lines.push(format!(
+                        "  memory [{}{}] {}",
+                        observation.priority,
+                        if observation.pinned { "/pinned" } else { "" },
+                        truncate_for_dashboard(&observation.summary, 72)
+                    ));
+                }
+            }
         }
 
         lines
@@ -6210,6 +6344,14 @@ impl Dashboard {
                 }
             }
 
+            if let Some(harness) = self.session_harnesses.get(&session.id) {
+                lines.push(format!(
+                    "Harness {} | Detected {}",
+                    harness.primary_label,
+                    harness.detected_summary()
+                ));
+            }
+
             lines.push(format!(
                 "Tokens {} total | In {} | Out {}",
                 format_token_count(metrics.tokens_used),
@@ -6254,6 +6396,7 @@ impl Dashboard {
                     }
                 }
             }
+            lines.extend(self.session_graph_recall_lines(session));
             lines.extend(self.session_graph_metrics_lines(&session.id));
             let file_overlaps = self
                 .db
@@ -8455,6 +8598,39 @@ fn summarize_completion_warnings(
     warnings
 }
 
+fn completion_summary_observation_details(
+    summary: &SessionCompletionSummary,
+    session: &Session,
+) -> BTreeMap<String, String> {
+    let mut details = BTreeMap::new();
+    details.insert("state".to_string(), session.state.to_string());
+    details.insert(
+        "files_changed".to_string(),
+        summary.files_changed.to_string(),
+    );
+    details.insert("tokens_used".to_string(), summary.tokens_used.to_string());
+    details.insert(
+        "duration_secs".to_string(),
+        summary.duration_secs.to_string(),
+    );
+    details.insert("cost_usd".to_string(), format!("{:.4}", summary.cost_usd));
+    details.insert("tests_run".to_string(), summary.tests_run.to_string());
+    details.insert("tests_passed".to_string(), summary.tests_passed.to_string());
+    if !summary.recent_files.is_empty() {
+        details.insert("recent_files".to_string(), summary.recent_files.join(" | "));
+    }
+    if !summary.key_decisions.is_empty() {
+        details.insert(
+            "key_decisions".to_string(),
+            summary.key_decisions.join(" | "),
+        );
+    }
+    if !summary.warnings.is_empty() {
+        details.insert("warnings".to_string(), summary.warnings.join(" | "));
+    }
+    details
+}
+
 fn session_started_webhook_body(session: &Session, compare_url: Option<&str>) -> String {
     let mut lines = vec![
         "*ECC 2.0: Session started*".to_string(),
@@ -10213,8 +10389,12 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
         let mut dashboard = test_dashboard(vec![focus.clone(), review.clone()], 0);
         dashboard.db.insert_session(&focus)?;
         dashboard.db.insert_session(&review)?;
-        dashboard.db.insert_decision(&focus.id, "Alpha graph path", &[], "planner path")?;
-        dashboard.db.insert_decision(&review.id, "Beta graph path", &[], "review path")?;
+        dashboard
+            .db
+            .insert_decision(&focus.id, "Alpha graph path", &[], "planner path")?;
+        dashboard
+            .db
+            .insert_decision(&review.id, "Beta graph path", &[], "review path")?;
 
         dashboard.toggle_context_graph_mode();
         dashboard.toggle_search_scope();
@@ -10254,8 +10434,12 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
         let mut dashboard = test_dashboard(vec![focus.clone(), review.clone()], 0);
         dashboard.db.insert_session(&focus)?;
         dashboard.db.insert_session(&review)?;
-        dashboard.db.insert_decision(&focus.id, "alpha local graph", &[], "planner path")?;
-        dashboard.db.insert_decision(&review.id, "alpha remote graph", &[], "review path")?;
+        dashboard
+            .db
+            .insert_decision(&focus.id, "alpha local graph", &[], "planner path")?;
+        dashboard
+            .db
+            .insert_decision(&review.id, "alpha remote graph", &[], "review path")?;
 
         dashboard.toggle_context_graph_mode();
         dashboard.toggle_search_scope();
@@ -10274,7 +10458,10 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
             dashboard.operator_note.as_deref(),
             Some("graph search /alpha.* match 2/2 | all sessions")
         );
-        assert_ne!(dashboard.selected_session_id().map(str::to_string), first_session);
+        assert_ne!(
+            dashboard.selected_session_id().map(str::to_string),
+            first_session
+        );
         Ok(())
     }
 
@@ -10322,14 +10509,7 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
             1,
             1,
         );
-        let delegate = sample_session(
-            "delegate-87654321",
-            "coder",
-            SessionState::Idle,
-            None,
-            1,
-            1,
-        );
+        let delegate = sample_session("delegate-87654321", "coder", SessionState::Idle, None, 1, 1);
         let dashboard = test_dashboard(vec![focus.clone(), delegate.clone()], 0);
         dashboard.db.insert_session(&focus)?;
         dashboard.db.insert_session(&delegate)?;
@@ -10351,6 +10531,57 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
         assert!(text.contains("outgoing 2 | incoming 0"));
         assert!(text.contains("-> decided decision:Use sqlite graph sync"));
         assert!(text.contains("-> delegates_to session:delegate-87654321"));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_session_metrics_text_includes_relevant_memory() -> Result<()> {
+        let mut focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        focus.task = "Investigate auth callback recovery".to_string();
+        let mut memory = sample_session("memory-87654321", "coder", SessionState::Idle, None, 1, 1);
+        memory.task = "Auth callback recovery notes".to_string();
+        let dashboard = test_dashboard(vec![focus.clone(), memory.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&memory)?;
+        dashboard.db.upsert_context_entity(
+            Some(&memory.id),
+            "file",
+            "callback.ts",
+            Some("src/routes/auth/callback.ts"),
+            "Handles auth callback recovery and billing fallback",
+            &BTreeMap::from([("area".to_string(), "auth".to_string())]),
+        )?;
+        let entity = dashboard
+            .db
+            .list_context_entities(Some(&memory.id), Some("file"), 10)?
+            .into_iter()
+            .find(|entry| entry.name == "callback.ts")
+            .expect("callback entity");
+        dashboard.db.add_context_observation(
+            Some(&memory.id),
+            entity.id,
+            "completion_summary",
+            ContextObservationPriority::Normal,
+            true,
+            "Recovered auth callback incident with billing fallback",
+            &BTreeMap::new(),
+        )?;
+
+        let text = dashboard.selected_session_metrics_text();
+        assert!(text.contains("Relevant memory"));
+        assert!(text.contains("[file] callback.ts"));
+        assert!(text.contains("| pinned"));
+        assert!(text.contains("matches auth, callback, recovery"));
+        assert!(text.contains(
+            "memory [normal/pinned] Recovered auth callback incident with billing fallback"
+        ));
         Ok(())
     }
 
@@ -11178,8 +11409,10 @@ diff --git a/src/lib.rs b/src/lib.rs
             24,
         );
 
-        let mut dashboard =
-            test_dashboard(vec![lead.clone(), older_worker.clone(), auth_worker.clone()], 0);
+        let mut dashboard = test_dashboard(
+            vec![lead.clone(), older_worker.clone(), auth_worker.clone()],
+            0,
+        );
         dashboard.db.insert_session(&lead).unwrap();
         dashboard.db.insert_session(&older_worker).unwrap();
         dashboard.db.insert_session(&auth_worker).unwrap();
@@ -11777,6 +12010,73 @@ diff --git a/src/lib.rs b/src/lib.rs
     }
 
     #[test]
+    fn refresh_persists_completion_summary_observation() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("ecc2-completion-observation-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join(".claude").join("metrics"))?;
+
+        let mut cfg = build_config(&root.join(".claude"));
+        cfg.completion_summary_notifications.delivery =
+            crate::notifications::CompletionSummaryDelivery::TuiPopup;
+        cfg.desktop_notifications.session_completed = false;
+
+        let db = StateStore::open(&cfg.db_path)?;
+        let mut session = sample_session(
+            "done-observation",
+            "claude",
+            SessionState::Running,
+            Some("ecc/observation"),
+            144,
+            42,
+        );
+        session.task = "Recover auth callback after wipe".to_string();
+        db.insert_session(&session)?;
+
+        let metrics_path = cfg.tool_activity_metrics_path();
+        fs::create_dir_all(metrics_path.parent().unwrap())?;
+        fs::write(
+            &metrics_path,
+            concat!(
+                "{\"id\":\"evt-1\",\"session_id\":\"done-observation\",\"tool_name\":\"Bash\",\"input_summary\":\"cargo test -q\",\"input_params_json\":\"{\\\"command\\\":\\\"cargo test -q\\\"}\",\"output_summary\":\"ok\",\"timestamp\":\"2026-04-09T00:00:00Z\"}\n",
+                "{\"id\":\"evt-2\",\"session_id\":\"done-observation\",\"tool_name\":\"Write\",\"input_summary\":\"Write src/routes/auth/callback.ts\",\"output_summary\":\"updated callback\",\"file_events\":[{\"path\":\"src/routes/auth/callback.ts\",\"action\":\"modify\",\"diff_preview\":\"portal first\",\"patch_preview\":\"+ portal first\"}],\"timestamp\":\"2026-04-09T00:01:00Z\"}\n"
+            ),
+        )?;
+
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard
+            .db
+            .update_state("done-observation", &SessionState::Completed)?;
+
+        dashboard.refresh();
+
+        let session_entity = dashboard
+            .db
+            .list_context_entities(Some("done-observation"), Some("session"), 10)?
+            .into_iter()
+            .find(|entity| entity.name == "done-observation")
+            .expect("session entity");
+        let observations = dashboard
+            .db
+            .list_context_observations(Some(session_entity.id), 10)?;
+        assert!(!observations.is_empty());
+        assert_eq!(observations[0].observation_type, "completion_summary");
+        assert!(observations[0]
+            .summary
+            .contains("Recover auth callback after wipe"));
+        assert_eq!(
+            observations[0].details.get("tests_run"),
+            Some(&"1".to_string())
+        );
+        assert!(observations[0]
+            .details
+            .get("recent_files")
+            .is_some_and(|value| value.contains("modify src/routes/auth/callback.ts")));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn dismiss_completion_popup_promotes_the_next_summary() {
         let mut dashboard = test_dashboard(Vec::new(), 0);
         dashboard.active_completion_popup = Some(SessionCompletionSummary {
@@ -11996,6 +12296,40 @@ diff --git a/src/lib.rs b/src/lib.rs
                 .len(),
             1
         );
+
+        let _ = fs::remove_dir_all(tempdir);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_session_metrics_text_includes_harness_summary() -> Result<()> {
+        let tempdir = std::env::temp_dir().join(format!(
+            "ecc2-dashboard-harness-metrics-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(tempdir.join(".claude"))?;
+        fs::create_dir_all(tempdir.join(".codex"))?;
+
+        let now = Utc::now();
+        let session = Session {
+            id: "sess-harness".to_string(),
+            task: "Map harness metadata".to_string(),
+            project: "ecc".to_string(),
+            task_group: "compat".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: tempdir.clone(),
+            state: SessionState::Running,
+            pid: Some(4242),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(1),
+            last_heartbeat_at: now - Duration::minutes(1),
+            metrics: SessionMetrics::default(),
+        };
+
+        let dashboard = test_dashboard(vec![session], 0);
+        let metrics_text = dashboard.selected_session_metrics_text();
+        assert!(metrics_text.contains("Harness claude | Detected claude, codex"));
 
         let _ = fs::remove_dir_all(tempdir);
         Ok(())
@@ -14149,6 +14483,15 @@ diff --git a/src/lib.rs b/src/lib.rs
             .iter()
             .map(|session| (session.id.clone(), session.state.clone()))
             .collect();
+        let session_harnesses = sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id.clone(),
+                    SessionHarnessInfo::detect(&session.agent_type, &session.working_dir),
+                )
+            })
+            .collect();
         let output_store = SessionOutputStore::default();
         let output_rx = output_store.subscribe();
         let mut session_table_state = TableState::default();
@@ -14165,6 +14508,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             notifier,
             webhook_notifier,
             sessions,
+            session_harnesses,
             session_output_cache: HashMap::new(),
             unread_message_counts: HashMap::new(),
             approval_queue_counts: HashMap::new(),
@@ -14246,8 +14590,10 @@ diff --git a/src/lib.rs b/src/lib.rs
             auto_terminate_stale_sessions: false,
             default_agent: "claude".to_string(),
             default_agent_profile: None,
+            harness_runners: Default::default(),
             agent_profiles: Default::default(),
             orchestration_templates: Default::default(),
+            memory_connectors: Default::default(),
             auto_dispatch_unread_handoffs: false,
             auto_dispatch_limit_per_session: 5,
             auto_create_worktrees: true,

@@ -79,6 +79,26 @@ pub struct ResolvedAgentProfile {
     pub append_system_prompt: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HarnessRunnerConfig {
+    pub program: String,
+    pub base_args: Vec<String>,
+    pub cwd_flag: Option<String>,
+    pub session_name_flag: Option<String>,
+    pub task_flag: Option<String>,
+    pub model_flag: Option<String>,
+    pub add_dir_flag: Option<String>,
+    pub include_directories_flag: Option<String>,
+    pub allowed_tools_flag: Option<String>,
+    pub disallowed_tools_flag: Option<String>,
+    pub permission_mode_flag: Option<String>,
+    pub max_budget_usd_flag: Option<String>,
+    pub append_system_prompt_flag: Option<String>,
+    pub inline_system_prompt_for_task: bool,
+    pub env: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct OrchestrationTemplateConfig {
@@ -101,6 +121,67 @@ pub struct OrchestrationTemplateStepConfig {
     pub worktree: Option<bool>,
     pub project: Option<String>,
     pub task_group: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MemoryConnectorConfig {
+    JsonlFile(MemoryConnectorJsonlFileConfig),
+    JsonlDirectory(MemoryConnectorJsonlDirectoryConfig),
+    MarkdownFile(MemoryConnectorMarkdownFileConfig),
+    MarkdownDirectory(MemoryConnectorMarkdownDirectoryConfig),
+    DotenvFile(MemoryConnectorDotenvFileConfig),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConnectorJsonlFileConfig {
+    pub path: PathBuf,
+    pub session_id: Option<String>,
+    pub default_entity_type: Option<String>,
+    pub default_observation_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConnectorJsonlDirectoryConfig {
+    pub path: PathBuf,
+    pub recurse: bool,
+    pub session_id: Option<String>,
+    pub default_entity_type: Option<String>,
+    pub default_observation_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConnectorMarkdownFileConfig {
+    pub path: PathBuf,
+    pub session_id: Option<String>,
+    pub default_entity_type: Option<String>,
+    pub default_observation_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConnectorMarkdownDirectoryConfig {
+    pub path: PathBuf,
+    pub recurse: bool,
+    pub session_id: Option<String>,
+    pub default_entity_type: Option<String>,
+    pub default_observation_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryConnectorDotenvFileConfig {
+    pub path: PathBuf,
+    pub session_id: Option<String>,
+    pub default_entity_type: Option<String>,
+    pub default_observation_type: Option<String>,
+    pub key_prefixes: Vec<String>,
+    pub include_keys: Vec<String>,
+    pub exclude_keys: Vec<String>,
+    pub include_safe_values: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,8 +218,10 @@ pub struct Config {
     pub auto_terminate_stale_sessions: bool,
     pub default_agent: String,
     pub default_agent_profile: Option<String>,
+    pub harness_runners: BTreeMap<String, HarnessRunnerConfig>,
     pub agent_profiles: BTreeMap<String, AgentProfileConfig>,
     pub orchestration_templates: BTreeMap<String, OrchestrationTemplateConfig>,
+    pub memory_connectors: BTreeMap<String, MemoryConnectorConfig>,
     pub auto_dispatch_unread_handoffs: bool,
     pub auto_dispatch_limit_per_session: usize,
     pub auto_create_worktrees: bool,
@@ -201,8 +284,10 @@ impl Default for Config {
             auto_terminate_stale_sessions: false,
             default_agent: "claude".to_string(),
             default_agent_profile: None,
+            harness_runners: BTreeMap::new(),
             agent_profiles: BTreeMap::new(),
             orchestration_templates: BTreeMap::new(),
+            memory_connectors: BTreeMap::new(),
             auto_dispatch_unread_handoffs: false,
             auto_dispatch_limit_per_session: 5,
             auto_create_worktrees: true,
@@ -264,6 +349,11 @@ impl Config {
     pub fn resolve_agent_profile(&self, name: &str) -> Result<ResolvedAgentProfile> {
         let mut chain = Vec::new();
         self.resolve_agent_profile_inner(name, &mut chain)
+    }
+
+    pub fn harness_runner(&self, harness: &str) -> Option<&HarnessRunnerConfig> {
+        let key = harness.trim().to_ascii_lowercase();
+        self.harness_runners.get(&key)
     }
 
     pub fn resolve_orchestration_template(
@@ -654,6 +744,28 @@ impl ResolvedAgentProfile {
             (None, Some(child)) => Some(child.clone()),
             (None, None) => None,
         };
+    }
+}
+
+impl Default for HarnessRunnerConfig {
+    fn default() -> Self {
+        Self {
+            program: String::new(),
+            base_args: Vec::new(),
+            cwd_flag: None,
+            session_name_flag: None,
+            task_flag: None,
+            model_flag: None,
+            add_dir_flag: None,
+            include_directories_flag: None,
+            allowed_tools_flag: None,
+            disallowed_tools_flag: None,
+            permission_mode_flag: None,
+            max_budget_usd_flag: None,
+            append_system_prompt_flag: None,
+            inline_system_prompt_for_task: true,
+            env: BTreeMap::new(),
+        }
     }
 }
 
@@ -1148,6 +1260,44 @@ inherits = "a"
     }
 
     #[test]
+    fn harness_runners_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[harness_runners.cursor]
+program = "cursor-agent"
+base_args = ["run"]
+cwd_flag = "--cwd"
+session_name_flag = "--name"
+task_flag = "--task"
+model_flag = "--model"
+permission_mode_flag = "--permission-mode"
+inline_system_prompt_for_task = true
+
+[harness_runners.cursor.env]
+ECC_HARNESS = "cursor"
+"#,
+        )
+        .unwrap();
+
+        let runner = config.harness_runner("cursor").expect("cursor runner");
+        assert_eq!(runner.program, "cursor-agent");
+        assert_eq!(runner.base_args, vec!["run"]);
+        assert_eq!(runner.cwd_flag.as_deref(), Some("--cwd"));
+        assert_eq!(runner.session_name_flag.as_deref(), Some("--name"));
+        assert_eq!(runner.task_flag.as_deref(), Some("--task"));
+        assert_eq!(runner.model_flag.as_deref(), Some("--model"));
+        assert_eq!(
+            runner.permission_mode_flag.as_deref(),
+            Some("--permission-mode")
+        );
+        assert!(runner.inline_system_prompt_for_task);
+        assert_eq!(
+            runner.env.get("ECC_HARNESS").map(String::as_str),
+            Some("cursor")
+        );
+    }
+
+    #[test]
     fn orchestration_templates_resolve_steps_and_interpolate_variables() {
         let config: Config = toml::from_str(
             r#"
@@ -1229,6 +1379,185 @@ task = "Plan {{task}} for {{component}}"
         assert!(error_text
             .contains("resolve task for orchestration template feature_development step 1"));
         assert!(error_text.contains("missing orchestration template variable(s): component"));
+    }
+
+    #[test]
+    fn memory_connectors_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[memory_connectors.hermes_notes]
+kind = "jsonl_file"
+path = "/tmp/hermes-memory.jsonl"
+session_id = "latest"
+default_entity_type = "incident"
+default_observation_type = "external_note"
+"#,
+        )
+        .unwrap();
+
+        let connector = config
+            .memory_connectors
+            .get("hermes_notes")
+            .expect("connector should deserialize");
+        match connector {
+            crate::config::MemoryConnectorConfig::JsonlFile(settings) => {
+                assert_eq!(settings.path, PathBuf::from("/tmp/hermes-memory.jsonl"));
+                assert_eq!(settings.session_id.as_deref(), Some("latest"));
+                assert_eq!(settings.default_entity_type.as_deref(), Some("incident"));
+                assert_eq!(
+                    settings.default_observation_type.as_deref(),
+                    Some("external_note")
+                );
+            }
+            _ => panic!("expected jsonl_file connector"),
+        }
+    }
+
+    #[test]
+    fn memory_jsonl_directory_connectors_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[memory_connectors.hermes_dir]
+kind = "jsonl_directory"
+path = "/tmp/hermes-memory"
+recurse = true
+default_entity_type = "incident"
+default_observation_type = "external_note"
+"#,
+        )
+        .unwrap();
+
+        let connector = config
+            .memory_connectors
+            .get("hermes_dir")
+            .expect("connector should deserialize");
+        match connector {
+            crate::config::MemoryConnectorConfig::JsonlDirectory(settings) => {
+                assert_eq!(settings.path, PathBuf::from("/tmp/hermes-memory"));
+                assert!(settings.recurse);
+                assert_eq!(settings.default_entity_type.as_deref(), Some("incident"));
+                assert_eq!(
+                    settings.default_observation_type.as_deref(),
+                    Some("external_note")
+                );
+            }
+            _ => panic!("expected jsonl_directory connector"),
+        }
+    }
+
+    #[test]
+    fn memory_markdown_file_connectors_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[memory_connectors.workspace_note]
+kind = "markdown_file"
+path = "/tmp/hermes-memory.md"
+session_id = "latest"
+default_entity_type = "note_section"
+default_observation_type = "external_note"
+"#,
+        )
+        .unwrap();
+
+        let connector = config
+            .memory_connectors
+            .get("workspace_note")
+            .expect("connector should deserialize");
+        match connector {
+            crate::config::MemoryConnectorConfig::MarkdownFile(settings) => {
+                assert_eq!(settings.path, PathBuf::from("/tmp/hermes-memory.md"));
+                assert_eq!(settings.session_id.as_deref(), Some("latest"));
+                assert_eq!(
+                    settings.default_entity_type.as_deref(),
+                    Some("note_section")
+                );
+                assert_eq!(
+                    settings.default_observation_type.as_deref(),
+                    Some("external_note")
+                );
+            }
+            _ => panic!("expected markdown_file connector"),
+        }
+    }
+
+    #[test]
+    fn memory_markdown_directory_connectors_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[memory_connectors.workspace_notes]
+kind = "markdown_directory"
+path = "/tmp/hermes-memory"
+recurse = true
+session_id = "latest"
+default_entity_type = "note_section"
+default_observation_type = "external_note"
+"#,
+        )
+        .unwrap();
+
+        let connector = config
+            .memory_connectors
+            .get("workspace_notes")
+            .expect("connector should deserialize");
+        match connector {
+            crate::config::MemoryConnectorConfig::MarkdownDirectory(settings) => {
+                assert_eq!(settings.path, PathBuf::from("/tmp/hermes-memory"));
+                assert!(settings.recurse);
+                assert_eq!(settings.session_id.as_deref(), Some("latest"));
+                assert_eq!(
+                    settings.default_entity_type.as_deref(),
+                    Some("note_section")
+                );
+                assert_eq!(
+                    settings.default_observation_type.as_deref(),
+                    Some("external_note")
+                );
+            }
+            _ => panic!("expected markdown_directory connector"),
+        }
+    }
+
+    #[test]
+    fn memory_dotenv_file_connectors_deserialize_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[memory_connectors.hermes_env]
+kind = "dotenv_file"
+path = "/tmp/hermes.env"
+session_id = "latest"
+default_entity_type = "service_config"
+default_observation_type = "external_config"
+key_prefixes = ["STRIPE_", "PUBLIC_"]
+include_keys = ["PUBLIC_BASE_URL"]
+exclude_keys = ["STRIPE_WEBHOOK_SECRET"]
+include_safe_values = true
+"#,
+        )
+        .unwrap();
+
+        let connector = config
+            .memory_connectors
+            .get("hermes_env")
+            .expect("connector should deserialize");
+        match connector {
+            crate::config::MemoryConnectorConfig::DotenvFile(settings) => {
+                assert_eq!(settings.path, PathBuf::from("/tmp/hermes.env"));
+                assert_eq!(settings.session_id.as_deref(), Some("latest"));
+                assert_eq!(
+                    settings.default_entity_type.as_deref(),
+                    Some("service_config")
+                );
+                assert_eq!(
+                    settings.default_observation_type.as_deref(),
+                    Some("external_config")
+                );
+                assert_eq!(settings.key_prefixes, vec!["STRIPE_", "PUBLIC_"]);
+                assert_eq!(settings.include_keys, vec!["PUBLIC_BASE_URL"]);
+                assert_eq!(settings.exclude_keys, vec!["STRIPE_WEBHOOK_SECRET"]);
+                assert!(settings.include_safe_values);
+            }
+            _ => panic!("expected dotenv_file connector"),
+        }
     }
 
     #[test]
