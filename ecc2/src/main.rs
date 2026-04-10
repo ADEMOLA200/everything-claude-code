@@ -1,5 +1,6 @@
 mod comms;
 mod config;
+mod notifications;
 mod observability;
 mod session;
 mod tui;
@@ -52,6 +53,9 @@ enum Commands {
         /// Agent type (claude, codex, custom)
         #[arg(short, long, default_value = "claude")]
         agent: String,
+        /// Agent profile defined in ecc2.toml
+        #[arg(long)]
+        profile: Option<String>,
         #[command(flatten)]
         worktree: WorktreePolicyArgs,
         /// Source session to delegate from
@@ -68,6 +72,9 @@ enum Commands {
         /// Agent type (claude, codex, custom)
         #[arg(short, long, default_value = "claude")]
         agent: String,
+        /// Agent profile defined in ecc2.toml
+        #[arg(long)]
+        profile: Option<String>,
         #[command(flatten)]
         worktree: WorktreePolicyArgs,
     },
@@ -81,6 +88,9 @@ enum Commands {
         /// Agent type (claude, codex, custom)
         #[arg(short, long, default_value = "claude")]
         agent: String,
+        /// Agent profile defined in ecc2.toml
+        #[arg(long)]
+        profile: Option<String>,
         #[command(flatten)]
         worktree: WorktreePolicyArgs,
     },
@@ -244,11 +254,51 @@ enum Commands {
         #[arg(long)]
         keep_worktree: bool,
     },
+    /// Show the merge queue for inactive worktrees and any branch-to-branch blockers
+    MergeQueue {
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+        /// Process the queue, auto-rebasing clean blocked worktrees and merging what becomes ready
+        #[arg(long)]
+        apply: bool,
+    },
     /// Prune worktrees for inactive sessions and report any active sessions still holding one
     PruneWorktrees {
         /// Emit machine-readable JSON instead of the human summary
         #[arg(long)]
         json: bool,
+    },
+    /// Log a significant agent decision for auditability
+    LogDecision {
+        /// Session ID or alias. Omit to log against the latest session.
+        session_id: Option<String>,
+        /// The chosen decision or direction
+        #[arg(long)]
+        decision: String,
+        /// Why the agent made this choice
+        #[arg(long)]
+        reasoning: String,
+        /// Alternative considered and rejected; repeat for multiple entries
+        #[arg(long = "alternative")]
+        alternatives: Vec<String>,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show recent decision-log entries
+    Decisions {
+        /// Session ID or alias. Omit to read the latest session.
+        session_id: Option<String>,
+        /// Show decision log entries across all sessions
+        #[arg(long)]
+        all: bool,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+        /// Maximum decision-log entries to return
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Export sessions, tool spans, and metrics in OTLP-compatible JSON
     ExportOtel {
@@ -340,14 +390,50 @@ async fn main() -> Result<()> {
         Some(Commands::Start {
             task,
             agent,
+            profile,
             worktree,
             from_session,
         }) => {
             let use_worktree = worktree.resolve(&cfg);
-            let session_id =
-                session::manager::create_session(&db, &cfg, &task, &agent, use_worktree).await?;
-            if let Some(from_session) = from_session {
-                let from_id = resolve_session_id(&db, &from_session)?;
+            let source = if let Some(from_session) = from_session.as_ref() {
+                let from_id = resolve_session_id(&db, from_session)?;
+                Some(
+                    db.get_session(&from_id)?
+                        .ok_or_else(|| anyhow::anyhow!("Session not found: {from_id}"))?,
+                )
+            } else {
+                None
+            };
+            let grouping = session::SessionGrouping {
+                project: source.as_ref().map(|session| session.project.clone()),
+                task_group: source.as_ref().map(|session| session.task_group.clone()),
+            };
+            let session_id = if let Some(source) = source.as_ref() {
+                session::manager::create_session_from_source_with_profile_and_grouping(
+                    &db,
+                    &cfg,
+                    &task,
+                    &agent,
+                    use_worktree,
+                    profile.as_deref(),
+                    &source.id,
+                    grouping,
+                )
+                .await?
+            } else {
+                session::manager::create_session_with_profile_and_grouping(
+                    &db,
+                    &cfg,
+                    &task,
+                    &agent,
+                    use_worktree,
+                    profile.as_deref(),
+                    grouping,
+                )
+                .await?
+            };
+            if let Some(source) = source {
+                let from_id = source.id;
                 send_handoff_message(&db, &from_id, &session_id)?;
             }
             println!("Session started: {session_id}");
@@ -356,6 +442,7 @@ async fn main() -> Result<()> {
             from_session,
             task,
             agent,
+            profile,
             worktree,
         }) => {
             let use_worktree = worktree.resolve(&cfg);
@@ -371,8 +458,20 @@ async fn main() -> Result<()> {
                 )
             });
 
-            let session_id =
-                session::manager::create_session(&db, &cfg, &task, &agent, use_worktree).await?;
+            let session_id = session::manager::create_session_from_source_with_profile_and_grouping(
+                &db,
+                &cfg,
+                &task,
+                &agent,
+                use_worktree,
+                profile.as_deref(),
+                &source.id,
+                session::SessionGrouping {
+                    project: Some(source.project.clone()),
+                    task_group: Some(source.task_group.clone()),
+                },
+            )
+            .await?;
             send_handoff_message(&db, &source.id, &session_id)?;
             println!(
                 "Delegated session started: {} <- {}",
@@ -384,13 +483,22 @@ async fn main() -> Result<()> {
             from_session,
             task,
             agent,
+            profile,
             worktree,
         }) => {
             let use_worktree = worktree.resolve(&cfg);
             let lead_id = resolve_session_id(&db, &from_session)?;
-            let outcome =
-                session::manager::assign_session(&db, &cfg, &lead_id, &task, &agent, use_worktree)
-                    .await?;
+            let outcome = session::manager::assign_session_with_profile_and_grouping(
+                &db,
+                &cfg,
+                &lead_id,
+                &task,
+                &agent,
+                use_worktree,
+                profile.as_deref(),
+                session::SessionGrouping::default(),
+            )
+            .await?;
             if session::manager::assignment_action_routes_work(outcome.action) {
                 println!(
                     "Assignment routed: {} -> {} ({})",
@@ -808,12 +916,68 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::MergeQueue { json, apply }) => {
+            if apply {
+                let outcome = session::manager::process_merge_queue(&db).await?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&outcome)?);
+                } else {
+                    println!("{}", format_bulk_worktree_merge_human(&outcome));
+                }
+            } else {
+                let report = session::manager::build_merge_queue(&db)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_merge_queue_human(&report));
+                }
+            }
+        }
         Some(Commands::PruneWorktrees { json }) => {
             let outcome = session::manager::prune_inactive_worktrees(&db, &cfg).await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {
                 println!("{}", format_prune_worktrees_human(&outcome));
+            }
+        }
+        Some(Commands::LogDecision {
+            session_id,
+            decision,
+            reasoning,
+            alternatives,
+            json,
+        }) => {
+            let resolved_id = resolve_session_id(&db, session_id.as_deref().unwrap_or("latest"))?;
+            let entry = db.insert_decision(&resolved_id, &decision, &alternatives, &reasoning)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entry)?);
+            } else {
+                println!("{}", format_logged_decision_human(&entry));
+            }
+        }
+        Some(Commands::Decisions {
+            session_id,
+            all,
+            json,
+            limit,
+        }) => {
+            if all && session_id.is_some() {
+                return Err(anyhow::anyhow!(
+                    "decisions does not accept a session ID when --all is set"
+                ));
+            }
+            let entries = if all {
+                db.list_decisions(limit)?
+            } else {
+                let resolved_id =
+                    resolve_session_id(&db, session_id.as_deref().unwrap_or("latest"))?;
+                db.list_decisions_for_session(&resolved_id, limit)?
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                println!("{}", format_decisions_human(&entries, all));
             }
         }
         Some(Commands::ExportOtel { session_id, output }) => {
@@ -1462,6 +1626,26 @@ fn format_bulk_worktree_merge_human(
         ));
     }
 
+    if !outcome.rebased.is_empty() {
+        lines.push(format!(
+            "Rebased {} blocked worktree(s) onto their base branch",
+            outcome.rebased.len()
+        ));
+        for rebased in &outcome.rebased {
+            lines.push(format!(
+                "- rebased {} onto {} for {}{}",
+                rebased.branch,
+                rebased.base_branch,
+                short_session(&rebased.session_id),
+                if rebased.already_up_to_date {
+                    " (already up to date)"
+                } else {
+                    ""
+                }
+            ));
+        }
+    }
+
     if !outcome.active_with_worktree_ids.is_empty() {
         lines.push(format!(
             "Skipped {} active worktree session(s)",
@@ -1478,6 +1662,12 @@ fn format_bulk_worktree_merge_human(
         lines.push(format!(
             "Skipped {} dirty worktree(s)",
             outcome.dirty_worktree_ids.len()
+        ));
+    }
+    if !outcome.blocked_by_queue_session_ids.is_empty() {
+        lines.push(format!(
+            "Blocked {} worktree(s) on remaining queue conflicts",
+            outcome.blocked_by_queue_session_ids.len()
         ));
     }
     if !outcome.failures.is_empty() {
@@ -1553,6 +1743,120 @@ fn format_prune_worktrees_human(outcome: &session::manager::WorktreePruneOutcome
         ));
         for session_id in &outcome.retained_session_ids {
             lines.push(format!("- retained {}", short_session(session_id)));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_logged_decision_human(entry: &session::DecisionLogEntry) -> String {
+    let mut lines = vec![
+        format!("Logged decision for {}", short_session(&entry.session_id)),
+        format!("Decision: {}", entry.decision),
+        format!("Why: {}", entry.reasoning),
+    ];
+
+    if entry.alternatives.is_empty() {
+        lines.push("Alternatives: none recorded".to_string());
+    } else {
+        lines.push("Alternatives:".to_string());
+        for alternative in &entry.alternatives {
+            lines.push(format!("- {alternative}"));
+        }
+    }
+
+    lines.push(format!(
+        "Recorded at: {}",
+        entry.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+    ));
+    lines.join("\n")
+}
+
+fn format_decisions_human(entries: &[session::DecisionLogEntry], include_session: bool) -> String {
+    if entries.is_empty() {
+        return if include_session {
+            "No decision-log entries across all sessions yet.".to_string()
+        } else {
+            "No decision-log entries for this session yet.".to_string()
+        };
+    }
+
+    let mut lines = vec![format!("Decision log: {} entries", entries.len())];
+    for entry in entries {
+        let prefix = if include_session {
+            format!("{} | ", short_session(&entry.session_id))
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "- [{}] {prefix}{}",
+            entry.timestamp.format("%H:%M:%S"),
+            entry.decision
+        ));
+        lines.push(format!("  why {}", entry.reasoning));
+        if entry.alternatives.is_empty() {
+            lines.push("  alternatives none recorded".to_string());
+        } else {
+            for alternative in &entry.alternatives {
+                lines.push(format!("  alternative {alternative}"));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_merge_queue_human(report: &session::manager::MergeQueueReport) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Merge queue: {} ready / {} blocked",
+        report.ready_entries.len(),
+        report.blocked_entries.len()
+    ));
+
+    if report.ready_entries.is_empty() {
+        lines.push("No merge-ready worktrees queued".to_string());
+    } else {
+        lines.push("Ready".to_string());
+        for entry in &report.ready_entries {
+            lines.push(format!(
+                "- #{} {} [{}] | {} / {} | {}",
+                entry.queue_position.unwrap_or(0),
+                entry.session_id,
+                entry.branch,
+                entry.project,
+                entry.task_group,
+                entry.task
+            ));
+        }
+    }
+
+    if !report.blocked_entries.is_empty() {
+        lines.push(String::new());
+        lines.push("Blocked".to_string());
+        for entry in &report.blocked_entries {
+            lines.push(format!(
+                "- {} [{}] | {} / {} | {}",
+                entry.session_id,
+                entry.branch,
+                entry.project,
+                entry.task_group,
+                entry.suggested_action
+            ));
+            for blocker in entry.blocked_by.iter().take(2) {
+                lines.push(format!(
+                    "  blocker {} [{}] | {}",
+                    blocker.session_id, blocker.branch, blocker.summary
+                ));
+                for conflict in blocker.conflicts.iter().take(3) {
+                    lines.push(format!("    conflict {conflict}"));
+                }
+                if let Some(preview) = blocker.conflicting_patch_preview.as_ref() {
+                    for line in preview.lines().take(6) {
+                        lines.push(format!("    {}", line));
+                    }
+                }
+            }
         }
     }
 
@@ -1908,6 +2212,8 @@ mod tests {
         Session {
             id: id.to_string(),
             task: task.to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp/ecc"),
             state,
@@ -2505,6 +2811,34 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_merge_queue_json_flag() {
+        let cli = Cli::try_parse_from(["ecc", "merge-queue", "--json"])
+            .expect("merge-queue --json should parse");
+
+        match cli.command {
+            Some(Commands::MergeQueue { json, apply }) => {
+                assert!(json);
+                assert!(!apply);
+            }
+            _ => panic!("expected merge-queue subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_merge_queue_apply_flag() {
+        let cli = Cli::try_parse_from(["ecc", "merge-queue", "--apply", "--json"])
+            .expect("merge-queue --apply --json should parse");
+
+        match cli.command {
+            Some(Commands::MergeQueue { json, apply }) => {
+                assert!(json);
+                assert!(apply);
+            }
+            _ => panic!("expected merge-queue subcommand"),
+        }
+    }
+
+    #[test]
     fn format_worktree_status_human_includes_readiness_and_conflicts() {
         let report = WorktreeStatusReport {
             session_id: "deadbeefcafefeed".to_string(),
@@ -2636,6 +2970,60 @@ mod tests {
     }
 
     #[test]
+    fn format_merge_queue_human_reports_ready_and_blocked_entries() {
+        let text = format_merge_queue_human(&session::manager::MergeQueueReport {
+            ready_entries: vec![session::manager::MergeQueueEntry {
+                session_id: "alpha1234".to_string(),
+                task: "merge alpha".to_string(),
+                project: "ecc".to_string(),
+                task_group: "checkout".to_string(),
+                branch: "ecc/alpha1234".to_string(),
+                base_branch: "main".to_string(),
+                state: session::SessionState::Stopped,
+                worktree_health: worktree::WorktreeHealth::InProgress,
+                dirty: false,
+                queue_position: Some(1),
+                ready_to_merge: true,
+                blocked_by: Vec::new(),
+                suggested_action: "merge in queue order #1".to_string(),
+            }],
+            blocked_entries: vec![session::manager::MergeQueueEntry {
+                session_id: "beta5678".to_string(),
+                task: "merge beta".to_string(),
+                project: "ecc".to_string(),
+                task_group: "checkout".to_string(),
+                branch: "ecc/beta5678".to_string(),
+                base_branch: "main".to_string(),
+                state: session::SessionState::Stopped,
+                worktree_health: worktree::WorktreeHealth::InProgress,
+                dirty: false,
+                queue_position: None,
+                ready_to_merge: false,
+                blocked_by: vec![session::manager::MergeQueueBlocker {
+                    session_id: "alpha1234".to_string(),
+                    branch: "ecc/alpha1234".to_string(),
+                    state: session::SessionState::Stopped,
+                    conflicts: vec!["README.md".to_string()],
+                    summary: "merge after alpha1234 to avoid branch conflicts".to_string(),
+                    conflicting_patch_preview: Some(
+                        "--- Branch diff vs main ---\nREADME.md".to_string(),
+                    ),
+                    blocker_patch_preview: None,
+                }],
+                suggested_action: "merge after alpha1234".to_string(),
+            }],
+        });
+
+        assert!(text.contains("Merge queue: 1 ready / 1 blocked"));
+        assert!(text.contains("Ready"));
+        assert!(text.contains("#1 alpha1234"));
+        assert!(text.contains("Blocked"));
+        assert!(text.contains("beta5678"));
+        assert!(text.contains("blocker alpha1234"));
+        assert!(text.contains("conflict README.md"));
+    }
+
+    #[test]
     fn format_bulk_worktree_merge_human_reports_summary_and_skips() {
         let text = format_bulk_worktree_merge_human(&session::manager::WorktreeBulkMergeOutcome {
             merged: vec![session::manager::WorktreeMergeOutcome {
@@ -2645,9 +3033,16 @@ mod tests {
                 already_up_to_date: false,
                 cleaned_worktree: true,
             }],
+            rebased: vec![session::manager::WorktreeRebaseOutcome {
+                session_id: "rebased12345678".to_string(),
+                branch: "ecc/rebased12345678".to_string(),
+                base_branch: "main".to_string(),
+                already_up_to_date: false,
+            }],
             active_with_worktree_ids: vec!["running12345678".to_string()],
             conflicted_session_ids: vec!["conflict123456".to_string()],
             dirty_worktree_ids: vec!["dirty123456789".to_string()],
+            blocked_by_queue_session_ids: vec!["queue123456789".to_string()],
             failures: vec![session::manager::WorktreeMergeFailure {
                 session_id: "fail1234567890".to_string(),
                 reason: "base branch not checked out".to_string(),
@@ -2656,9 +3051,12 @@ mod tests {
 
         assert!(text.contains("Merged 1 ready worktree(s)"));
         assert!(text.contains("- merged ecc/deadbeefcafefeed -> main for deadbeef"));
+        assert!(text.contains("Rebased 1 blocked worktree(s) onto their base branch"));
+        assert!(text.contains("- rebased ecc/rebased12345678 onto main for rebased1"));
         assert!(text.contains("Skipped 1 active worktree session(s)"));
         assert!(text.contains("Skipped 1 conflicted worktree(s)"));
         assert!(text.contains("Skipped 1 dirty worktree(s)"));
+        assert!(text.contains("Blocked 1 worktree(s) on remaining queue conflicts"));
         assert!(text.contains("Encountered 1 merge failure(s)"));
         assert!(text.contains("- failed fail1234: base branch not checked out"));
     }
@@ -3024,6 +3422,87 @@ mod tests {
             }
             _ => panic!("expected coordination-status subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_parses_log_decision_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "log-decision",
+            "latest",
+            "--decision",
+            "Use sqlite",
+            "--reasoning",
+            "It is already embedded",
+            "--alternative",
+            "json files",
+            "--alternative",
+            "memory only",
+            "--json",
+        ])
+        .expect("log-decision should parse");
+
+        match cli.command {
+            Some(Commands::LogDecision {
+                session_id,
+                decision,
+                reasoning,
+                alternatives,
+                json,
+            }) => {
+                assert_eq!(session_id.as_deref(), Some("latest"));
+                assert_eq!(decision, "Use sqlite");
+                assert_eq!(reasoning, "It is already embedded");
+                assert_eq!(alternatives, vec!["json files", "memory only"]);
+                assert!(json);
+            }
+            _ => panic!("expected log-decision subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_decisions_command() {
+        let cli = Cli::try_parse_from(["ecc", "decisions", "--all", "--limit", "5", "--json"])
+            .expect("decisions should parse");
+
+        match cli.command {
+            Some(Commands::Decisions {
+                session_id,
+                all,
+                json,
+                limit,
+            }) => {
+                assert!(session_id.is_none());
+                assert!(all);
+                assert!(json);
+                assert_eq!(limit, 5);
+            }
+            _ => panic!("expected decisions subcommand"),
+        }
+    }
+
+    #[test]
+    fn format_decisions_human_renders_details() {
+        let text = format_decisions_human(
+            &[session::DecisionLogEntry {
+                id: 1,
+                session_id: "sess-12345678".to_string(),
+                decision: "Use sqlite for the shared context graph".to_string(),
+                alternatives: vec!["json files".to_string(), "memory only".to_string()],
+                reasoning: "SQLite keeps the audit trail queryable.".to_string(),
+                timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-09T01:02:03Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            }],
+            true,
+        );
+
+        assert!(text.contains("Decision log: 1 entries"));
+        assert!(text.contains("sess-123"));
+        assert!(text.contains("Use sqlite for the shared context graph"));
+        assert!(text.contains("why SQLite keeps the audit trail queryable."));
+        assert!(text.contains("alternative json files"));
+        assert!(text.contains("alternative memory only"));
     }
 
     #[test]

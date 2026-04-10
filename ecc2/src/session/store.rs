@@ -13,8 +13,9 @@ use crate::observability::{ToolCallEvent, ToolLogEntry, ToolLogPage};
 
 use super::output::{OutputLine, OutputStream, OUTPUT_BUFFER_LIMIT};
 use super::{
-    FileActivityAction, FileActivityEntry, Session, SessionMessage, SessionMetrics, SessionState,
-    WorktreeInfo,
+    default_project_label, default_task_group_label, normalize_group_label, DecisionLogEntry,
+    FileActivityAction, FileActivityEntry, Session, SessionAgentProfile, SessionMessage,
+    SessionMetrics, SessionState, WorktreeInfo,
 };
 
 pub struct StateStore {
@@ -36,6 +37,24 @@ pub struct FileActivityOverlap {
     pub other_session_id: String,
     pub other_session_state: SessionState,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConflictIncident {
+    pub id: i64,
+    pub conflict_key: String,
+    pub path: String,
+    pub first_session_id: String,
+    pub second_session_id: String,
+    pub active_session_id: String,
+    pub paused_session_id: String,
+    pub first_action: FileActivityAction,
+    pub second_action: FileActivityAction,
+    pub strategy: String,
+    pub summary: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub resolved_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -138,6 +157,8 @@ impl StateStore {
             CREATE TABLE IF NOT EXISTS sessions (
                 id TEXT PRIMARY KEY,
                 task TEXT NOT NULL,
+                project TEXT NOT NULL DEFAULT '',
+                task_group TEXT NOT NULL DEFAULT '',
                 agent_type TEXT NOT NULL,
                 working_dir TEXT NOT NULL DEFAULT '.',
                 state TEXT NOT NULL DEFAULT 'pending',
@@ -173,6 +194,19 @@ impl StateStore {
                 file_events_json TEXT NOT NULL DEFAULT '[]'
             );
 
+            CREATE TABLE IF NOT EXISTS session_profiles (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                profile_name TEXT NOT NULL,
+                model TEXT,
+                allowed_tools_json TEXT NOT NULL DEFAULT '[]',
+                disallowed_tools_json TEXT NOT NULL DEFAULT '[]',
+                permission_mode TEXT,
+                add_dirs_json TEXT NOT NULL DEFAULT '[]',
+                max_budget_usd REAL,
+                token_budget INTEGER,
+                append_system_prompt TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_session TEXT NOT NULL,
@@ -191,10 +225,36 @@ impl StateStore {
                 timestamp TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS decision_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                decision TEXT NOT NULL,
+                alternatives_json TEXT NOT NULL DEFAULT '[]',
+                reasoning TEXT NOT NULL,
+                timestamp TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS pending_worktree_queue (
                 session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
                 repo_root TEXT NOT NULL,
                 requested_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS conflict_incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conflict_key TEXT NOT NULL UNIQUE,
+                path TEXT NOT NULL,
+                first_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                second_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                active_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                paused_session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                first_action TEXT NOT NULL,
+                second_action TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                resolved_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS daemon_activity (
@@ -223,12 +283,13 @@ impl StateStore {
 
             CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
             CREATE INDEX IF NOT EXISTS idx_tool_log_session ON tool_log(session_id);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_tool_log_hook_event
-                ON tool_log(hook_event_id)
-                WHERE hook_event_id IS NOT NULL;
             CREATE INDEX IF NOT EXISTS idx_messages_to ON messages(to_session, read);
             CREATE INDEX IF NOT EXISTS idx_session_output_session
                 ON session_output(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_decision_log_session
+                ON decision_log(session_id, timestamp, id);
+            CREATE INDEX IF NOT EXISTS idx_conflict_incidents_sessions
+                ON conflict_incidents(first_session_id, second_session_id, resolved_at, updated_at);
             CREATE INDEX IF NOT EXISTS idx_pending_worktree_queue_requested_at
                 ON pending_worktree_queue(requested_at, session_id);
 
@@ -253,6 +314,24 @@ impl StateStore {
             self.conn
                 .execute("ALTER TABLE sessions ADD COLUMN pid INTEGER", [])
                 .context("Failed to add pid column to sessions table")?;
+        }
+
+        if !self.has_column("sessions", "project")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE sessions ADD COLUMN project TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .context("Failed to add project column to sessions table")?;
+        }
+
+        if !self.has_column("sessions", "task_group")? {
+            self.conn
+                .execute(
+                    "ALTER TABLE sessions ADD COLUMN task_group TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .context("Failed to add task_group column to sessions table")?;
         }
 
         if !self.has_column("sessions", "input_tokens")? {
@@ -478,11 +557,13 @@ impl StateStore {
 
     pub fn insert_session(&self, session: &Session) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO sessions (id, task, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base, created_at, updated_at, last_heartbeat_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO sessions (id, task, project, task_group, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base, created_at, updated_at, last_heartbeat_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 session.id,
                 session.task,
+                session.project,
+                session.task_group,
                 session.agent_type,
                 session.working_dir.to_string_lossy().to_string(),
                 session.state.to_string(),
@@ -499,6 +580,98 @@ impl StateStore {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn upsert_session_profile(
+        &self,
+        session_id: &str,
+        profile: &SessionAgentProfile,
+    ) -> Result<()> {
+        let allowed_tools_json = serde_json::to_string(&profile.allowed_tools)
+            .context("serialize allowed agent profile tools")?;
+        let disallowed_tools_json = serde_json::to_string(&profile.disallowed_tools)
+            .context("serialize disallowed agent profile tools")?;
+        let add_dirs_json = serde_json::to_string(&profile.add_dirs)
+            .context("serialize agent profile add_dirs")?;
+
+        self.conn.execute(
+            "INSERT INTO session_profiles (
+                session_id,
+                profile_name,
+                model,
+                allowed_tools_json,
+                disallowed_tools_json,
+                permission_mode,
+                add_dirs_json,
+                max_budget_usd,
+                token_budget,
+                append_system_prompt
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(session_id) DO UPDATE SET
+                profile_name = excluded.profile_name,
+                model = excluded.model,
+                allowed_tools_json = excluded.allowed_tools_json,
+                disallowed_tools_json = excluded.disallowed_tools_json,
+                permission_mode = excluded.permission_mode,
+                add_dirs_json = excluded.add_dirs_json,
+                max_budget_usd = excluded.max_budget_usd,
+                token_budget = excluded.token_budget,
+                append_system_prompt = excluded.append_system_prompt",
+            rusqlite::params![
+                session_id,
+                profile.profile_name,
+                profile.model,
+                allowed_tools_json,
+                disallowed_tools_json,
+                profile.permission_mode,
+                add_dirs_json,
+                profile.max_budget_usd,
+                profile.token_budget,
+                profile.append_system_prompt,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session_profile(&self, session_id: &str) -> Result<Option<SessionAgentProfile>> {
+        self.conn
+            .query_row(
+                "SELECT
+                    profile_name,
+                    model,
+                    allowed_tools_json,
+                    disallowed_tools_json,
+                    permission_mode,
+                    add_dirs_json,
+                    max_budget_usd,
+                    token_budget,
+                    append_system_prompt
+                 FROM session_profiles
+                 WHERE session_id = ?1",
+                [session_id],
+                |row| {
+                    let allowed_tools_json: String = row.get(2)?;
+                    let disallowed_tools_json: String = row.get(3)?;
+                    let add_dirs_json: String = row.get(5)?;
+                    Ok(SessionAgentProfile {
+                        profile_name: row.get(0)?,
+                        model: row.get(1)?,
+                        allowed_tools: serde_json::from_str(&allowed_tools_json)
+                            .unwrap_or_default(),
+                        disallowed_tools: serde_json::from_str(&disallowed_tools_json)
+                            .unwrap_or_default(),
+                        permission_mode: row.get(4)?,
+                        add_dirs: serde_json::from_str(&add_dirs_json).unwrap_or_default(),
+                        max_budget_usd: row.get(6)?,
+                        token_budget: row.get(7)?,
+                        append_system_prompt: row.get(8)?,
+                        agent: None,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn update_state_and_pid(
@@ -1062,7 +1235,7 @@ impl StateStore {
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, task, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base,
+            "SELECT id, task, project, task_group, agent_type, working_dir, state, pid, worktree_path, worktree_branch, worktree_base,
                     input_tokens, output_tokens, tokens_used, tool_calls, files_changed, duration_secs, cost_usd,
                     created_at, updated_at, last_heartbeat_at
              FROM sessions ORDER BY updated_at DESC",
@@ -1070,27 +1243,42 @@ impl StateStore {
 
         let sessions = stmt
             .query_map([], |row| {
-                let state_str: String = row.get(4)?;
+                let state_str: String = row.get(6)?;
                 let state = SessionState::from_db_value(&state_str);
 
-                let worktree_path: Option<String> = row.get(6)?;
+                let working_dir = PathBuf::from(row.get::<_, String>(5)?);
+                let project = row
+                    .get::<_, String>(2)
+                    .ok()
+                    .and_then(|value| normalize_group_label(&value))
+                    .unwrap_or_else(|| default_project_label(&working_dir));
+                let task: String = row.get(1)?;
+                let task_group = row
+                    .get::<_, String>(3)
+                    .ok()
+                    .and_then(|value| normalize_group_label(&value))
+                    .unwrap_or_else(|| default_task_group_label(&task));
+
+                let worktree_path: Option<String> = row.get(8)?;
                 let worktree = worktree_path.map(|path| super::WorktreeInfo {
                     path: PathBuf::from(path),
-                    branch: row.get::<_, String>(7).unwrap_or_default(),
-                    base_branch: row.get::<_, String>(8).unwrap_or_default(),
+                    branch: row.get::<_, String>(9).unwrap_or_default(),
+                    base_branch: row.get::<_, String>(10).unwrap_or_default(),
                 });
 
-                let created_str: String = row.get(16)?;
-                let updated_str: String = row.get(17)?;
-                let heartbeat_str: String = row.get(18)?;
+                let created_str: String = row.get(18)?;
+                let updated_str: String = row.get(19)?;
+                let heartbeat_str: String = row.get(20)?;
 
                 Ok(Session {
                     id: row.get(0)?,
-                    task: row.get(1)?,
-                    agent_type: row.get(2)?,
-                    working_dir: PathBuf::from(row.get::<_, String>(3)?),
+                    task,
+                    project,
+                    task_group,
+                    agent_type: row.get(4)?,
+                    working_dir,
                     state,
-                    pid: row.get::<_, Option<u32>>(5)?,
+                    pid: row.get::<_, Option<u32>>(7)?,
                     worktree,
                     created_at: chrono::DateTime::parse_from_rfc3339(&created_str)
                         .unwrap_or_default()
@@ -1104,13 +1292,13 @@ impl StateStore {
                         })
                         .with_timezone(&chrono::Utc),
                     metrics: SessionMetrics {
-                        input_tokens: row.get(9)?,
-                        output_tokens: row.get(10)?,
-                        tokens_used: row.get(11)?,
-                        tool_calls: row.get(12)?,
-                        files_changed: row.get(13)?,
-                        duration_secs: row.get(14)?,
-                        cost_usd: row.get(15)?,
+                        input_tokens: row.get(11)?,
+                        output_tokens: row.get(12)?,
+                        tokens_used: row.get(13)?,
+                        tool_calls: row.get(14)?,
+                        files_changed: row.get(15)?,
+                        duration_secs: row.get(16)?,
+                        cost_usd: row.get(17)?,
                     },
                 })
             })?
@@ -1262,6 +1450,35 @@ impl StateStore {
         messages.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    pub fn latest_unread_approval_message(&self) -> Result<Option<SessionMessage>> {
+        self.conn
+            .query_row(
+                "SELECT id, from_session, to_session, content, msg_type, read, timestamp
+                 FROM messages
+                 WHERE read = 0 AND msg_type IN ('query', 'conflict')
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    let timestamp: String = row.get(6)?;
+
+                    Ok(SessionMessage {
+                        id: row.get(0)?,
+                        from_session: row.get(1)?,
+                        to_session: row.get(2)?,
+                        content: row.get(3)?,
+                        msg_type: row.get(4)?,
+                        read: row.get::<_, i64>(5)? != 0,
+                        timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp)
+                            .unwrap_or_default()
+                            .with_timezone(&chrono::Utc),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn unread_task_handoffs_for_session(
         &self,
         session_id: &str,
@@ -1355,6 +1572,84 @@ impl StateStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn insert_decision(
+        &self,
+        session_id: &str,
+        decision: &str,
+        alternatives: &[String],
+        reasoning: &str,
+    ) -> Result<DecisionLogEntry> {
+        let timestamp = chrono::Utc::now();
+        let alternatives_json = serde_json::to_string(alternatives)
+            .context("Failed to serialize decision alternatives")?;
+
+        self.conn.execute(
+            "INSERT INTO decision_log (session_id, decision, alternatives_json, reasoning, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                session_id,
+                decision,
+                alternatives_json,
+                reasoning,
+                timestamp.to_rfc3339(),
+            ],
+        )?;
+
+        Ok(DecisionLogEntry {
+            id: self.conn.last_insert_rowid(),
+            session_id: session_id.to_string(),
+            decision: decision.to_string(),
+            alternatives: alternatives.to_vec(),
+            reasoning: reasoning.to_string(),
+            timestamp,
+        })
+    }
+
+    pub fn list_decisions_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<DecisionLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, decision, alternatives_json, reasoning, timestamp
+             FROM (
+                 SELECT id, session_id, decision, alternatives_json, reasoning, timestamp
+                 FROM decision_log
+                 WHERE session_id = ?1
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT ?2
+             )
+             ORDER BY timestamp ASC, id ASC",
+        )?;
+
+        let entries = stmt
+            .query_map(rusqlite::params![session_id, limit as i64], |row| {
+                map_decision_log_entry(row)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
+    }
+
+    pub fn list_decisions(&self, limit: usize) -> Result<Vec<DecisionLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, decision, alternatives_json, reasoning, timestamp
+             FROM (
+                 SELECT id, session_id, decision, alternatives_json, reasoning, timestamp
+                 FROM decision_log
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT ?1
+             )
+             ORDER BY timestamp ASC, id ASC",
+        )?;
+
+        let entries = stmt
+            .query_map(rusqlite::params![limit as i64], map_decision_log_entry)?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(entries)
     }
 
     pub fn daemon_activity(&self) -> Result<DaemonActivity> {
@@ -1885,6 +2180,157 @@ impl StateStore {
         overlaps.truncate(limit);
         Ok(overlaps)
     }
+
+    pub fn has_open_conflict_incident(&self, conflict_key: &str) -> Result<bool> {
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT 1
+                 FROM conflict_incidents
+                 WHERE conflict_key = ?1 AND resolved_at IS NULL
+                 LIMIT 1",
+                rusqlite::params![conflict_key],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_conflict_incident(
+        &self,
+        conflict_key: &str,
+        path: &str,
+        first_session_id: &str,
+        second_session_id: &str,
+        active_session_id: &str,
+        paused_session_id: &str,
+        first_action: &FileActivityAction,
+        second_action: &FileActivityAction,
+        strategy: &str,
+        summary: &str,
+    ) -> Result<ConflictIncident> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO conflict_incidents (
+                 conflict_key, path, first_session_id, second_session_id,
+                 active_session_id, paused_session_id, first_action, second_action,
+                 strategy, summary, created_at, updated_at, resolved_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, NULL)
+             ON CONFLICT(conflict_key) DO UPDATE SET
+                 path = excluded.path,
+                 first_session_id = excluded.first_session_id,
+                 second_session_id = excluded.second_session_id,
+                 active_session_id = excluded.active_session_id,
+                 paused_session_id = excluded.paused_session_id,
+                 first_action = excluded.first_action,
+                 second_action = excluded.second_action,
+                 strategy = excluded.strategy,
+                 summary = excluded.summary,
+                 updated_at = excluded.updated_at,
+                 resolved_at = NULL",
+            rusqlite::params![
+                conflict_key,
+                path,
+                first_session_id,
+                second_session_id,
+                active_session_id,
+                paused_session_id,
+                file_activity_action_value(first_action),
+                file_activity_action_value(second_action),
+                strategy,
+                summary,
+                now,
+            ],
+        )?;
+
+        self.conn
+            .query_row(
+                "SELECT id, conflict_key, path, first_session_id, second_session_id,
+                        active_session_id, paused_session_id, first_action, second_action,
+                        strategy, summary, created_at, updated_at, resolved_at
+                 FROM conflict_incidents
+                 WHERE conflict_key = ?1",
+                rusqlite::params![conflict_key],
+                map_conflict_incident,
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn resolve_conflict_incidents_not_in(
+        &self,
+        active_keys: &HashSet<String>,
+    ) -> Result<usize> {
+        let open = self.list_open_conflict_incidents(512)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut resolved = 0;
+
+        for incident in open {
+            if active_keys.contains(&incident.conflict_key) {
+                continue;
+            }
+
+            resolved += self.conn.execute(
+                "UPDATE conflict_incidents
+                 SET resolved_at = ?2, updated_at = ?2
+                 WHERE conflict_key = ?1 AND resolved_at IS NULL",
+                rusqlite::params![incident.conflict_key, now],
+            )?;
+        }
+
+        Ok(resolved)
+    }
+
+    pub fn list_open_conflict_incidents_for_session(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ConflictIncident>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, conflict_key, path, first_session_id, second_session_id,
+                    active_session_id, paused_session_id, first_action, second_action,
+                    strategy, summary, created_at, updated_at, resolved_at
+             FROM conflict_incidents
+             WHERE resolved_at IS NULL
+               AND (
+                   first_session_id = ?1
+                   OR second_session_id = ?1
+                   OR active_session_id = ?1
+                   OR paused_session_id = ?1
+               )
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+
+        let incidents = stmt
+            .query_map(
+                rusqlite::params![session_id, limit as i64],
+                map_conflict_incident,
+            )?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(incidents)
+    }
+
+    fn list_open_conflict_incidents(&self, limit: usize) -> Result<Vec<ConflictIncident>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, conflict_key, path, first_session_id, second_session_id,
+                    active_session_id, paused_session_id, first_action, second_action,
+                    strategy, summary, created_at, updated_at, resolved_at
+             FROM conflict_incidents
+             WHERE resolved_at IS NULL
+             ORDER BY updated_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+
+        let incidents = stmt
+            .query_map(rusqlite::params![limit as i64], map_conflict_incident)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(incidents)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1918,6 +2364,70 @@ fn parse_persisted_file_events(value: &str) -> Option<Vec<PersistedFileEvent>> {
         return None;
     }
     Some(events)
+}
+
+fn file_activity_action_value(action: &FileActivityAction) -> &'static str {
+    match action {
+        FileActivityAction::Read => "read",
+        FileActivityAction::Create => "create",
+        FileActivityAction::Modify => "modify",
+        FileActivityAction::Move => "move",
+        FileActivityAction::Delete => "delete",
+        FileActivityAction::Touch => "touch",
+    }
+}
+
+fn map_conflict_incident(row: &rusqlite::Row<'_>) -> rusqlite::Result<ConflictIncident> {
+    let created_at = parse_timestamp_column(row.get::<_, String>(11)?, 11)?;
+    let updated_at = parse_timestamp_column(row.get::<_, String>(12)?, 12)?;
+    let resolved_at = row
+        .get::<_, Option<String>>(13)?
+        .map(|value| parse_timestamp_column(value, 13))
+        .transpose()?;
+
+    Ok(ConflictIncident {
+        id: row.get(0)?,
+        conflict_key: row.get(1)?,
+        path: row.get(2)?,
+        first_session_id: row.get(3)?,
+        second_session_id: row.get(4)?,
+        active_session_id: row.get(5)?,
+        paused_session_id: row.get(6)?,
+        first_action: parse_file_activity_action(&row.get::<_, String>(7)?).ok_or_else(|| {
+            rusqlite::Error::InvalidColumnType(
+                7,
+                "first_action".into(),
+                rusqlite::types::Type::Text,
+            )
+        })?,
+        second_action: parse_file_activity_action(&row.get::<_, String>(8)?).ok_or_else(|| {
+            rusqlite::Error::InvalidColumnType(
+                8,
+                "second_action".into(),
+                rusqlite::types::Type::Text,
+            )
+        })?,
+        strategy: row.get(9)?,
+        summary: row.get(10)?,
+        created_at,
+        updated_at,
+        resolved_at,
+    })
+}
+
+fn parse_timestamp_column(
+    value: String,
+    index: usize,
+) -> rusqlite::Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(&value)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })
 }
 
 fn parse_file_activity_action(value: &str) -> Option<FileActivityAction> {
@@ -1969,6 +2479,34 @@ fn session_state_supports_overlap(state: &SessionState) -> bool {
         state,
         SessionState::Pending | SessionState::Running | SessionState::Idle | SessionState::Stale
     )
+}
+
+fn map_decision_log_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<DecisionLogEntry> {
+    let alternatives_json = row
+        .get::<_, Option<String>>(3)?
+        .unwrap_or_else(|| "[]".to_string());
+    let alternatives = serde_json::from_str(&alternatives_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let timestamp = row.get::<_, String>(5)?;
+    let timestamp = chrono::DateTime::parse_from_rfc3339(&timestamp)
+        .map(|value| value.with_timezone(&chrono::Utc))
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+
+    Ok(DecisionLogEntry {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        decision: row.get(2)?,
+        alternatives,
+        reasoning: row.get(4)?,
+        timestamp,
+    })
 }
 
 fn file_overlap_is_relevant(current: &FileActivityEntry, other: &FileActivityEntry) -> bool {
@@ -2023,6 +2561,8 @@ mod tests {
         Session {
             id: id.to_string(),
             task: "task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state,
@@ -2098,6 +2638,63 @@ mod tests {
     }
 
     #[test]
+    fn session_profile_round_trips_with_launch_settings() -> Result<()> {
+        let tempdir = TestDir::new("store-session-profile")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "review work".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Pending,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.upsert_session_profile(
+            "session-1",
+            &crate::session::SessionAgentProfile {
+                agent: None,
+                profile_name: "reviewer".to_string(),
+                model: Some("sonnet".to_string()),
+                allowed_tools: vec!["Read".to_string(), "Edit".to_string()],
+                disallowed_tools: vec!["Bash".to_string()],
+                permission_mode: Some("plan".to_string()),
+                add_dirs: vec![PathBuf::from("docs"), PathBuf::from("specs")],
+                max_budget_usd: Some(1.5),
+                token_budget: Some(1200),
+                append_system_prompt: Some("Review thoroughly.".to_string()),
+            },
+        )?;
+
+        let profile = db
+            .get_session_profile("session-1")?
+            .expect("profile should be stored");
+        assert_eq!(profile.profile_name, "reviewer");
+        assert_eq!(profile.model.as_deref(), Some("sonnet"));
+        assert_eq!(profile.allowed_tools, vec!["Read", "Edit"]);
+        assert_eq!(profile.disallowed_tools, vec!["Bash"]);
+        assert_eq!(profile.permission_mode.as_deref(), Some("plan"));
+        assert_eq!(profile.add_dirs, vec![PathBuf::from("docs"), PathBuf::from("specs")]);
+        assert_eq!(profile.max_budget_usd, Some(1.5));
+        assert_eq!(profile.token_budget, Some(1200));
+        assert_eq!(
+            profile.append_system_prompt.as_deref(),
+            Some("Review thoroughly.")
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn sync_cost_tracker_metrics_aggregates_usage_into_sessions() -> Result<()> {
         let tempdir = TestDir::new("store-cost-metrics")?;
         let db = StateStore::open(&tempdir.path().join("state.db"))?;
@@ -2106,6 +2703,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "sync usage".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2151,6 +2750,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "sync tools".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2164,6 +2765,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-2".to_string(),
             task: "no activity".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Pending,
@@ -2228,6 +2831,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "sync tools".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2273,6 +2878,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "sync tools".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2321,6 +2928,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "focus".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2334,6 +2943,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-2".to_string(),
             task: "delegate".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Idle,
@@ -2347,6 +2958,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-3".to_string(),
             task: "done".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Completed,
@@ -2384,6 +2997,201 @@ mod tests {
     }
 
     #[test]
+    fn conflict_incidents_upsert_and_resolve() -> Result<()> {
+        let tempdir = TestDir::new("store-conflict-incidents")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        for id in ["session-a", "session-b"] {
+            db.insert_session(&Session {
+                id: id.to_string(),
+                task: id.to_string(),
+                project: "workspace".to_string(),
+                task_group: "general".to_string(),
+                agent_type: "claude".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                state: SessionState::Running,
+                pid: None,
+                worktree: None,
+                created_at: now,
+                updated_at: now,
+                last_heartbeat_at: now,
+                metrics: SessionMetrics::default(),
+            })?;
+        }
+
+        let incident = db.upsert_conflict_incident(
+            "src/lib.rs::session-a::session-b",
+            "src/lib.rs",
+            "session-a",
+            "session-b",
+            "session-a",
+            "session-b",
+            &FileActivityAction::Modify,
+            &FileActivityAction::Modify,
+            "escalate",
+            "Paused session-b after overlapping modify on src/lib.rs",
+        )?;
+        assert_eq!(incident.paused_session_id, "session-b");
+        assert!(db.has_open_conflict_incident("src/lib.rs::session-a::session-b")?);
+
+        let listed = db.list_open_conflict_incidents_for_session("session-b", 10)?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].path, "src/lib.rs");
+
+        let resolved = db.resolve_conflict_incidents_not_in(&HashSet::new())?;
+        assert_eq!(resolved, 1);
+        assert!(!db.has_open_conflict_incident("src/lib.rs::session-a::session-b")?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn open_migrates_legacy_tool_log_before_creating_hook_event_index() -> Result<()> {
+        let tempdir = TestDir::new("store-legacy-hook-event")?;
+        let db_path = tempdir.path().join("state.db");
+        let conn = Connection::open(&db_path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                task TEXT NOT NULL,
+                agent_type TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE tool_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                input_summary TEXT,
+                output_summary TEXT,
+                duration_ms INTEGER,
+                risk_score REAL DEFAULT 0.0,
+                timestamp TEXT NOT NULL
+            );
+            ",
+        )?;
+        drop(conn);
+
+        let db = StateStore::open(&db_path)?;
+        assert!(db.has_column("tool_log", "hook_event_id")?);
+
+        let conn = Connection::open(&db_path)?;
+        let index_count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_tool_log_hook_event'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(index_count, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn insert_and_list_decisions_for_session() -> Result<()> {
+        let tempdir = TestDir::new("store-decisions")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "session-1".to_string(),
+            task: "architect".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            state: SessionState::Running,
+            pid: None,
+            worktree: None,
+            created_at: now,
+            updated_at: now,
+            last_heartbeat_at: now,
+            metrics: SessionMetrics::default(),
+        })?;
+
+        db.insert_decision(
+            "session-1",
+            "Use sqlite for the shared context graph",
+            &["json files".to_string(), "memory only".to_string()],
+            "SQLite keeps the audit trail queryable from both CLI and TUI.",
+        )?;
+        db.insert_decision(
+            "session-1",
+            "Keep decision logging append-only",
+            &["mutable edits".to_string()],
+            "Append-only history preserves operator trust and timeline integrity.",
+        )?;
+
+        let entries = db.list_decisions_for_session("session-1", 10)?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].session_id, "session-1");
+        assert_eq!(
+            entries[0].decision,
+            "Use sqlite for the shared context graph"
+        );
+        assert_eq!(
+            entries[0].alternatives,
+            vec!["json files".to_string(), "memory only".to_string()]
+        );
+        assert_eq!(entries[1].decision, "Keep decision logging append-only");
+        assert_eq!(
+            entries[1].reasoning,
+            "Append-only history preserves operator trust and timeline integrity."
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn list_recent_decisions_across_sessions_returns_latest_subset_in_order() -> Result<()> {
+        let tempdir = TestDir::new("store-decisions-all")?;
+        let db = StateStore::open(&tempdir.path().join("state.db"))?;
+        let now = Utc::now();
+
+        for session_id in ["session-a", "session-b", "session-c"] {
+            db.insert_session(&Session {
+                id: session_id.to_string(),
+                task: "decision log".to_string(),
+                project: "workspace".to_string(),
+                task_group: "general".to_string(),
+                agent_type: "claude".to_string(),
+                working_dir: PathBuf::from("/tmp"),
+                state: SessionState::Running,
+                pid: None,
+                worktree: None,
+                created_at: now,
+                updated_at: now,
+                last_heartbeat_at: now,
+                metrics: SessionMetrics::default(),
+            })?;
+        }
+
+        db.insert_decision("session-a", "Oldest", &[], "first")?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        db.insert_decision("session-b", "Middle", &[], "second")?;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        db.insert_decision("session-c", "Newest", &[], "third")?;
+
+        let entries = db.list_decisions(2)?;
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.decision.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Middle", "Newest"]
+        );
+        assert_eq!(entries[0].session_id, "session-b");
+        assert_eq!(entries[1].session_id, "session-c");
+
+        Ok(())
+    }
+
+    #[test]
     fn refresh_session_durations_updates_running_and_terminal_sessions() -> Result<()> {
         let tempdir = TestDir::new("store-duration-metrics")?;
         let db = StateStore::open(&tempdir.path().join("state.db"))?;
@@ -2392,6 +3200,8 @@ mod tests {
         db.insert_session(&Session {
             id: "running-1".to_string(),
             task: "live run".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2405,6 +3215,8 @@ mod tests {
         db.insert_session(&Session {
             id: "done-1".to_string(),
             task: "finished run".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Completed,
@@ -2440,6 +3252,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "heartbeat".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,
@@ -2470,6 +3284,8 @@ mod tests {
         db.insert_session(&Session {
             id: "session-1".to_string(),
             task: "buffer output".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
             agent_type: "claude".to_string(),
             working_dir: PathBuf::from("/tmp"),
             state: SessionState::Running,

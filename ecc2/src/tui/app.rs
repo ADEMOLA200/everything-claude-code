@@ -27,6 +27,18 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(key) = event::read()? {
+                if dashboard.has_active_completion_popup() {
+                    match (key.modifiers, key.code) {
+                        (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
+                        (_, KeyCode::Esc) | (_, KeyCode::Enter) | (_, KeyCode::Char(' ')) => {
+                            dashboard.dismiss_completion_popup();
+                        }
+                        _ => {}
+                    }
+
+                    continue;
+                }
+
                 if dashboard.is_input_mode() {
                     match (key.modifiers, key.code) {
                         (KeyModifiers::CONTROL, KeyCode::Char('c')) => break,
@@ -91,7 +103,13 @@ pub async fn run(db: StateStore, cfg: Config) -> Result<()> {
                     (_, KeyCode::Char('y')) => dashboard.toggle_timeline_mode(),
                     (_, KeyCode::Char('E')) => dashboard.cycle_timeline_event_filter(),
                     (_, KeyCode::Char('v')) => dashboard.toggle_output_mode(),
+                    (_, KeyCode::Char('z')) => dashboard.toggle_git_status_mode(),
                     (_, KeyCode::Char('V')) => dashboard.toggle_diff_view_mode(),
+                    (_, KeyCode::Char('S')) => dashboard.stage_selected_git_status(),
+                    (_, KeyCode::Char('U')) => dashboard.unstage_selected_git_status(),
+                    (_, KeyCode::Char('R')) => dashboard.reset_selected_git_status(),
+                    (_, KeyCode::Char('C')) => dashboard.begin_commit_prompt(),
+                    (_, KeyCode::Char('P')) => dashboard.begin_pr_prompt(),
                     (_, KeyCode::Char('{')) => dashboard.prev_diff_hunk(),
                     (_, KeyCode::Char('}')) => dashboard.next_diff_hunk(),
                     (_, KeyCode::Char('c')) => dashboard.toggle_conflict_protocol_mode(),
