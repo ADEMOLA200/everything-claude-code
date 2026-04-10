@@ -38,6 +38,7 @@ const PANE_RESIZE_STEP_PERCENT: u16 = 5;
 const MAX_LOG_ENTRIES: u64 = 12;
 const MAX_DIFF_PREVIEW_LINES: usize = 6;
 const MAX_DIFF_PATCH_LINES: usize = 80;
+const MAX_METRICS_GRAPH_RELATIONS: usize = 6;
 const MAX_FILE_ACTIVITY_PATCH_LINES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4909,8 +4910,12 @@ impl Dashboard {
                 }
 
                 self.selected_team_summary = if team.total > 0 { Some(team) } else { None };
+                let selected_agent_type = self
+                    .selected_agent_type()
+                    .unwrap_or(self.cfg.default_agent.as_str())
+                    .to_string();
                 self.selected_route_preview =
-                    self.build_route_preview(team.total, &route_candidates);
+                    self.build_route_preview(&session_id, &selected_agent_type, team.total, &route_candidates);
                 delegated.sort_by_key(|delegate| {
                     (
                         delegate_attention_priority(delegate),
@@ -4933,9 +4938,23 @@ impl Dashboard {
 
     fn build_route_preview(
         &self,
+        lead_id: &str,
+        lead_agent_type: &str,
         delegate_count: usize,
         delegates: &[DelegatedChildSummary],
     ) -> Option<String> {
+        if let Some(task) = self.latest_route_task(lead_id) {
+            if let Ok(preview) = manager::preview_assignment_for_task(
+                &self.db,
+                &self.cfg,
+                lead_id,
+                &task,
+                lead_agent_type,
+            ) {
+                return Some(self.format_assignment_preview(&task, &preview));
+            }
+        }
+
         if let Some(idle_clear) = delegates
             .iter()
             .filter(|delegate| {
@@ -4959,7 +4978,7 @@ impl Dashboard {
             .min_by_key(|delegate| (delegate.handoff_backlog, delegate.session_id.as_str()))
         {
             return Some(format!(
-                "reuse idle {} with backlog {}",
+                "defer; idle {} backlog {}",
                 format_session_id(&idle_backed_up.session_id),
                 idle_backed_up.handoff_backlog
             ));
@@ -4976,9 +4995,18 @@ impl Dashboard {
             .min_by_key(|delegate| (delegate.handoff_backlog, delegate.session_id.as_str()))
         {
             return Some(format!(
-                "reuse active {} with backlog {}",
+                "{} active {}{}",
+                if active_delegate.handoff_backlog > 0 {
+                    "defer;"
+                } else {
+                    "reuse"
+                },
                 format_session_id(&active_delegate.session_id),
-                active_delegate.handoff_backlog
+                if active_delegate.handoff_backlog > 0 {
+                    format!(" backlog {}", active_delegate.handoff_backlog)
+                } else {
+                    String::new()
+                }
             ));
         }
 
@@ -4986,6 +5014,78 @@ impl Dashboard {
             Some("spawn new delegate".to_string())
         } else {
             Some("spawn fallback delegate".to_string())
+        }
+    }
+
+    fn latest_route_task(&self, session_id: &str) -> Option<String> {
+        self.db
+            .list_messages_for_session(session_id, 16)
+            .ok()?
+            .into_iter()
+            .rev()
+            .find_map(|message| {
+                if message.to_session != session_id || message.msg_type != "task_handoff" {
+                    return None;
+                }
+                manager::parse_task_handoff_task(&message.content)
+                    .or_else(|| Some(message.content))
+            })
+    }
+
+    fn format_assignment_preview(
+        &self,
+        task: &str,
+        preview: &manager::AssignmentPreview,
+    ) -> String {
+        let task_preview = truncate_for_dashboard(task, 40);
+        let graph_suffix = if preview.graph_match_terms.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " | graph {}",
+                truncate_for_dashboard(&preview.graph_match_terms.join(", "), 36)
+            )
+        };
+
+        match preview.action {
+            manager::AssignmentAction::Spawned => {
+                format!("for `{task_preview}` spawn new delegate")
+            }
+            manager::AssignmentAction::ReusedIdle => format!(
+                "for `{task_preview}` reuse idle {}{}",
+                preview
+                    .session_id
+                    .as_deref()
+                    .map(format_session_id)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                graph_suffix
+            ),
+            manager::AssignmentAction::ReusedActive => format!(
+                "for `{task_preview}` reuse active {}{}",
+                preview
+                    .session_id
+                    .as_deref()
+                    .map(format_session_id)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                graph_suffix
+            ),
+            manager::AssignmentAction::DeferredSaturated => {
+                let state_label = match preview.delegate_state {
+                    Some(SessionState::Idle) => "idle",
+                    Some(SessionState::Running) | Some(SessionState::Pending) => "active",
+                    _ => "delegate",
+                };
+                format!(
+                    "for `{task_preview}` defer; {state_label} {} backlog {}{}",
+                    preview
+                        .session_id
+                        .as_deref()
+                        .map(format_session_id)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    preview.handoff_backlog,
+                    graph_suffix
+                )
+            }
         }
     }
 
@@ -5130,6 +5230,60 @@ impl Dashboard {
                     ),
                 });
             }
+        }
+
+        lines
+    }
+
+    fn session_graph_metrics_lines(&self, session_id: &str) -> Vec<String> {
+        let entity = self
+            .db
+            .list_context_entities(Some(session_id), Some("session"), 4)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|entity| {
+                entity.session_id.as_deref() == Some(session_id) || entity.name == session_id
+            });
+        let Some(entity) = entity else {
+            return Vec::new();
+        };
+
+        let Ok(Some(detail)) = self
+            .db
+            .get_context_entity_detail(entity.id, MAX_METRICS_GRAPH_RELATIONS)
+        else {
+            return Vec::new();
+        };
+
+        if detail.outgoing.is_empty() && detail.incoming.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lines = vec![
+            "Context graph".to_string(),
+            format!(
+                "- outgoing {} | incoming {}",
+                detail.outgoing.len(),
+                detail.incoming.len()
+            ),
+        ];
+
+        for relation in detail.outgoing.iter().take(4) {
+            lines.push(format!(
+                "- -> {} {}:{}",
+                relation.relation_type,
+                relation.to_entity_type,
+                truncate_for_dashboard(&relation.to_entity_name, 72)
+            ));
+        }
+
+        for relation in detail.incoming.iter().take(2) {
+            lines.push(format!(
+                "- <- {} {}:{}",
+                relation.relation_type,
+                relation.from_entity_type,
+                truncate_for_dashboard(&relation.from_entity_name, 72)
+            ));
         }
 
         lines
@@ -6100,6 +6254,7 @@ impl Dashboard {
                     }
                 }
             }
+            lines.extend(self.session_graph_metrics_lines(&session.id));
             let file_overlaps = self
                 .db
                 .list_file_overlaps(&session.id, 3)
@@ -10104,12 +10259,14 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
 
         dashboard.toggle_context_graph_mode();
         dashboard.toggle_search_scope();
+        dashboard.cycle_graph_entity_filter();
         dashboard.begin_search();
         for ch in "alpha.*".chars() {
             dashboard.push_input_char(ch);
         }
         dashboard.submit_search();
 
+        assert_eq!(dashboard.graph_entity_filter, GraphEntityFilter::Decisions);
         assert_eq!(dashboard.search_matches.len(), 2);
         let first_session = dashboard.selected_session_id().map(str::to_string);
         dashboard.next_search_match();
@@ -10118,6 +10275,82 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
             Some("graph search /alpha.* match 2/2 | all sessions")
         );
         assert_ne!(dashboard.selected_session_id().map(str::to_string), first_session);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_sessions_filter_renders_auto_session_relations() -> Result<()> {
+        let session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session)?;
+        dashboard.db.insert_decision(
+            &session.id,
+            "Use graph relations",
+            &[],
+            "Edges make the context graph navigable",
+        )?;
+
+        dashboard.toggle_context_graph_mode();
+        dashboard.cycle_graph_entity_filter();
+        dashboard.cycle_graph_entity_filter();
+        dashboard.cycle_graph_entity_filter();
+        dashboard.cycle_graph_entity_filter();
+
+        assert_eq!(dashboard.graph_entity_filter, GraphEntityFilter::Sessions);
+        assert_eq!(dashboard.output_title(), " Graph sessions ");
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("focus-12345678"));
+        assert!(rendered.contains("summary running | planner |"));
+        assert!(rendered.contains("-> decided decision:Use graph relations"));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_session_metrics_text_includes_context_graph_relations() -> Result<()> {
+        let focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let delegate = sample_session(
+            "delegate-87654321",
+            "coder",
+            SessionState::Idle,
+            None,
+            1,
+            1,
+        );
+        let dashboard = test_dashboard(vec![focus.clone(), delegate.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&delegate)?;
+        dashboard.db.insert_decision(
+            &focus.id,
+            "Use sqlite graph sync",
+            &[],
+            "Keeps shared memory queryable",
+        )?;
+        dashboard.db.send_message(
+            &focus.id,
+            &delegate.id,
+            "{\"task\":\"Review graph edge\",\"context\":\"coordination smoke\"}",
+            "task_handoff",
+        )?;
+
+        let text = dashboard.selected_session_metrics_text();
+        assert!(text.contains("Context graph"));
+        assert!(text.contains("outgoing 2 | incoming 0"));
+        assert!(text.contains("-> decided decision:Use sqlite graph sync"));
+        assert!(text.contains("-> delegates_to session:delegate-87654321"));
         Ok(())
     }
 
@@ -10916,6 +11149,89 @@ diff --git a/src/lib.rs b/src/lib.rs
         assert!(text.contains("Needs attention:"));
         assert!(text.contains("Conflicted worktree focus-12"));
         assert!(!text.contains("Backlog focus-12"));
+    }
+
+    #[test]
+    fn route_preview_uses_graph_context_for_latest_incoming_handoff() {
+        let lead = sample_session(
+            "lead-12345678",
+            "planner",
+            SessionState::Running,
+            Some("ecc/lead"),
+            512,
+            42,
+        );
+        let older_worker = sample_session(
+            "older-worker",
+            "planner",
+            SessionState::Idle,
+            Some("ecc/older"),
+            128,
+            12,
+        );
+        let auth_worker = sample_session(
+            "auth-worker",
+            "planner",
+            SessionState::Idle,
+            Some("ecc/auth"),
+            256,
+            24,
+        );
+
+        let mut dashboard =
+            test_dashboard(vec![lead.clone(), older_worker.clone(), auth_worker.clone()], 0);
+        dashboard.db.insert_session(&lead).unwrap();
+        dashboard.db.insert_session(&older_worker).unwrap();
+        dashboard.db.insert_session(&auth_worker).unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "older-worker",
+                "{\"task\":\"Legacy delegated work\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .send_message(
+                "lead-12345678",
+                "auth-worker",
+                "{\"task\":\"Auth delegated work\",\"context\":\"Delegated from lead\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard.db.mark_messages_read("older-worker").unwrap();
+        dashboard.db.mark_messages_read("auth-worker").unwrap();
+        dashboard
+            .db
+            .send_message(
+                "planner-root",
+                "lead-12345678",
+                "{\"task\":\"Investigate auth callback recovery\",\"context\":\"Delegated from planner-root\"}",
+                "task_handoff",
+            )
+            .unwrap();
+        dashboard
+            .db
+            .upsert_context_entity(
+                Some("auth-worker"),
+                "file",
+                "auth-callback.ts",
+                Some("src/auth/callback.ts"),
+                "Auth callback recovery edge cases",
+                &BTreeMap::new(),
+            )
+            .unwrap();
+
+        dashboard.unread_message_counts = dashboard.db.unread_message_counts().unwrap();
+        dashboard.sync_selected_messages();
+        dashboard.sync_selected_lineage();
+
+        assert_eq!(
+            dashboard.selected_route_preview.as_deref(),
+            Some("for `Investigate auth callback recovery` reuse idle auth-wor | graph auth, callback, recovery")
+        );
     }
 
     #[test]

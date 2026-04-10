@@ -480,11 +480,8 @@ pub async fn drain_inbox(
     let mut outcomes = Vec::new();
 
     for message in messages {
-        let task = match comms::parse(&message.content) {
-            Some(MessageType::TaskHandoff { task, .. }) => task,
-            _ => extract_legacy_handoff_task(&message.content)
-                .unwrap_or_else(|| message.content.clone()),
-        };
+        let task = parse_task_handoff_task(&message.content)
+            .unwrap_or_else(|| message.content.clone());
 
         let outcome = assign_session_in_dir_with_runner_program(
             db,
@@ -687,11 +684,8 @@ pub async fn rebalance_team_backlog(
                 continue;
             }
 
-            let task = match comms::parse(&message.content) {
-                Some(MessageType::TaskHandoff { task, .. }) => task,
-                _ => extract_legacy_handoff_task(&message.content)
-                    .unwrap_or_else(|| message.content.clone()),
-            };
+            let task = parse_task_handoff_task(&message.content)
+                .unwrap_or_else(|| message.content.clone());
 
             let outcome = assign_session_in_dir_with_runner_program(
                 db,
@@ -1156,7 +1150,7 @@ async fn assign_session_in_dir_with_runner_program(
                     .unwrap_or(0)
                     == 0
         })
-        .min_by_key(|session| session.updated_at)
+        .max_by_key(|session| delegate_selection_key(db, session, task))
     {
         send_task_handoff(db, &lead, &idle_delegate.id, task, "reused idle delegate")?;
         return Ok(AssignmentOutcome {
@@ -1208,13 +1202,14 @@ async fn assign_session_in_dir_with_runner_program(
     if let Some(active_delegate) = delegates
         .iter()
         .filter(|session| matches!(session.state, SessionState::Running | SessionState::Pending))
-        .min_by_key(|session| {
+        .max_by_key(|session| {
             (
-                delegate_handoff_backlog
+                graph_context_match_score(db, &session.id, task),
+                -(delegate_handoff_backlog
                     .get(&session.id)
                     .copied()
-                    .unwrap_or(0),
-                session.updated_at,
+                    .unwrap_or(0) as i64),
+                -session.updated_at.timestamp_millis(),
             )
         })
     {
@@ -2358,6 +2353,63 @@ fn direct_delegate_sessions(
     Ok(sessions)
 }
 
+fn delegate_selection_key(db: &StateStore, session: &Session, task: &str) -> (usize, i64) {
+    (
+        graph_context_match_score(db, &session.id, task),
+        -session.updated_at.timestamp_millis(),
+    )
+}
+
+fn graph_context_match_score(db: &StateStore, session_id: &str, task: &str) -> usize {
+    graph_context_matched_terms(db, session_id, task).len()
+}
+
+fn graph_context_matched_terms(db: &StateStore, session_id: &str, task: &str) -> Vec<String> {
+    let terms = graph_match_terms(task);
+    if terms.is_empty() {
+        return Vec::new();
+    }
+
+    let entities = match db.list_context_entities(Some(session_id), None, 48) {
+        Ok(entities) => entities,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut haystacks = Vec::new();
+    for entity in entities {
+        haystacks.push(entity.name.to_lowercase());
+        haystacks.push(entity.summary.to_lowercase());
+        if let Some(path) = entity.path.as_ref() {
+            haystacks.push(path.to_lowercase());
+        }
+        for (key, value) in entity.metadata {
+            haystacks.push(key.to_lowercase());
+            haystacks.push(value.to_lowercase());
+        }
+    }
+
+    terms
+        .into_iter()
+        .filter(|term| haystacks.iter().any(|haystack| haystack.contains(term)))
+        .collect()
+}
+
+fn graph_match_terms(task: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    for token in task
+        .split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-')))
+        .map(str::trim)
+        .filter(|token| token.len() >= 3)
+    {
+        let lowered = token.to_ascii_lowercase();
+        if seen.insert(lowered.clone()) {
+            terms.push(lowered);
+        }
+    }
+    terms
+}
+
 fn summarize_backlog_pressure(
     db: &StateStore,
     cfg: &Config,
@@ -2417,6 +2469,13 @@ fn send_task_handoff(
             context,
         },
     )
+}
+
+pub(crate) fn parse_task_handoff_task(content: &str) -> Option<String> {
+    match comms::parse(content) {
+        Some(MessageType::TaskHandoff { task, .. }) => Some(task),
+        _ => extract_legacy_handoff_task(content),
+    }
 }
 
 fn extract_legacy_handoff_task(content: &str) -> Option<String> {
@@ -2628,6 +2687,15 @@ pub struct AssignmentOutcome {
     pub action: AssignmentAction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignmentPreview {
+    pub session_id: Option<String>,
+    pub action: AssignmentAction,
+    pub delegate_state: Option<SessionState>,
+    pub handoff_backlog: usize,
+    pub graph_match_terms: Vec<String>,
+}
+
 pub struct InboxDrainOutcome {
     pub message_id: i64,
     pub task: String,
@@ -2701,6 +2769,120 @@ pub enum AssignmentAction {
     ReusedIdle,
     ReusedActive,
     DeferredSaturated,
+}
+
+pub fn preview_assignment_for_task(
+    db: &StateStore,
+    cfg: &Config,
+    lead_id: &str,
+    task: &str,
+    agent_type: &str,
+) -> Result<AssignmentPreview> {
+    let lead = resolve_session(db, lead_id)?;
+    let delegates = direct_delegate_sessions(db, &lead.id, agent_type)?;
+    let delegate_handoff_backlog = delegates
+        .iter()
+        .map(|session| {
+            db.unread_task_handoff_count(&session.id)
+                .map(|count| (session.id.clone(), count))
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    if let Some(idle_delegate) = delegates
+        .iter()
+        .filter(|session| {
+            session.state == SessionState::Idle
+                && delegate_handoff_backlog
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+        })
+        .max_by_key(|session| delegate_selection_key(db, session, task))
+    {
+        return Ok(AssignmentPreview {
+            session_id: Some(idle_delegate.id.clone()),
+            action: AssignmentAction::ReusedIdle,
+            delegate_state: Some(idle_delegate.state.clone()),
+            handoff_backlog: 0,
+            graph_match_terms: graph_context_matched_terms(db, &idle_delegate.id, task),
+        });
+    }
+
+    if delegates.len() < cfg.max_parallel_sessions {
+        return Ok(AssignmentPreview {
+            session_id: None,
+            action: AssignmentAction::Spawned,
+            delegate_state: None,
+            handoff_backlog: 0,
+            graph_match_terms: Vec::new(),
+        });
+    }
+
+    if let Some(idle_delegate) = delegates
+        .iter()
+        .filter(|session| session.state == SessionState::Idle)
+        .min_by_key(|session| {
+            (
+                delegate_handoff_backlog
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(0),
+                session.updated_at,
+            )
+        })
+    {
+        let handoff_backlog = delegate_handoff_backlog
+            .get(&idle_delegate.id)
+            .copied()
+            .unwrap_or(0);
+        return Ok(AssignmentPreview {
+            session_id: Some(idle_delegate.id.clone()),
+            action: AssignmentAction::DeferredSaturated,
+            delegate_state: Some(idle_delegate.state.clone()),
+            handoff_backlog,
+            graph_match_terms: graph_context_matched_terms(db, &idle_delegate.id, task),
+        });
+    }
+
+    if let Some(active_delegate) = delegates
+        .iter()
+        .filter(|session| matches!(session.state, SessionState::Running | SessionState::Pending))
+        .max_by_key(|session| {
+            (
+                graph_context_match_score(db, &session.id, task),
+                -(delegate_handoff_backlog
+                    .get(&session.id)
+                    .copied()
+                    .unwrap_or(0) as i64),
+                -session.updated_at.timestamp_millis(),
+            )
+        })
+    {
+        let handoff_backlog = delegate_handoff_backlog
+            .get(&active_delegate.id)
+            .copied()
+            .unwrap_or(0);
+        return Ok(AssignmentPreview {
+            session_id: Some(active_delegate.id.clone()),
+            action: if handoff_backlog > 0 {
+                AssignmentAction::DeferredSaturated
+            } else {
+                AssignmentAction::ReusedActive
+            },
+            delegate_state: Some(active_delegate.state.clone()),
+            handoff_backlog,
+            graph_match_terms: graph_context_matched_terms(db, &active_delegate.id, task),
+        });
+    }
+
+    Ok(AssignmentPreview {
+        session_id: None,
+        action: AssignmentAction::Spawned,
+        delegate_state: None,
+        handoff_backlog: 0,
+        graph_match_terms: Vec::new(),
+    })
 }
 
 pub fn assignment_action_routes_work(action: AssignmentAction) -> bool {
@@ -4735,6 +4917,130 @@ mod tests {
         assert!(messages.iter().any(|message| {
             message.msg_type == "task_handoff"
                 && message.content.contains("Review billing edge cases")
+        }));
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assign_session_prefers_idle_delegate_with_graph_context_match() -> Result<()> {
+        let tempdir = TestDir::new("manager-assign-graph-context-idle")?;
+        let repo_root = tempdir.path().join("repo");
+        init_git_repo(&repo_root)?;
+
+        let cfg = build_config(tempdir.path());
+        let db = StateStore::open(&cfg.db_path)?;
+        let now = Utc::now();
+
+        db.insert_session(&Session {
+            id: "lead".to_string(),
+            task: "lead task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Running,
+            pid: Some(42),
+            worktree: None,
+            created_at: now - Duration::minutes(4),
+            updated_at: now - Duration::minutes(4),
+            last_heartbeat_at: now - Duration::minutes(4),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "older-worker".to_string(),
+            task: "legacy delegated task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: Some(100),
+            worktree: None,
+            created_at: now - Duration::minutes(3),
+            updated_at: now - Duration::minutes(3),
+            last_heartbeat_at: now - Duration::minutes(3),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.insert_session(&Session {
+            id: "auth-worker".to_string(),
+            task: "auth delegated task".to_string(),
+            project: "workspace".to_string(),
+            task_group: "general".to_string(),
+            agent_type: "claude".to_string(),
+            working_dir: repo_root.clone(),
+            state: SessionState::Idle,
+            pid: Some(101),
+            worktree: None,
+            created_at: now - Duration::minutes(2),
+            updated_at: now - Duration::minutes(2),
+            last_heartbeat_at: now - Duration::minutes(2),
+            metrics: SessionMetrics::default(),
+        })?;
+        db.send_message(
+            "lead",
+            "older-worker",
+            "{\"task\":\"legacy delegated task\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.send_message(
+            "lead",
+            "auth-worker",
+            "{\"task\":\"auth delegated task\",\"context\":\"Delegated from lead\"}",
+            "task_handoff",
+        )?;
+        db.mark_messages_read("older-worker")?;
+        db.mark_messages_read("auth-worker")?;
+
+        db.upsert_context_entity(
+            Some("auth-worker"),
+            "file",
+            "auth-callback.ts",
+            Some("src/auth/callback.ts"),
+            "Auth callback recovery edge cases",
+            &BTreeMap::new(),
+        )?;
+
+        let preview = preview_assignment_for_task(
+            &db,
+            &cfg,
+            "lead",
+            "Investigate auth callback recovery",
+            "claude",
+        )?;
+        assert_eq!(preview.action, AssignmentAction::ReusedIdle);
+        assert_eq!(preview.session_id.as_deref(), Some("auth-worker"));
+        assert_eq!(
+            preview.graph_match_terms,
+            vec![
+                "auth".to_string(),
+                "callback".to_string(),
+                "recovery".to_string()
+            ]
+        );
+
+        let (fake_runner, _) = write_fake_claude(tempdir.path())?;
+        let outcome = assign_session_in_dir_with_runner_program(
+            &db,
+            &cfg,
+            "lead",
+            "Investigate auth callback recovery",
+            "claude",
+            true,
+            &repo_root,
+            &fake_runner,
+            None,
+            SessionGrouping::default(),
+        )
+        .await?;
+
+        assert_eq!(outcome.action, AssignmentAction::ReusedIdle);
+        assert_eq!(outcome.session_id, "auth-worker");
+
+        let auth_messages = db.list_messages_for_session("auth-worker", 10)?;
+        assert!(auth_messages.iter().any(|message| {
+            message.msg_type == "task_handoff"
+                && message.content.contains("Investigate auth callback recovery")
         }));
 
         Ok(())
