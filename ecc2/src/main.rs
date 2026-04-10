@@ -9,8 +9,8 @@ mod worktree;
 use anyhow::{Context, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::fs::File;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -345,6 +345,11 @@ enum Commands {
         #[command(subcommand)]
         command: GraphCommands,
     },
+    /// Audit Hermes/OpenClaw-style workspaces and map them onto ECC2
+    Migrate {
+        #[command(subcommand)]
+        command: MigrationCommands,
+    },
     /// Manage persistent scheduled task dispatch
     Schedule {
         #[command(subcommand)]
@@ -565,6 +570,79 @@ enum RemoteCommands {
         /// Bearer token required for POST /dispatch
         #[arg(long)]
         token: String,
+    },
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum MigrationCommands {
+    /// Audit a Hermes/OpenClaw-style workspace and map it onto ECC2 features
+    Audit {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Generate an actionable ECC2 migration plan from a legacy workspace audit
+    Plan {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Write the plan to a file instead of stdout
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scaffold migration artifacts on disk from a legacy workspace audit
+    Scaffold {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Directory where scaffolded migration artifacts should be written
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import recurring jobs from a legacy cron/jobs.json into ECC2 schedules
+    ImportSchedules {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Preview detected jobs without creating ECC2 schedules
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import legacy workspace memory into the ECC2 context graph
+    ImportMemory {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Maximum imported records across all synthesized connectors
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Import legacy gateway/dispatch tasks into the ECC2 remote queue
+    ImportRemote {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Preview detected requests without creating ECC2 remote queue entries
+        #[arg(long)]
+        dry_run: bool,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -859,6 +937,162 @@ struct GraphConnectorStatus {
 struct GraphConnectorStatusReport {
     configured_connectors: usize,
     connectors: Vec<GraphConnectorStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyMigrationReadiness {
+    ReadyNow,
+    ManualTranslation,
+    LocalAuthRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyMigrationArtifact {
+    category: String,
+    readiness: LegacyMigrationReadiness,
+    source_paths: Vec<String>,
+    detected_items: usize,
+    mapping: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyMigrationAuditSummary {
+    artifact_categories_detected: usize,
+    ready_now_categories: usize,
+    manual_translation_categories: usize,
+    local_auth_required_categories: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyMigrationAuditReport {
+    source: String,
+    detected_systems: Vec<String>,
+    summary: LegacyMigrationAuditSummary,
+    recommended_next_steps: Vec<String>,
+    artifacts: Vec<LegacyMigrationArtifact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyMigrationPlanStep {
+    category: String,
+    readiness: LegacyMigrationReadiness,
+    title: String,
+    target_surface: String,
+    source_paths: Vec<String>,
+    command_snippets: Vec<String>,
+    config_snippets: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyMigrationPlanReport {
+    source: String,
+    generated_at: String,
+    audit_summary: LegacyMigrationAuditSummary,
+    steps: Vec<LegacyMigrationPlanStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyMigrationScaffoldReport {
+    source: String,
+    output_dir: String,
+    files_written: Vec<String>,
+    steps_scaffolded: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LegacyScheduleImportJobStatus {
+    Ready,
+    Imported,
+    Disabled,
+    Invalid,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyScheduleImportJobReport {
+    source_path: String,
+    job_name: String,
+    cron_expr: Option<String>,
+    task: Option<String>,
+    agent: Option<String>,
+    profile: Option<String>,
+    project: Option<String>,
+    task_group: Option<String>,
+    use_worktree: Option<bool>,
+    status: LegacyScheduleImportJobStatus,
+    reason: Option<String>,
+    command_snippet: Option<String>,
+    imported_schedule_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyScheduleImportReport {
+    source: String,
+    source_path: String,
+    dry_run: bool,
+    jobs_detected: usize,
+    ready_jobs: usize,
+    imported_jobs: usize,
+    disabled_jobs: usize,
+    invalid_jobs: usize,
+    skipped_jobs: usize,
+    jobs: Vec<LegacyScheduleImportJobReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyMemoryImportReport {
+    source: String,
+    connectors_detected: usize,
+    report: GraphConnectorSyncReport,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LegacyRemoteImportRequestStatus {
+    Ready,
+    Imported,
+    Disabled,
+    Invalid,
+    Skipped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyRemoteImportRequestReport {
+    source_path: String,
+    request_name: String,
+    request_kind: session::RemoteDispatchKind,
+    task: Option<String>,
+    goal: Option<String>,
+    target_url: Option<String>,
+    context: Option<String>,
+    target_session: Option<String>,
+    priority: Option<TaskPriorityArg>,
+    agent: Option<String>,
+    profile: Option<String>,
+    project: Option<String>,
+    task_group: Option<String>,
+    use_worktree: Option<bool>,
+    status: LegacyRemoteImportRequestStatus,
+    reason: Option<String>,
+    command_snippet: Option<String>,
+    imported_request_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyRemoteImportReport {
+    source: String,
+    dry_run: bool,
+    requests_detected: usize,
+    ready_requests: usize,
+    imported_requests: usize,
+    disabled_requests: usize,
+    invalid_requests: usize,
+    skipped_requests: usize,
+    requests: Vec<LegacyRemoteImportRequestReport>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1588,6 +1822,85 @@ async fn main() -> Result<()> {
                 println!("{}", format_decisions_human(&entries, all));
             }
         }
+        Some(Commands::Migrate { command }) => match command {
+            MigrationCommands::Audit { source, json } => {
+                let report = build_legacy_migration_audit_report(&source)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_legacy_migration_audit_human(&report));
+                }
+            }
+            MigrationCommands::Plan {
+                source,
+                output,
+                json,
+            } => {
+                let audit = build_legacy_migration_audit_report(&source)?;
+                let plan = build_legacy_migration_plan_report(&audit);
+                let rendered = if json {
+                    serde_json::to_string_pretty(&plan)?
+                } else {
+                    format_legacy_migration_plan_human(&plan)
+                };
+                if let Some(path) = output {
+                    std::fs::write(&path, &rendered)?;
+                    println!("Migration plan written to {}", path.display());
+                } else {
+                    println!("{rendered}");
+                }
+            }
+            MigrationCommands::Scaffold {
+                source,
+                output_dir,
+                json,
+            } => {
+                let audit = build_legacy_migration_audit_report(&source)?;
+                let plan = build_legacy_migration_plan_report(&audit);
+                let report = write_legacy_migration_scaffold(&plan, &output_dir)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_legacy_migration_scaffold_human(&report));
+                }
+            }
+            MigrationCommands::ImportSchedules {
+                source,
+                dry_run,
+                json,
+            } => {
+                let report = import_legacy_schedules(&db, &cfg, &source, dry_run)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_legacy_schedule_import_human(&report));
+                }
+            }
+            MigrationCommands::ImportMemory {
+                source,
+                limit,
+                json,
+            } => {
+                let report = import_legacy_memory(&db, &cfg, &source, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_legacy_memory_import_human(&report));
+                }
+            }
+            MigrationCommands::ImportRemote {
+                source,
+                dry_run,
+                json,
+            } => {
+                let report = import_legacy_remote_dispatch(&db, &cfg, &source, dry_run)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_legacy_remote_import_human(&report));
+                }
+            }
+        },
         Some(Commands::Graph { command }) => match command {
             GraphCommands::AddEntity {
                 session_id,
@@ -2828,6 +3141,13 @@ fn collect_jsonl_paths(root: &Path, recurse: bool) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn collect_json_paths(root: &Path, recurse: bool) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    collect_json_paths_inner(root, recurse, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
 fn collect_markdown_paths(root: &Path, recurse: bool) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     collect_markdown_paths_inner(root, recurse, &mut paths)?;
@@ -2863,6 +3183,29 @@ fn collect_jsonl_paths_inner(root: &Path, recurse: bool, paths: &mut Vec<PathBuf
             .extension()
             .and_then(|value| value.to_str())
             .is_some_and(|value| value.eq_ignore_ascii_case("jsonl"))
+        {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_json_paths_inner(root: &Path, recurse: bool, paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("read memory connector directory {}", root.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if recurse {
+                collect_json_paths_inner(&path, recurse, paths)?;
+            }
+            continue;
+        }
+        if path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.eq_ignore_ascii_case("json"))
         {
             paths.push(path);
         }
@@ -4392,6 +4735,1875 @@ fn format_graph_observations_human(observations: &[session::ContextGraphObservat
         }
         lines.push(line);
         lines.push(format!("  summary {}", observation.summary));
+    }
+
+    lines.join("\n")
+}
+
+fn build_legacy_migration_audit_report(source: &Path) -> Result<LegacyMigrationAuditReport> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("Legacy workspace not found: {}", source.display()))?;
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Legacy workspace source must be a directory: {}",
+            source.display()
+        );
+    }
+
+    let mut artifacts = Vec::new();
+
+    let scheduler_paths = collect_existing_relative_paths(
+        &source,
+        &["cron/scheduler.py", "jobs.py", "cron/jobs.json"],
+    );
+    if !scheduler_paths.is_empty() {
+        artifacts.push(LegacyMigrationArtifact {
+            category: "scheduler".to_string(),
+            readiness: LegacyMigrationReadiness::ReadyNow,
+            detected_items: scheduler_paths.len(),
+            source_paths: scheduler_paths,
+            mapping: vec![
+                "ecc schedule add".to_string(),
+                "ecc schedule list".to_string(),
+                "ecc schedule run-due".to_string(),
+                "ecc daemon".to_string(),
+            ],
+            notes: vec![
+                "Recurring jobs can be recreated directly in ECC2's persistent scheduler."
+                    .to_string(),
+                "Translate each legacy cron prompt into an explicit ECC task body before enabling it."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let gateway_dir = source.join("gateway");
+    if gateway_dir.is_dir() {
+        artifacts.push(LegacyMigrationArtifact {
+            category: "gateway_dispatch".to_string(),
+            readiness: LegacyMigrationReadiness::ReadyNow,
+            detected_items: count_files_recursive(&gateway_dir)?,
+            source_paths: vec!["gateway".to_string()],
+            mapping: vec![
+                "ecc remote serve".to_string(),
+                "ecc remote add".to_string(),
+                "ecc remote computer-use".to_string(),
+                "ecc remote run".to_string(),
+            ],
+            notes: vec![
+                "ECC2 already ships a token-authenticated remote dispatch queue and HTTP intake."
+                    .to_string(),
+                "Remote handlers should be translated to ECC task bodies instead of copied verbatim."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let memory_paths = collect_existing_relative_paths(&source, &["memory_tool.py"]);
+    if !memory_paths.is_empty() {
+        artifacts.push(LegacyMigrationArtifact {
+            category: "memory_tool".to_string(),
+            readiness: LegacyMigrationReadiness::ReadyNow,
+            detected_items: memory_paths.len(),
+            source_paths: memory_paths,
+            mapping: vec![
+                "ecc graph add-observation".to_string(),
+                "ecc graph connector-sync".to_string(),
+                "ecc graph recall".to_string(),
+                "ecc graph connectors".to_string(),
+            ],
+            notes: vec![
+                "ECC2 deep memory now supports persistent observations, recall, compaction, and external connectors."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let workspace_dir = source.join("workspace");
+    if workspace_dir.is_dir() {
+        artifacts.push(LegacyMigrationArtifact {
+            category: "workspace_memory".to_string(),
+            readiness: LegacyMigrationReadiness::ReadyNow,
+            detected_items: count_files_recursive(&workspace_dir)?,
+            source_paths: vec!["workspace".to_string()],
+            mapping: vec![
+                "ecc graph connector-sync".to_string(),
+                "ecc graph recall".to_string(),
+                "WORKING-CONTEXT.md".to_string(),
+            ],
+            notes: vec![
+                "Import only sanitized operator memory into the shared context graph."
+                    .to_string(),
+                "Private business data, secrets, and personal archives should stay outside the public repo."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let skills_paths = collect_existing_relative_paths(&source, &["skills", "skills/ecc-imports"]);
+    if !skills_paths.is_empty() {
+        artifacts.push(LegacyMigrationArtifact {
+            category: "skills".to_string(),
+            readiness: LegacyMigrationReadiness::ManualTranslation,
+            detected_items: count_files_recursive(&source.join("skills"))?,
+            source_paths: skills_paths,
+            mapping: vec![
+                "skills/".to_string(),
+                "ecc template".to_string(),
+                "configure-ecc".to_string(),
+            ],
+            notes: vec![
+                "Reusable skills should be ported one by one into ECC-native skills or orchestration templates."
+                    .to_string(),
+                "Do not bulk-copy legacy private skills without auditing for secrets and operator-only assumptions."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let tools_dir = source.join("tools");
+    if tools_dir.is_dir() {
+        artifacts.push(LegacyMigrationArtifact {
+            category: "tools".to_string(),
+            readiness: LegacyMigrationReadiness::ManualTranslation,
+            detected_items: count_files_recursive(&tools_dir)?,
+            source_paths: vec!["tools".to_string()],
+            mapping: vec![
+                "agents/".to_string(),
+                "commands/".to_string(),
+                "hooks/".to_string(),
+                "harness_runners.<name>".to_string(),
+            ],
+            notes: vec![
+                "Legacy tool wrappers should be rebuilt as ECC agents, commands, hooks, or configured harness runners."
+                    .to_string(),
+                "Only the reusable workflow surface should move across; opaque runtime glue should be reimplemented minimally."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let plugins_dir = source.join("plugins");
+    if plugins_dir.is_dir() {
+        artifacts.push(LegacyMigrationArtifact {
+            category: "plugins".to_string(),
+            readiness: LegacyMigrationReadiness::ManualTranslation,
+            detected_items: count_files_recursive(&plugins_dir)?,
+            source_paths: vec!["plugins".to_string()],
+            mapping: vec![
+                "hooks/".to_string(),
+                "commands/".to_string(),
+                "skills/".to_string(),
+            ],
+            notes: vec![
+                "Bridge plugins normally translate into ECC hooks, commands, or skills instead of one-for-one plugin copies."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let env_service_paths = collect_env_service_paths(&source)?;
+    if !env_service_paths.is_empty() {
+        artifacts.push(LegacyMigrationArtifact {
+            category: "env_services".to_string(),
+            readiness: LegacyMigrationReadiness::LocalAuthRequired,
+            detected_items: env_service_paths.len(),
+            source_paths: env_service_paths,
+            mapping: vec![
+                "Claude connectors / OAuth".to_string(),
+                "MCP config".to_string(),
+                "local API key setup".to_string(),
+            ],
+            notes: vec![
+                "Secret material should not be imported into ECC2."
+                    .to_string(),
+                "Re-enter credentials locally through connectors, OAuth, MCP servers, or local env configuration."
+                    .to_string(),
+            ],
+        });
+    }
+
+    let summary = LegacyMigrationAuditSummary {
+        artifact_categories_detected: artifacts.len(),
+        ready_now_categories: artifacts
+            .iter()
+            .filter(|artifact| artifact.readiness == LegacyMigrationReadiness::ReadyNow)
+            .count(),
+        manual_translation_categories: artifacts
+            .iter()
+            .filter(|artifact| artifact.readiness == LegacyMigrationReadiness::ManualTranslation)
+            .count(),
+        local_auth_required_categories: artifacts
+            .iter()
+            .filter(|artifact| artifact.readiness == LegacyMigrationReadiness::LocalAuthRequired)
+            .count(),
+    };
+
+    Ok(LegacyMigrationAuditReport {
+        source: source.display().to_string(),
+        detected_systems: detect_legacy_workspace_systems(&source, &artifacts),
+        summary,
+        recommended_next_steps: build_legacy_migration_next_steps(&artifacts),
+        artifacts,
+    })
+}
+
+fn collect_existing_relative_paths(source: &Path, relative_paths: &[&str]) -> Vec<String> {
+    let mut matches = Vec::new();
+    for relative_path in relative_paths {
+        if source.join(relative_path).exists() {
+            matches.push((*relative_path).to_string());
+        }
+    }
+    matches
+}
+
+fn collect_env_service_paths(source: &Path) -> Result<Vec<String>> {
+    let mut matches = Vec::new();
+    for file_name in [
+        "config.yaml",
+        ".env",
+        ".env.local",
+        ".env.production",
+        ".envrc",
+    ] {
+        if source.join(file_name).is_file() {
+            matches.push(file_name.to_string());
+        }
+    }
+
+    let services_dir = source.join("services");
+    if services_dir.is_dir() {
+        let service_file_count = count_files_recursive(&services_dir)?;
+        if service_file_count > 0 {
+            matches.push("services".to_string());
+        }
+    }
+
+    Ok(matches)
+}
+
+fn count_files_recursive(path: &Path) -> Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    if path.is_file() {
+        return Ok(1);
+    }
+
+    let mut total = 0usize;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        total += count_files_recursive(&entry_path)?;
+    }
+    Ok(total)
+}
+
+fn detect_legacy_workspace_systems(
+    source: &Path,
+    artifacts: &[LegacyMigrationArtifact],
+) -> Vec<String> {
+    let mut detected = BTreeSet::new();
+    let display = source.display().to_string().to_lowercase();
+    if display.contains("hermes")
+        || source.join("config.yaml").is_file()
+        || source.join("cron").exists()
+        || source.join("workspace").exists()
+    {
+        detected.insert("hermes".to_string());
+    }
+    if display.contains("openclaw") || source.join(".openclaw").exists() {
+        detected.insert("openclaw".to_string());
+    }
+    if detected.is_empty() && !artifacts.is_empty() {
+        detected.insert("legacy_workspace".to_string());
+    }
+    detected.into_iter().collect()
+}
+
+fn build_legacy_migration_next_steps(artifacts: &[LegacyMigrationArtifact]) -> Vec<String> {
+    let mut steps = Vec::new();
+    let categories: BTreeSet<&str> = artifacts
+        .iter()
+        .map(|artifact| artifact.category.as_str())
+        .collect();
+
+    if categories.contains("scheduler") {
+        steps.push(
+            "Recreate recurring jobs with `ecc schedule add`, verify them with `ecc schedule list`, then enable processing through `ecc daemon`."
+                .to_string(),
+        );
+    }
+    if categories.contains("gateway_dispatch") {
+        steps.push(
+            "Replace gateway/dispatch entrypoints with `ecc remote serve`, preview/import legacy requests with `ecc migrate import-remote`, then verify them with `ecc remote list` / `ecc remote run`."
+                .to_string(),
+        );
+    }
+    if categories.contains("memory_tool") || categories.contains("workspace_memory") {
+        steps.push(
+            "Import sanitized operator memory through `ecc graph connector-sync`, then use `ecc graph recall` and pinned observations for durable context."
+                .to_string(),
+        );
+    }
+    if categories.contains("skills") {
+        steps.push(
+            "Translate reusable Hermes/OpenClaw skills into ECC skills or orchestration templates one lane at a time instead of bulk-copying them."
+                .to_string(),
+        );
+    }
+    if categories.contains("tools") || categories.contains("plugins") {
+        steps.push(
+            "Rebuild valuable tool/plugin wrappers as ECC agents, commands, hooks, or harness runners, keeping only reusable workflow behavior."
+                .to_string(),
+        );
+    }
+    if categories.contains("env_services") {
+        steps.push(
+            "Reconfigure credentials locally through Claude connectors, MCP config, OAuth, or local API key setup; do not import raw secret material."
+                .to_string(),
+        );
+    }
+
+    if steps.is_empty() {
+        steps.push(
+            "No recognizable Hermes/OpenClaw migration surfaces were detected; inspect the workspace manually before attempting migration."
+                .to_string(),
+        );
+    }
+
+    steps
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyScheduleDraft {
+    source_path: String,
+    job_name: String,
+    cron_expr: Option<String>,
+    task: Option<String>,
+    agent: Option<String>,
+    profile: Option<String>,
+    project: Option<String>,
+    task_group: Option<String>,
+    use_worktree: Option<bool>,
+    enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyRemoteDispatchDraft {
+    source_path: String,
+    request_name: String,
+    request_kind: session::RemoteDispatchKind,
+    task: Option<String>,
+    goal: Option<String>,
+    target_url: Option<String>,
+    context: Option<String>,
+    target_session: Option<String>,
+    priority: Option<TaskPriorityArg>,
+    agent: Option<String>,
+    profile: Option<String>,
+    project: Option<String>,
+    task_group: Option<String>,
+    use_worktree: Option<bool>,
+    enabled: bool,
+}
+
+fn load_legacy_schedule_drafts(source: &Path) -> Result<Vec<LegacyScheduleDraft>> {
+    let jobs_path = source.join("cron/jobs.json");
+    if !jobs_path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let text = fs::read_to_string(&jobs_path)
+        .with_context(|| format!("read legacy scheduler jobs: {}", jobs_path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse legacy scheduler jobs JSON: {}", jobs_path.display()))?;
+    let source_path = jobs_path
+        .strip_prefix(source)
+        .unwrap_or(&jobs_path)
+        .display()
+        .to_string();
+
+    let entries: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(map) => {
+            if let Some(items) = ["jobs", "schedules", "tasks"]
+                .iter()
+                .find_map(|key| map.get(*key).and_then(serde_json::Value::as_array))
+            {
+                items.iter().collect()
+            } else {
+                vec![&value]
+            }
+        }
+        _ => anyhow::bail!(
+            "legacy scheduler jobs file must be a JSON object or array: {}",
+            jobs_path.display()
+        ),
+    };
+
+    Ok(entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| build_legacy_schedule_draft(value, index, &source_path))
+        .collect())
+}
+
+fn load_legacy_remote_dispatch_drafts(source: &Path) -> Result<Vec<LegacyRemoteDispatchDraft>> {
+    let gateway_dir = source.join("gateway");
+    if !gateway_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut drafts = Vec::new();
+    for path in collect_json_paths(&gateway_dir, true)? {
+        drafts.extend(load_legacy_remote_dispatch_json_file(source, &path)?);
+    }
+    for path in collect_jsonl_paths(&gateway_dir, true)? {
+        drafts.extend(load_legacy_remote_dispatch_jsonl_file(source, &path)?);
+    }
+    Ok(drafts)
+}
+
+fn load_legacy_remote_dispatch_json_file(
+    source: &Path,
+    path: &Path,
+) -> Result<Vec<LegacyRemoteDispatchDraft>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("read legacy remote dispatch JSON: {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse legacy remote dispatch JSON: {}", path.display()))?;
+    let source_path = path
+        .strip_prefix(source)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+
+    let entries = extract_legacy_remote_dispatch_entries(&value);
+    Ok(entries
+        .into_iter()
+        .enumerate()
+        .map(|(index, entry)| build_legacy_remote_dispatch_draft(entry, index, &source_path))
+        .collect())
+}
+
+fn load_legacy_remote_dispatch_jsonl_file(
+    source: &Path,
+    path: &Path,
+) -> Result<Vec<LegacyRemoteDispatchDraft>> {
+    let file = File::open(path)
+        .with_context(|| format!("open legacy remote dispatch JSONL: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let source_path = path
+        .strip_prefix(source)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+
+    let mut drafts = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(&line).with_context(|| {
+            format!(
+                "parse legacy remote dispatch JSONL: {} line {}",
+                path.display(),
+                index + 1
+            )
+        })?;
+        if !legacy_remote_dispatch_entry_is_relevant(&value) {
+            continue;
+        }
+        drafts.push(build_legacy_remote_dispatch_draft(
+            &value,
+            drafts.len(),
+            &source_path,
+        ));
+    }
+    Ok(drafts)
+}
+
+fn extract_legacy_remote_dispatch_entries<'a>(
+    value: &'a serde_json::Value,
+) -> Vec<&'a serde_json::Value> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter(|item| legacy_remote_dispatch_entry_is_relevant(item))
+            .collect(),
+        serde_json::Value::Object(map) => {
+            if let Some(items) = [
+                "dispatches",
+                "requests",
+                "remote_requests",
+                "tasks",
+                "queue",
+                "items",
+            ]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(serde_json::Value::as_array))
+            {
+                return items
+                    .iter()
+                    .filter(|item| legacy_remote_dispatch_entry_is_relevant(item))
+                    .collect();
+            }
+            if legacy_remote_dispatch_entry_is_relevant(value) {
+                vec![value]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn legacy_remote_dispatch_entry_is_relevant(value: &serde_json::Value) -> bool {
+    if json_string_candidates(
+        value,
+        &[
+            &["task"],
+            &["prompt"],
+            &["description"],
+            &["goal"],
+            &["message"],
+            &["target_url"],
+            &["url"],
+            &["to_session"],
+            &["target_session"],
+            &["lead"],
+        ],
+    )
+    .is_some()
+    {
+        return true;
+    }
+    if json_bool_candidates(value, &[&["computer_use"], &["browser"], &["use_browser"]])
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    json_string_candidates(
+        value,
+        &[&["kind"], &["type"], &["mode"], &["dispatch_type"]],
+    )
+    .map(|kind| {
+        matches!(
+            kind.trim().to_ascii_lowercase().as_str(),
+            "dispatch"
+                | "remote_dispatch"
+                | "remote-dispatch"
+                | "task"
+                | "computer_use"
+                | "computer-use"
+                | "computer use"
+                | "browser"
+                | "browser_task"
+                | "operator_browser"
+        )
+    })
+    .unwrap_or(false)
+}
+
+fn build_legacy_remote_dispatch_draft(
+    value: &serde_json::Value,
+    index: usize,
+    source_path: &str,
+) -> LegacyRemoteDispatchDraft {
+    let request_name = json_string_candidates(
+        value,
+        &[
+            &["name"],
+            &["id"],
+            &["title"],
+            &["label"],
+            &["request_name"],
+        ],
+    )
+    .unwrap_or_else(|| format!("legacy-remote-request-{}", index + 1));
+    let request_kind = detect_legacy_remote_dispatch_kind(value);
+    let body_text = json_string_candidates(
+        value,
+        &[
+            &["task"],
+            &["prompt"],
+            &["description"],
+            &["goal"],
+            &["message"],
+            &["instructions"],
+        ],
+    );
+    let enabled = !json_bool_candidates(value, &[&["disabled"]]).unwrap_or(false)
+        && json_bool_candidates(value, &[&["enabled"], &["active"]]).unwrap_or(true);
+
+    LegacyRemoteDispatchDraft {
+        source_path: source_path.to_string(),
+        request_name,
+        request_kind,
+        task: (request_kind == session::RemoteDispatchKind::Standard)
+            .then(|| body_text.clone())
+            .flatten(),
+        goal: (request_kind == session::RemoteDispatchKind::ComputerUse)
+            .then_some(body_text)
+            .flatten(),
+        target_url: json_string_candidates(
+            value,
+            &[
+                &["target_url"],
+                &["url"],
+                &["start_url"],
+                &["browser", "url"],
+            ],
+        ),
+        context: json_string_candidates(
+            value,
+            &[
+                &["context"],
+                &["notes"],
+                &["details"],
+                &["browser_context"],
+                &["extra_context"],
+            ],
+        ),
+        target_session: json_string_candidates(
+            value,
+            &[
+                &["to_session"],
+                &["target_session"],
+                &["target_session_id"],
+                &["session"],
+                &["lead"],
+                &["to"],
+            ],
+        ),
+        priority: json_task_priority_candidates(value, &[&["priority"], &["task", "priority"]]),
+        agent: json_string_candidates(value, &[&["agent"], &["runner"]]),
+        profile: json_string_candidates(value, &[&["profile"], &["agent_profile"]]),
+        project: json_string_candidates(value, &[&["project"]]),
+        task_group: json_string_candidates(value, &[&["task_group"], &["group"]]),
+        use_worktree: json_bool_candidates(value, &[&["use_worktree"], &["worktree"]]),
+        enabled,
+    }
+}
+
+fn detect_legacy_remote_dispatch_kind(value: &serde_json::Value) -> session::RemoteDispatchKind {
+    if json_bool_candidates(value, &[&["computer_use"], &["browser"], &["use_browser"]])
+        .unwrap_or(false)
+    {
+        return session::RemoteDispatchKind::ComputerUse;
+    }
+    if json_string_candidates(
+        value,
+        &[
+            &["target_url"],
+            &["url"],
+            &["start_url"],
+            &["browser", "url"],
+        ],
+    )
+    .is_some()
+    {
+        return session::RemoteDispatchKind::ComputerUse;
+    }
+    if let Some(kind) = json_string_candidates(
+        value,
+        &[&["kind"], &["type"], &["mode"], &["dispatch_type"]],
+    ) {
+        let normalized = kind.trim().to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "computer_use"
+                | "computer-use"
+                | "computer use"
+                | "browser"
+                | "browser_task"
+                | "operator_browser"
+        ) {
+            return session::RemoteDispatchKind::ComputerUse;
+        }
+    }
+    session::RemoteDispatchKind::Standard
+}
+
+fn build_legacy_schedule_draft(
+    value: &serde_json::Value,
+    index: usize,
+    source_path: &str,
+) -> LegacyScheduleDraft {
+    let job_name = json_string_candidates(
+        value,
+        &[
+            &["name"],
+            &["id"],
+            &["title"],
+            &["job_name"],
+            &["task_name"],
+        ],
+    )
+    .unwrap_or_else(|| format!("legacy-job-{}", index + 1));
+    let cron_expr = json_string_candidates(
+        value,
+        &[
+            &["cron"],
+            &["schedule"],
+            &["cron_expr"],
+            &["trigger", "cron"],
+            &["timing", "cron"],
+        ],
+    );
+    let task = json_string_candidates(
+        value,
+        &[
+            &["task"],
+            &["prompt"],
+            &["goal"],
+            &["description"],
+            &["command"],
+            &["task", "prompt"],
+            &["task", "description"],
+        ],
+    );
+    let enabled = !json_bool_candidates(value, &[&["disabled"]]).unwrap_or(false)
+        && json_bool_candidates(value, &[&["enabled"], &["active"]]).unwrap_or(true);
+
+    LegacyScheduleDraft {
+        source_path: source_path.to_string(),
+        job_name,
+        cron_expr,
+        task,
+        agent: json_string_candidates(value, &[&["agent"], &["runner"]]),
+        profile: json_string_candidates(value, &[&["profile"], &["agent_profile"]]),
+        project: json_string_candidates(value, &[&["project"]]),
+        task_group: json_string_candidates(value, &[&["task_group"], &["group"]]),
+        use_worktree: json_bool_candidates(value, &[&["use_worktree"], &["worktree"]]),
+        enabled,
+    }
+}
+
+fn json_string_candidates(value: &serde_json::Value, paths: &[&[&str]]) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| json_lookup(value, path))
+        .and_then(json_to_string)
+}
+
+fn json_bool_candidates(value: &serde_json::Value, paths: &[&[&str]]) -> Option<bool> {
+    paths.iter().find_map(|path| {
+        json_lookup(value, path).and_then(|value| match value {
+            serde_json::Value::Bool(boolean) => Some(*boolean),
+            serde_json::Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => Some(true),
+                "false" | "0" | "no" | "off" => Some(false),
+                _ => None,
+            },
+            _ => None,
+        })
+    })
+}
+
+fn json_task_priority_candidates(
+    value: &serde_json::Value,
+    paths: &[&[&str]],
+) -> Option<TaskPriorityArg> {
+    paths.iter().find_map(|path| {
+        json_lookup(value, path).and_then(|value| match value {
+            serde_json::Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "low" | "p3" => Some(TaskPriorityArg::Low),
+                "normal" | "medium" | "default" => Some(TaskPriorityArg::Normal),
+                "high" | "urgent" | "p2" | "p1" => Some(TaskPriorityArg::High),
+                "critical" | "crit" | "p0" => Some(TaskPriorityArg::Critical),
+                _ => None,
+            },
+            serde_json::Value::Number(number) => number.as_i64().and_then(|value| match value {
+                0 => Some(TaskPriorityArg::Low),
+                1 => Some(TaskPriorityArg::Normal),
+                2 => Some(TaskPriorityArg::High),
+                3 => Some(TaskPriorityArg::Critical),
+                _ => None,
+            }),
+            _ => None,
+        })
+    })
+}
+
+fn format_task_priority_arg(priority: TaskPriorityArg) -> &'static str {
+    match priority {
+        TaskPriorityArg::Low => "low",
+        TaskPriorityArg::Normal => "normal",
+        TaskPriorityArg::High => "high",
+        TaskPriorityArg::Critical => "critical",
+    }
+}
+
+fn json_lookup<'a>(value: &'a serde_json::Value, path: &[&str]) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+    Some(current)
+}
+
+fn json_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn shell_quote_double(value: &str) -> String {
+    format!(
+        "\"{}\"",
+        value
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+    )
+}
+
+fn validate_schedule_cron_expr(expr: &str) -> Result<()> {
+    let trimmed = expr.trim();
+    let normalized = match trimmed.split_whitespace().count() {
+        5 => format!("0 {trimmed}"),
+        6 | 7 => trimmed.to_string(),
+        fields => {
+            anyhow::bail!(
+                "invalid cron expression `{trimmed}`: expected 5, 6, or 7 fields but found {fields}"
+            )
+        }
+    };
+    <cron::Schedule as std::str::FromStr>::from_str(&normalized)
+        .with_context(|| format!("invalid cron expression `{trimmed}`"))?;
+    Ok(())
+}
+
+fn build_legacy_schedule_add_command(draft: &LegacyScheduleDraft) -> Option<String> {
+    let cron_expr = draft.cron_expr.as_deref()?;
+    let task = draft.task.as_deref()?;
+    let mut parts = vec![
+        "ecc schedule add".to_string(),
+        format!("--cron {}", shell_quote_double(cron_expr)),
+        format!("--task {}", shell_quote_double(task)),
+    ];
+    if let Some(agent) = draft.agent.as_deref() {
+        parts.push(format!("--agent {}", shell_quote_double(agent)));
+    }
+    if let Some(profile) = draft.profile.as_deref() {
+        parts.push(format!("--profile {}", shell_quote_double(profile)));
+    }
+    match draft.use_worktree {
+        Some(true) => parts.push("--worktree".to_string()),
+        Some(false) => parts.push("--no-worktree".to_string()),
+        None => {}
+    }
+    if let Some(project) = draft.project.as_deref() {
+        parts.push(format!("--project {}", shell_quote_double(project)));
+    }
+    if let Some(task_group) = draft.task_group.as_deref() {
+        parts.push(format!("--task-group {}", shell_quote_double(task_group)));
+    }
+    Some(parts.join(" "))
+}
+
+fn import_legacy_schedules(
+    db: &session::store::StateStore,
+    cfg: &config::Config,
+    source: &Path,
+    dry_run: bool,
+) -> Result<LegacyScheduleImportReport> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("Legacy workspace not found: {}", source.display()))?;
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Legacy workspace source must be a directory: {}",
+            source.display()
+        );
+    }
+
+    let drafts = load_legacy_schedule_drafts(&source)?;
+    let source_path = source.join("cron/jobs.json");
+    let source_path = source_path
+        .strip_prefix(&source)
+        .unwrap_or(&source_path)
+        .display()
+        .to_string();
+
+    let mut report = LegacyScheduleImportReport {
+        source: source.display().to_string(),
+        source_path,
+        dry_run,
+        jobs_detected: drafts.len(),
+        ready_jobs: 0,
+        imported_jobs: 0,
+        disabled_jobs: 0,
+        invalid_jobs: 0,
+        skipped_jobs: 0,
+        jobs: Vec::new(),
+    };
+
+    for draft in drafts {
+        let mut item = LegacyScheduleImportJobReport {
+            source_path: draft.source_path.clone(),
+            job_name: draft.job_name.clone(),
+            cron_expr: draft.cron_expr.clone(),
+            task: draft.task.clone(),
+            agent: draft.agent.clone(),
+            profile: draft.profile.clone(),
+            project: draft.project.clone(),
+            task_group: draft.task_group.clone(),
+            use_worktree: draft.use_worktree,
+            status: LegacyScheduleImportJobStatus::Ready,
+            reason: None,
+            command_snippet: build_legacy_schedule_add_command(&draft),
+            imported_schedule_id: None,
+        };
+
+        if !draft.enabled {
+            item.status = LegacyScheduleImportJobStatus::Disabled;
+            item.reason = Some("disabled in legacy workspace".to_string());
+            report.disabled_jobs += 1;
+            report.jobs.push(item);
+            continue;
+        }
+
+        let cron_expr = match draft.cron_expr.as_deref() {
+            Some(value) => value,
+            None => {
+                item.status = LegacyScheduleImportJobStatus::Invalid;
+                item.reason = Some("missing cron expression".to_string());
+                report.invalid_jobs += 1;
+                report.jobs.push(item);
+                continue;
+            }
+        };
+        let task = match draft.task.as_deref() {
+            Some(value) => value,
+            None => {
+                item.status = LegacyScheduleImportJobStatus::Invalid;
+                item.reason = Some("missing task/prompt".to_string());
+                report.invalid_jobs += 1;
+                report.jobs.push(item);
+                continue;
+            }
+        };
+
+        if let Err(error) = validate_schedule_cron_expr(cron_expr) {
+            item.status = LegacyScheduleImportJobStatus::Invalid;
+            item.reason = Some(error.to_string());
+            report.invalid_jobs += 1;
+            report.jobs.push(item);
+            continue;
+        }
+
+        if let Some(profile) = draft.profile.as_deref() {
+            if let Err(error) = cfg.resolve_agent_profile(profile) {
+                item.status = LegacyScheduleImportJobStatus::Skipped;
+                item.reason = Some(format!("profile `{profile}` is not usable here: {error}"));
+                report.skipped_jobs += 1;
+                report.jobs.push(item);
+                continue;
+            }
+        }
+
+        report.ready_jobs += 1;
+        if dry_run {
+            report.jobs.push(item);
+            continue;
+        }
+
+        let schedule = session::manager::create_scheduled_task(
+            db,
+            cfg,
+            cron_expr,
+            task,
+            draft.agent.as_deref().unwrap_or(&cfg.default_agent),
+            draft.profile.as_deref(),
+            draft.use_worktree.unwrap_or(cfg.auto_create_worktrees),
+            session::SessionGrouping {
+                project: draft.project.clone(),
+                task_group: draft.task_group.clone(),
+            },
+        )?;
+        item.status = LegacyScheduleImportJobStatus::Imported;
+        item.imported_schedule_id = Some(schedule.id);
+        report.imported_jobs += 1;
+        report.jobs.push(item);
+    }
+
+    Ok(report)
+}
+
+fn import_legacy_memory(
+    db: &session::store::StateStore,
+    cfg: &config::Config,
+    source: &Path,
+    limit: usize,
+) -> Result<LegacyMemoryImportReport> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("Legacy workspace not found: {}", source.display()))?;
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Legacy workspace source must be a directory: {}",
+            source.display()
+        );
+    }
+
+    let mut import_cfg = cfg.clone();
+    import_cfg.memory_connectors.clear();
+
+    let workspace_dir = source.join("workspace");
+    if workspace_dir.is_dir() {
+        if !collect_markdown_paths(&workspace_dir, true)?.is_empty() {
+            import_cfg.memory_connectors.insert(
+                "legacy_workspace_markdown".to_string(),
+                config::MemoryConnectorConfig::MarkdownDirectory(
+                    config::MemoryConnectorMarkdownDirectoryConfig {
+                        path: workspace_dir.clone(),
+                        recurse: true,
+                        session_id: None,
+                        default_entity_type: Some("legacy_workspace_note".to_string()),
+                        default_observation_type: Some("legacy_workspace_memory".to_string()),
+                    },
+                ),
+            );
+        }
+        if !collect_jsonl_paths(&workspace_dir, true)?.is_empty() {
+            import_cfg.memory_connectors.insert(
+                "legacy_workspace_jsonl".to_string(),
+                config::MemoryConnectorConfig::JsonlDirectory(
+                    config::MemoryConnectorJsonlDirectoryConfig {
+                        path: workspace_dir,
+                        recurse: true,
+                        session_id: None,
+                        default_entity_type: Some("legacy_workspace_record".to_string()),
+                        default_observation_type: Some("legacy_workspace_memory".to_string()),
+                    },
+                ),
+            );
+        }
+    }
+
+    let report = sync_all_memory_connectors(db, &import_cfg, limit)?;
+    Ok(LegacyMemoryImportReport {
+        source: source.display().to_string(),
+        connectors_detected: import_cfg.memory_connectors.len(),
+        report,
+    })
+}
+
+fn build_legacy_remote_add_command(draft: &LegacyRemoteDispatchDraft) -> Option<String> {
+    match draft.request_kind {
+        session::RemoteDispatchKind::Standard => {
+            let task = draft.task.as_deref()?;
+            let mut parts = vec![
+                "ecc remote add".to_string(),
+                format!("--task {}", shell_quote_double(task)),
+            ];
+            if let Some(target_session) = draft.target_session.as_deref() {
+                parts.push(format!(
+                    "--to-session {}",
+                    shell_quote_double(target_session)
+                ));
+            }
+            if let Some(priority) = draft
+                .priority
+                .filter(|value| *value != TaskPriorityArg::Normal)
+            {
+                parts.push(format!("--priority {}", format_task_priority_arg(priority)));
+            }
+            if let Some(agent) = draft.agent.as_deref() {
+                parts.push(format!("--agent {}", shell_quote_double(agent)));
+            }
+            if let Some(profile) = draft.profile.as_deref() {
+                parts.push(format!("--profile {}", shell_quote_double(profile)));
+            }
+            match draft.use_worktree {
+                Some(true) => parts.push("--worktree".to_string()),
+                Some(false) => parts.push("--no-worktree".to_string()),
+                None => {}
+            }
+            if let Some(project) = draft.project.as_deref() {
+                parts.push(format!("--project {}", shell_quote_double(project)));
+            }
+            if let Some(task_group) = draft.task_group.as_deref() {
+                parts.push(format!("--task-group {}", shell_quote_double(task_group)));
+            }
+            Some(parts.join(" "))
+        }
+        session::RemoteDispatchKind::ComputerUse => {
+            let goal = draft.goal.as_deref()?;
+            let mut parts = vec![
+                "ecc remote computer-use".to_string(),
+                format!("--goal {}", shell_quote_double(goal)),
+            ];
+            if let Some(target_url) = draft.target_url.as_deref() {
+                parts.push(format!("--target-url {}", shell_quote_double(target_url)));
+            }
+            if let Some(context) = draft.context.as_deref() {
+                parts.push(format!("--context {}", shell_quote_double(context)));
+            }
+            if let Some(target_session) = draft.target_session.as_deref() {
+                parts.push(format!(
+                    "--to-session {}",
+                    shell_quote_double(target_session)
+                ));
+            }
+            if let Some(priority) = draft
+                .priority
+                .filter(|value| *value != TaskPriorityArg::Normal)
+            {
+                parts.push(format!("--priority {}", format_task_priority_arg(priority)));
+            }
+            if let Some(agent) = draft.agent.as_deref() {
+                parts.push(format!("--agent {}", shell_quote_double(agent)));
+            }
+            if let Some(profile) = draft.profile.as_deref() {
+                parts.push(format!("--profile {}", shell_quote_double(profile)));
+            }
+            match draft.use_worktree {
+                Some(true) => parts.push("--worktree".to_string()),
+                Some(false) => parts.push("--no-worktree".to_string()),
+                None => {}
+            }
+            if let Some(project) = draft.project.as_deref() {
+                parts.push(format!("--project {}", shell_quote_double(project)));
+            }
+            if let Some(task_group) = draft.task_group.as_deref() {
+                parts.push(format!("--task-group {}", shell_quote_double(task_group)));
+            }
+            Some(parts.join(" "))
+        }
+    }
+}
+
+fn import_legacy_remote_dispatch(
+    db: &session::store::StateStore,
+    cfg: &config::Config,
+    source: &Path,
+    dry_run: bool,
+) -> Result<LegacyRemoteImportReport> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("Legacy workspace not found: {}", source.display()))?;
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Legacy workspace source must be a directory: {}",
+            source.display()
+        );
+    }
+
+    let drafts = load_legacy_remote_dispatch_drafts(&source)?;
+    let mut report = LegacyRemoteImportReport {
+        source: source.display().to_string(),
+        dry_run,
+        requests_detected: drafts.len(),
+        ready_requests: 0,
+        imported_requests: 0,
+        disabled_requests: 0,
+        invalid_requests: 0,
+        skipped_requests: 0,
+        requests: Vec::new(),
+    };
+
+    for draft in drafts {
+        let mut item = LegacyRemoteImportRequestReport {
+            source_path: draft.source_path.clone(),
+            request_name: draft.request_name.clone(),
+            request_kind: draft.request_kind,
+            task: draft.task.clone(),
+            goal: draft.goal.clone(),
+            target_url: draft.target_url.clone(),
+            context: draft.context.clone(),
+            target_session: draft.target_session.clone(),
+            priority: draft.priority,
+            agent: draft.agent.clone(),
+            profile: draft.profile.clone(),
+            project: draft.project.clone(),
+            task_group: draft.task_group.clone(),
+            use_worktree: draft.use_worktree,
+            status: LegacyRemoteImportRequestStatus::Ready,
+            reason: None,
+            command_snippet: build_legacy_remote_add_command(&draft),
+            imported_request_id: None,
+        };
+
+        if !draft.enabled {
+            item.status = LegacyRemoteImportRequestStatus::Disabled;
+            item.reason = Some("disabled in legacy workspace".to_string());
+            report.disabled_requests += 1;
+            report.requests.push(item);
+            continue;
+        }
+
+        let body_text = match draft.request_kind {
+            session::RemoteDispatchKind::Standard => draft.task.as_deref(),
+            session::RemoteDispatchKind::ComputerUse => draft.goal.as_deref(),
+        };
+        if body_text.is_none() {
+            item.status = LegacyRemoteImportRequestStatus::Invalid;
+            item.reason = Some(match draft.request_kind {
+                session::RemoteDispatchKind::Standard => "missing task/prompt".to_string(),
+                session::RemoteDispatchKind::ComputerUse => {
+                    "missing computer-use goal/prompt".to_string()
+                }
+            });
+            report.invalid_requests += 1;
+            report.requests.push(item);
+            continue;
+        }
+
+        if let Some(profile) = draft.profile.as_deref() {
+            if let Err(error) = cfg.resolve_agent_profile(profile) {
+                item.status = LegacyRemoteImportRequestStatus::Skipped;
+                item.reason = Some(format!("profile `{profile}` is not usable here: {error}"));
+                report.skipped_requests += 1;
+                report.requests.push(item);
+                continue;
+            }
+        }
+
+        let target_session_id = match draft.target_session.as_deref() {
+            Some(value) => match resolve_session_id(db, value) {
+                Ok(resolved) => Some(resolved),
+                Err(error) => {
+                    item.status = LegacyRemoteImportRequestStatus::Skipped;
+                    item.reason = Some(format!(
+                        "target session `{value}` is not usable here: {error}"
+                    ));
+                    report.skipped_requests += 1;
+                    report.requests.push(item);
+                    continue;
+                }
+            },
+            None => None,
+        };
+
+        report.ready_requests += 1;
+        if dry_run {
+            report.requests.push(item);
+            continue;
+        }
+
+        let request = match draft.request_kind {
+            session::RemoteDispatchKind::Standard => {
+                session::manager::create_remote_dispatch_request(
+                    db,
+                    cfg,
+                    body_text.expect("checked task text"),
+                    target_session_id.as_deref(),
+                    draft.priority.unwrap_or(TaskPriorityArg::Normal).into(),
+                    draft.agent.as_deref().unwrap_or(&cfg.default_agent),
+                    draft.profile.as_deref(),
+                    draft.use_worktree.unwrap_or(cfg.auto_create_worktrees),
+                    session::SessionGrouping {
+                        project: draft.project.clone(),
+                        task_group: draft.task_group.clone(),
+                    },
+                    "migrate_remote",
+                    None,
+                )?
+            }
+            session::RemoteDispatchKind::ComputerUse => {
+                let defaults = cfg.computer_use_dispatch_defaults();
+                session::manager::create_computer_use_remote_dispatch_request(
+                    db,
+                    cfg,
+                    body_text.expect("checked goal text"),
+                    draft.target_url.as_deref(),
+                    draft.context.as_deref(),
+                    target_session_id.as_deref(),
+                    draft.priority.unwrap_or(TaskPriorityArg::Normal).into(),
+                    draft.agent.as_deref(),
+                    draft.profile.as_deref(),
+                    Some(draft.use_worktree.unwrap_or(defaults.use_worktree)),
+                    session::SessionGrouping {
+                        project: draft.project.clone(),
+                        task_group: draft.task_group.clone(),
+                    },
+                    "migrate_remote_computer_use",
+                    None,
+                )?
+            }
+        };
+
+        item.status = LegacyRemoteImportRequestStatus::Imported;
+        item.imported_request_id = Some(request.id);
+        report.imported_requests += 1;
+        report.requests.push(item);
+    }
+
+    Ok(report)
+}
+
+fn build_legacy_migration_plan_report(
+    audit: &LegacyMigrationAuditReport,
+) -> LegacyMigrationPlanReport {
+    let mut steps = Vec::new();
+    let legacy_schedule_drafts =
+        load_legacy_schedule_drafts(Path::new(&audit.source)).unwrap_or_default();
+    let schedule_commands = legacy_schedule_drafts
+        .iter()
+        .filter(|draft| draft.enabled)
+        .filter_map(build_legacy_schedule_add_command)
+        .collect::<Vec<_>>();
+    let disabled_schedule_jobs = legacy_schedule_drafts
+        .iter()
+        .filter(|draft| !draft.enabled)
+        .count();
+    let invalid_schedule_jobs = legacy_schedule_drafts
+        .iter()
+        .filter(|draft| draft.enabled && (draft.cron_expr.is_none() || draft.task.is_none()))
+        .count();
+    let legacy_remote_drafts =
+        load_legacy_remote_dispatch_drafts(Path::new(&audit.source)).unwrap_or_default();
+    let remote_commands = legacy_remote_drafts
+        .iter()
+        .filter(|draft| draft.enabled)
+        .filter_map(build_legacy_remote_add_command)
+        .collect::<Vec<_>>();
+    let disabled_remote_requests = legacy_remote_drafts
+        .iter()
+        .filter(|draft| !draft.enabled)
+        .count();
+    let invalid_remote_requests = legacy_remote_drafts
+        .iter()
+        .filter(|draft| {
+            draft.enabled
+                && match draft.request_kind {
+                    session::RemoteDispatchKind::Standard => draft.task.is_none(),
+                    session::RemoteDispatchKind::ComputerUse => draft.goal.is_none(),
+                }
+        })
+        .count();
+
+    for artifact in &audit.artifacts {
+        let step = match artifact.category.as_str() {
+            "scheduler" => LegacyMigrationPlanStep {
+                category: artifact.category.clone(),
+                readiness: artifact.readiness,
+                title: "Recreate Hermes/OpenClaw recurring jobs in ECC2 scheduler".to_string(),
+                target_surface: "ECC2 scheduler".to_string(),
+                source_paths: artifact.source_paths.clone(),
+                command_snippets: if schedule_commands.is_empty() {
+                    vec![
+                        "ecc schedule add --cron \"<legacy-cron>\" --task \"Translate legacy recurring job from cron/scheduler.py\"".to_string(),
+                        "ecc schedule list".to_string(),
+                        "ecc daemon".to_string(),
+                    ]
+                } else {
+                    let mut commands = schedule_commands.clone();
+                    commands.push("ecc schedule list".to_string());
+                    commands.push("ecc daemon".to_string());
+                    commands
+                },
+                config_snippets: Vec::new(),
+                notes: {
+                    let mut notes = artifact.notes.clone();
+                    if !schedule_commands.is_empty() {
+                        notes.push(format!(
+                            "Recovered {} concrete recurring job(s) from cron/jobs.json.",
+                            schedule_commands.len()
+                        ));
+                    }
+                    if disabled_schedule_jobs > 0 {
+                        notes.push(format!(
+                            "{disabled_schedule_jobs} legacy recurring job(s) are disabled and were left out of generated ECC2 commands."
+                        ));
+                    }
+                    if invalid_schedule_jobs > 0 {
+                        notes.push(format!(
+                            "{invalid_schedule_jobs} legacy recurring job(s) were missing cron/task fields and still need manual translation."
+                        ));
+                    }
+                    notes
+                },
+            },
+            "gateway_dispatch" => LegacyMigrationPlanStep {
+                category: artifact.category.clone(),
+                readiness: artifact.readiness,
+                title: "Replace legacy gateway intake with ECC2 remote dispatch".to_string(),
+                target_surface: "ECC2 remote dispatch".to_string(),
+                source_paths: artifact.source_paths.clone(),
+                command_snippets: if remote_commands.is_empty() {
+                    vec![
+                        "ecc remote serve --bind 127.0.0.1:8787 --token <token>".to_string(),
+                        "ecc remote add --task \"Translate legacy dispatch workflow\"".to_string(),
+                        "ecc remote computer-use --goal \"Translate legacy browser/operator flow\"".to_string(),
+                    ]
+                } else {
+                    let mut commands = vec![
+                        "ecc remote serve --bind 127.0.0.1:8787 --token <token>".to_string(),
+                    ];
+                    commands.extend(remote_commands.clone());
+                    commands.push("ecc remote list".to_string());
+                    commands.push("ecc remote run".to_string());
+                    commands
+                },
+                config_snippets: Vec::new(),
+                notes: {
+                    let mut notes = artifact.notes.clone();
+                    if !remote_commands.is_empty() {
+                        notes.push(format!(
+                            "Recovered {} concrete remote dispatch request(s) from gateway JSON/JSONL files.",
+                            remote_commands.len()
+                        ));
+                    }
+                    if disabled_remote_requests > 0 {
+                        notes.push(format!(
+                            "{disabled_remote_requests} legacy remote dispatch request(s) are disabled and were left out of generated ECC2 commands."
+                        ));
+                    }
+                    if invalid_remote_requests > 0 {
+                        notes.push(format!(
+                            "{invalid_remote_requests} legacy remote dispatch request(s) were missing task/goal fields and still need manual translation."
+                        ));
+                    }
+                    notes
+                },
+            },
+            "memory_tool" => LegacyMigrationPlanStep {
+                category: artifact.category.clone(),
+                readiness: artifact.readiness,
+                title: "Port legacy memory tool usage to ECC2 deep memory".to_string(),
+                target_surface: "ECC2 context graph".to_string(),
+                source_paths: artifact.source_paths.clone(),
+                command_snippets: vec![
+                    "ecc graph add-observation --entity-id <id> --type migration_note --summary \"Imported legacy memory pattern\"".to_string(),
+                    "ecc graph recall \"<query>\"".to_string(),
+                    "ecc graph connectors".to_string(),
+                ],
+                config_snippets: Vec::new(),
+                notes: artifact.notes.clone(),
+            },
+            "workspace_memory" => LegacyMigrationPlanStep {
+                category: artifact.category.clone(),
+                readiness: artifact.readiness,
+                title: "Import sanitized workspace memory through ECC2 connectors".to_string(),
+                target_surface: "ECC2 memory connectors".to_string(),
+                source_paths: artifact.source_paths.clone(),
+                command_snippets: vec![
+                    "ecc graph connector-sync hermes_workspace".to_string(),
+                    "ecc graph recall \"<query>\"".to_string(),
+                ],
+                config_snippets: vec![format!(
+                    "[memory_connectors.hermes_workspace]\nkind = \"markdown_directory\"\npath = \"{}\"\nrecurse = true\ndefault_entity_type = \"legacy_workspace_note\"\ndefault_observation_type = \"legacy_workspace_memory\"",
+                    Path::new(&audit.source).join("workspace").display()
+                )],
+                notes: artifact.notes.clone(),
+            },
+            "skills" => LegacyMigrationPlanStep {
+                category: artifact.category.clone(),
+                readiness: artifact.readiness,
+                title: "Translate reusable legacy skills into ECC-native surfaces".to_string(),
+                target_surface: "ECC skills / orchestration templates".to_string(),
+                source_paths: artifact.source_paths.clone(),
+                command_snippets: vec![
+                    "ecc template <template-name> --task \"<translated workflow goal>\"".to_string(),
+                ],
+                config_snippets: vec![
+                    "[orchestration_templates.legacy_workflow]\nproject = \"legacy-migration\"\ntask_group = \"legacy workflow\"\nagent = \"claude\"\nworktree = false\n\n[[orchestration_templates.legacy_workflow.steps]]\nname = \"operator\"\ntask = \"Translate and run the legacy workflow for {{task}}\"".to_string(),
+                ],
+                notes: artifact.notes.clone(),
+            },
+            "tools" => LegacyMigrationPlanStep {
+                category: artifact.category.clone(),
+                readiness: artifact.readiness,
+                title: "Rebuild valuable legacy tools as ECC agents, hooks, commands, or harness runners".to_string(),
+                target_surface: "ECC agents / hooks / commands / harness runners".to_string(),
+                source_paths: artifact.source_paths.clone(),
+                command_snippets: vec![
+                    "ecc start --task \"Rebuild one legacy tool as an ECC-native command or hook\"".to_string(),
+                ],
+                config_snippets: vec![
+                    "[harness_runners.legacy-runner]\nprogram = \"<runner-binary>\"\nbase_args = []\nproject_markers = [\".legacy-runner\"]".to_string(),
+                ],
+                notes: artifact.notes.clone(),
+            },
+            "plugins" => LegacyMigrationPlanStep {
+                category: artifact.category.clone(),
+                readiness: artifact.readiness,
+                title: "Translate legacy bridge plugins into ECC-native automation".to_string(),
+                target_surface: "ECC hooks / commands / skills".to_string(),
+                source_paths: artifact.source_paths.clone(),
+                command_snippets: vec![
+                    "ecc start --task \"Port one bridge plugin behavior into an ECC hook or command\"".to_string(),
+                ],
+                config_snippets: Vec::new(),
+                notes: artifact.notes.clone(),
+            },
+            "env_services" => LegacyMigrationPlanStep {
+                category: artifact.category.clone(),
+                readiness: artifact.readiness,
+                title: "Reconfigure local auth and connectors without importing secrets".to_string(),
+                target_surface: "Claude connectors / MCP / local API key setup".to_string(),
+                source_paths: artifact.source_paths.clone(),
+                command_snippets: Vec::new(),
+                config_snippets: vec![
+                    "# Re-enter connector auth locally; do not copy legacy secrets into ECC2.\n# Typical targets: Google Drive OAuth, GitHub, Stripe, Linear, browser creds.".to_string(),
+                ],
+                notes: artifact.notes.clone(),
+            },
+            _ => LegacyMigrationPlanStep {
+                category: artifact.category.clone(),
+                readiness: artifact.readiness,
+                title: format!("Review legacy {} surface", artifact.category),
+                target_surface: "Manual ECC2 translation".to_string(),
+                source_paths: artifact.source_paths.clone(),
+                command_snippets: Vec::new(),
+                config_snippets: Vec::new(),
+                notes: artifact.notes.clone(),
+            },
+        };
+        steps.push(step);
+    }
+
+    LegacyMigrationPlanReport {
+        source: audit.source.clone(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        audit_summary: audit.summary.clone(),
+        steps,
+    }
+}
+
+fn write_legacy_migration_scaffold(
+    plan: &LegacyMigrationPlanReport,
+    output_dir: &Path,
+) -> Result<LegacyMigrationScaffoldReport> {
+    fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "create migration scaffold output directory: {}",
+            output_dir.display()
+        )
+    })?;
+
+    let plan_path = output_dir.join("migration-plan.md");
+    let config_path = output_dir.join("ecc2.migration.toml");
+
+    fs::write(&plan_path, format_legacy_migration_plan_human(plan))
+        .with_context(|| format!("write migration plan: {}", plan_path.display()))?;
+    fs::write(&config_path, render_legacy_migration_config_scaffold(plan))
+        .with_context(|| format!("write migration config scaffold: {}", config_path.display()))?;
+
+    Ok(LegacyMigrationScaffoldReport {
+        source: plan.source.clone(),
+        output_dir: output_dir.display().to_string(),
+        files_written: vec![
+            plan_path.display().to_string(),
+            config_path.display().to_string(),
+        ],
+        steps_scaffolded: plan.steps.len(),
+    })
+}
+
+fn render_legacy_migration_config_scaffold(plan: &LegacyMigrationPlanReport) -> String {
+    let mut sections = vec![
+        format!(
+            "# ECC2 migration scaffold generated from {}\n# Review every section before merging it into a real ecc2.toml.",
+            plan.source
+        ),
+    ];
+
+    for step in &plan.steps {
+        if step.config_snippets.is_empty() {
+            continue;
+        }
+        sections.push(format!(
+            "\n# {} [{} -> {}]",
+            step.title,
+            format_legacy_migration_readiness(step.readiness),
+            step.target_surface
+        ));
+        for snippet in &step.config_snippets {
+            sections.push(snippet.clone());
+        }
+    }
+
+    sections.join("\n\n")
+}
+
+fn format_legacy_migration_audit_human(report: &LegacyMigrationAuditReport) -> String {
+    let mut lines = vec![
+        format!("Legacy migration audit: {}", report.source),
+        format!(
+            "Detected systems: {}",
+            if report.detected_systems.is_empty() {
+                "none".to_string()
+            } else {
+                report.detected_systems.join(", ")
+            }
+        ),
+        format!(
+            "Artifact categories: {} | ready now {} | manual translation {} | local auth {}",
+            report.summary.artifact_categories_detected,
+            report.summary.ready_now_categories,
+            report.summary.manual_translation_categories,
+            report.summary.local_auth_required_categories
+        ),
+    ];
+
+    if report.artifacts.is_empty() {
+        lines.push("No recognizable Hermes/OpenClaw migration surfaces found.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(String::new());
+    lines.push("Artifacts".to_string());
+    for artifact in &report.artifacts {
+        lines.push(format!(
+            "- {} [{}] | items {}",
+            artifact.category,
+            format_legacy_migration_readiness(artifact.readiness),
+            artifact.detected_items
+        ));
+        lines.push(format!("  sources {}", artifact.source_paths.join(", ")));
+        lines.push(format!("  map to {}", artifact.mapping.join(", ")));
+        for note in &artifact.notes {
+            lines.push(format!("  note {note}"));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Recommended next steps".to_string());
+    for step in &report.recommended_next_steps {
+        lines.push(format!("- {step}"));
+    }
+
+    lines.join("\n")
+}
+
+fn format_legacy_migration_readiness(readiness: LegacyMigrationReadiness) -> &'static str {
+    match readiness {
+        LegacyMigrationReadiness::ReadyNow => "ready_now",
+        LegacyMigrationReadiness::ManualTranslation => "manual_translation",
+        LegacyMigrationReadiness::LocalAuthRequired => "local_auth_required",
+    }
+}
+
+fn format_legacy_migration_plan_human(report: &LegacyMigrationPlanReport) -> String {
+    let mut lines = vec![
+        format!("Legacy migration plan: {}", report.source),
+        format!("Generated at: {}", report.generated_at),
+        format!(
+            "Audit summary: {} categories | ready now {} | manual translation {} | local auth {}",
+            report.audit_summary.artifact_categories_detected,
+            report.audit_summary.ready_now_categories,
+            report.audit_summary.manual_translation_categories,
+            report.audit_summary.local_auth_required_categories
+        ),
+    ];
+
+    if report.steps.is_empty() {
+        lines.push("No migration steps generated.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push(String::new());
+    lines.push("Plan".to_string());
+    for step in &report.steps {
+        lines.push(format!(
+            "- {} [{}] -> {}",
+            step.title,
+            format_legacy_migration_readiness(step.readiness),
+            step.target_surface
+        ));
+        if !step.source_paths.is_empty() {
+            lines.push(format!("  sources {}", step.source_paths.join(", ")));
+        }
+        for command in &step.command_snippets {
+            lines.push(format!("  command {}", command));
+        }
+        for snippet in &step.config_snippets {
+            lines.push("  config".to_string());
+            for line in snippet.lines() {
+                lines.push(format!("    {}", line));
+            }
+        }
+        for note in &step.notes {
+            lines.push(format!("  note {}", note));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_legacy_migration_scaffold_human(report: &LegacyMigrationScaffoldReport) -> String {
+    let mut lines = vec![
+        format!("Legacy migration scaffold written for {}", report.source),
+        format!("- output dir {}", report.output_dir),
+        format!("- steps scaffolded {}", report.steps_scaffolded),
+        "- files".to_string(),
+    ];
+    for path in &report.files_written {
+        lines.push(format!("  {}", path));
+    }
+    lines.join("\n")
+}
+
+fn format_legacy_schedule_import_human(report: &LegacyScheduleImportReport) -> String {
+    let mut lines = vec![
+        format!(
+            "Legacy schedule import {} for {}",
+            if report.dry_run {
+                "preview"
+            } else {
+                "complete"
+            },
+            report.source
+        ),
+        format!("- source path {}", report.source_path),
+        format!("- jobs detected {}", report.jobs_detected),
+        format!("- ready jobs {}", report.ready_jobs),
+        format!("- imported jobs {}", report.imported_jobs),
+        format!("- disabled jobs {}", report.disabled_jobs),
+        format!("- invalid jobs {}", report.invalid_jobs),
+        format!("- skipped jobs {}", report.skipped_jobs),
+    ];
+
+    if report.jobs.is_empty() {
+        lines.push("- no importable cron/jobs.json entries were found".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("Jobs".to_string());
+    for job in &report.jobs {
+        lines.push(format!(
+            "- {} [{}]",
+            job.job_name,
+            match job.status {
+                LegacyScheduleImportJobStatus::Ready => "ready",
+                LegacyScheduleImportJobStatus::Imported => "imported",
+                LegacyScheduleImportJobStatus::Disabled => "disabled",
+                LegacyScheduleImportJobStatus::Invalid => "invalid",
+                LegacyScheduleImportJobStatus::Skipped => "skipped",
+            }
+        ));
+        if let Some(cron_expr) = job.cron_expr.as_deref() {
+            lines.push(format!("  cron {}", cron_expr));
+        }
+        if let Some(task) = job.task.as_deref() {
+            lines.push(format!("  task {}", task));
+        }
+        if let Some(command) = job.command_snippet.as_deref() {
+            lines.push(format!("  command {}", command));
+        }
+        if let Some(schedule_id) = job.imported_schedule_id {
+            lines.push(format!("  schedule {}", schedule_id));
+        }
+        if let Some(reason) = job.reason.as_deref() {
+            lines.push(format!("  note {}", reason));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_legacy_memory_import_human(report: &LegacyMemoryImportReport) -> String {
+    let mut lines = vec![
+        format!(
+            "Legacy workspace memory import complete for {}",
+            report.source
+        ),
+        format!("- connectors detected {}", report.connectors_detected),
+        format!("- connectors synced {}", report.report.connectors_synced),
+        format!("- records read {}", report.report.records_read),
+        format!("- entities upserted {}", report.report.entities_upserted),
+        format!("- observations added {}", report.report.observations_added),
+        format!("- skipped records {}", report.report.skipped_records),
+        format!(
+            "- skipped unchanged sources {}",
+            report.report.skipped_unchanged_sources
+        ),
+    ];
+
+    if !report.report.connectors.is_empty() {
+        lines.push("Connectors".to_string());
+        for connector in &report.report.connectors {
+            lines.push(format!(
+                "- {} | records {} | entities {} | observations {} | skipped unchanged {}",
+                connector.connector_name,
+                connector.records_read,
+                connector.entities_upserted,
+                connector.observations_added,
+                connector.skipped_unchanged_sources
+            ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_legacy_remote_import_human(report: &LegacyRemoteImportReport) -> String {
+    let mut lines = vec![
+        format!(
+            "Legacy remote dispatch import {} for {}",
+            if report.dry_run {
+                "preview"
+            } else {
+                "complete"
+            },
+            report.source
+        ),
+        format!("- requests detected {}", report.requests_detected),
+        format!("- ready requests {}", report.ready_requests),
+        format!("- imported requests {}", report.imported_requests),
+        format!("- disabled requests {}", report.disabled_requests),
+        format!("- invalid requests {}", report.invalid_requests),
+        format!("- skipped requests {}", report.skipped_requests),
+    ];
+
+    if report.requests.is_empty() {
+        lines.push("- no importable gateway JSON/JSONL request entries were found".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("Requests".to_string());
+    for request in &report.requests {
+        let status = match request.status {
+            LegacyRemoteImportRequestStatus::Ready => "ready",
+            LegacyRemoteImportRequestStatus::Imported => "imported",
+            LegacyRemoteImportRequestStatus::Disabled => "disabled",
+            LegacyRemoteImportRequestStatus::Invalid => "invalid",
+            LegacyRemoteImportRequestStatus::Skipped => "skipped",
+        };
+        lines.push(format!(
+            "- {} [{} / {}]",
+            request.request_name, status, request.request_kind
+        ));
+        lines.push(format!("  source {}", request.source_path));
+        if let Some(task) = request.task.as_deref() {
+            lines.push(format!("  task {}", task));
+        }
+        if let Some(goal) = request.goal.as_deref() {
+            lines.push(format!("  goal {}", goal));
+        }
+        if let Some(target_url) = request.target_url.as_deref() {
+            lines.push(format!("  target url {}", target_url));
+        }
+        if let Some(target_session) = request.target_session.as_deref() {
+            lines.push(format!("  target {}", target_session));
+        }
+        if let Some(command) = request.command_snippet.as_deref() {
+            lines.push(format!("  command {}", command));
+        }
+        if let Some(request_id) = request.imported_request_id {
+            lines.push(format!("  request {}", request_id));
+        }
+        if let Some(reason) = request.reason.as_deref() {
+            lines.push(format!("  note {}", reason));
+        }
     }
 
     lines.join("\n")
@@ -6818,6 +9030,723 @@ mod tests {
             }
             _ => panic!("expected graph connectors subcommand"),
         }
+    }
+
+    #[test]
+    fn cli_parses_migrate_audit_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "migrate",
+            "audit",
+            "--source",
+            "/tmp/hermes",
+            "--json",
+        ])
+        .expect("migrate audit should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                command: MigrationCommands::Audit { source, json },
+            }) => {
+                assert_eq!(source, PathBuf::from("/tmp/hermes"));
+                assert!(json);
+            }
+            _ => panic!("expected migrate audit subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_migrate_plan_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "migrate",
+            "plan",
+            "--source",
+            "/tmp/hermes",
+            "--output",
+            "/tmp/plan.md",
+        ])
+        .expect("migrate plan should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                command:
+                    MigrationCommands::Plan {
+                        source,
+                        output,
+                        json,
+                    },
+            }) => {
+                assert_eq!(source, PathBuf::from("/tmp/hermes"));
+                assert_eq!(output, Some(PathBuf::from("/tmp/plan.md")));
+                assert!(!json);
+            }
+            _ => panic!("expected migrate plan subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_migrate_scaffold_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "migrate",
+            "scaffold",
+            "--source",
+            "/tmp/hermes",
+            "--output-dir",
+            "/tmp/migration-scaffold",
+            "--json",
+        ])
+        .expect("migrate scaffold should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                command:
+                    MigrationCommands::Scaffold {
+                        source,
+                        output_dir,
+                        json,
+                    },
+            }) => {
+                assert_eq!(source, PathBuf::from("/tmp/hermes"));
+                assert_eq!(output_dir, PathBuf::from("/tmp/migration-scaffold"));
+                assert!(json);
+            }
+            _ => panic!("expected migrate scaffold subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_migrate_import_schedules_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "migrate",
+            "import-schedules",
+            "--source",
+            "/tmp/hermes",
+            "--dry-run",
+            "--json",
+        ])
+        .expect("migrate import-schedules should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                command:
+                    MigrationCommands::ImportSchedules {
+                        source,
+                        dry_run,
+                        json,
+                    },
+            }) => {
+                assert_eq!(source, PathBuf::from("/tmp/hermes"));
+                assert!(dry_run);
+                assert!(json);
+            }
+            _ => panic!("expected migrate import-schedules subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_migrate_import_memory_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "migrate",
+            "import-memory",
+            "--source",
+            "/tmp/hermes",
+            "--limit",
+            "24",
+            "--json",
+        ])
+        .expect("migrate import-memory should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                command:
+                    MigrationCommands::ImportMemory {
+                        source,
+                        limit,
+                        json,
+                    },
+            }) => {
+                assert_eq!(source, PathBuf::from("/tmp/hermes"));
+                assert_eq!(limit, 24);
+                assert!(json);
+            }
+            _ => panic!("expected migrate import-memory subcommand"),
+        }
+    }
+
+    #[test]
+    fn legacy_migration_audit_report_maps_detected_artifacts() -> Result<()> {
+        let tempdir = TestDir::new("legacy-migration-audit")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("cron"))?;
+        fs::create_dir_all(root.join("gateway"))?;
+        fs::create_dir_all(root.join("workspace/notes"))?;
+        fs::create_dir_all(root.join("skills/ecc-imports"))?;
+        fs::create_dir_all(root.join("tools"))?;
+        fs::create_dir_all(root.join("plugins"))?;
+        fs::write(root.join("config.yaml"), "model: claude\n")?;
+        fs::write(root.join("cron/scheduler.py"), "print('tick')\n")?;
+        fs::write(root.join("jobs.py"), "JOBS = []\n")?;
+        fs::write(root.join("gateway/router.py"), "route = True\n")?;
+        fs::write(root.join("memory_tool.py"), "class MemoryTool: pass\n")?;
+        fs::write(root.join("workspace/notes/recovery.md"), "# recovery\n")?;
+        fs::write(root.join("skills/ecc-imports/research.md"), "# skill\n")?;
+        fs::write(root.join("tools/browser.py"), "print('browser')\n")?;
+        fs::write(root.join("plugins/reminders.py"), "print('reminders')\n")?;
+        fs::write(
+            root.join(".env.local"),
+            "STRIPE_SECRET_KEY=sk_test_secret\n",
+        )?;
+
+        let report = build_legacy_migration_audit_report(root)?;
+
+        assert_eq!(report.detected_systems, vec!["hermes"]);
+        assert_eq!(report.summary.artifact_categories_detected, 8);
+        assert_eq!(report.summary.ready_now_categories, 4);
+        assert_eq!(report.summary.manual_translation_categories, 3);
+        assert_eq!(report.summary.local_auth_required_categories, 1);
+        assert!(report
+            .recommended_next_steps
+            .iter()
+            .any(|step| step.contains("ecc schedule add")));
+        assert!(report
+            .recommended_next_steps
+            .iter()
+            .any(|step| step.contains("ecc remote serve")));
+
+        let scheduler = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.category == "scheduler")
+            .expect("scheduler artifact");
+        assert_eq!(scheduler.readiness, LegacyMigrationReadiness::ReadyNow);
+        assert_eq!(scheduler.detected_items, 2);
+
+        let env_services = report
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.category == "env_services")
+            .expect("env services artifact");
+        assert_eq!(
+            env_services.readiness,
+            LegacyMigrationReadiness::LocalAuthRequired
+        );
+        assert!(env_services
+            .source_paths
+            .contains(&"config.yaml".to_string()));
+        assert!(env_services
+            .source_paths
+            .contains(&".env.local".to_string()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_migration_plan_report_generates_workspace_connector_step() -> Result<()> {
+        let tempdir = TestDir::new("legacy-migration-plan")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("cron"))?;
+        fs::create_dir_all(root.join("gateway"))?;
+        fs::create_dir_all(root.join("workspace/notes"))?;
+        fs::write(root.join("config.yaml"), "model: claude\n")?;
+        fs::write(
+            root.join("cron/jobs.json"),
+            serde_json::json!({
+                "jobs": [
+                    {
+                        "name": "portal-recovery",
+                        "cron": "*/15 * * * *",
+                        "prompt": "Check portal-first recovery flow",
+                        "agent": "codex",
+                        "project": "billing-web",
+                        "task_group": "recovery",
+                        "use_worktree": false
+                    },
+                    {
+                        "name": "paused-job",
+                        "cron": "0 12 * * *",
+                        "prompt": "This one stays paused",
+                        "disabled": true
+                    }
+                ]
+            })
+            .to_string(),
+        )?;
+        fs::write(
+            root.join("gateway/dispatch.jsonl"),
+            [
+                serde_json::json!({
+                    "name": "route-account-recovery",
+                    "task": "Handle account recovery triage",
+                    "priority": "high",
+                    "agent": "codex",
+                    "project": "ecc-tools",
+                    "task_group": "recovery"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "name": "browser-billing-check",
+                    "kind": "computer_use",
+                    "goal": "Verify the billing portal warning banner",
+                    "target_url": "https://ecc.tools/account",
+                    "context": "Use the production account flow",
+                    "priority": "critical",
+                    "use_worktree": false
+                })
+                .to_string(),
+                serde_json::json!({
+                    "name": "paused-remote",
+                    "task": "Do not migrate this now",
+                    "disabled": true
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )?;
+        fs::write(root.join("workspace/notes/recovery.md"), "# recovery\n")?;
+
+        let audit = build_legacy_migration_audit_report(root)?;
+        let plan = build_legacy_migration_plan_report(&audit);
+
+        let workspace_step = plan
+            .steps
+            .iter()
+            .find(|step| step.category == "workspace_memory")
+            .expect("workspace memory step");
+        assert_eq!(workspace_step.readiness, LegacyMigrationReadiness::ReadyNow);
+        assert!(workspace_step
+            .config_snippets
+            .iter()
+            .any(|snippet| snippet.contains("[memory_connectors.hermes_workspace]")));
+        assert!(workspace_step
+            .command_snippets
+            .contains(&"ecc graph connector-sync hermes_workspace".to_string()));
+
+        let scheduler_step = plan
+            .steps
+            .iter()
+            .find(|step| step.category == "scheduler")
+            .expect("scheduler step");
+        assert!(scheduler_step
+            .command_snippets
+            .iter()
+            .any(|command| command.contains("ecc schedule add --cron \"*/15 * * * *\"")));
+        assert!(!scheduler_step
+            .command_snippets
+            .iter()
+            .any(|command| command.contains("<legacy-cron>")));
+        assert!(scheduler_step
+            .notes
+            .iter()
+            .any(|note| note.contains("disabled")));
+
+        let gateway_step = plan
+            .steps
+            .iter()
+            .find(|step| step.category == "gateway_dispatch")
+            .expect("gateway step");
+        assert!(gateway_step
+            .command_snippets
+            .iter()
+            .any(|command| command
+                .contains("ecc remote add --task \"Handle account recovery triage\"")));
+        assert!(gateway_step
+            .command_snippets
+            .iter()
+            .any(|command| command.contains(
+                "ecc remote computer-use --goal \"Verify the billing portal warning banner\""
+            )));
+        assert!(!gateway_step
+            .command_snippets
+            .iter()
+            .any(|command| command.contains("Translate legacy dispatch workflow")));
+        assert!(gateway_step
+            .notes
+            .iter()
+            .any(|note| note.contains("disabled")));
+
+        let rendered = format_legacy_migration_plan_human(&plan);
+        assert!(rendered.contains("Legacy migration plan"));
+        assert!(rendered.contains("Import sanitized workspace memory through ECC2 connectors"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_schedules_dry_run_reports_ready_disabled_and_invalid_jobs() -> Result<()> {
+        let tempdir = TestDir::new("legacy-schedule-import-dry-run")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("cron"))?;
+        fs::write(
+            root.join("cron/jobs.json"),
+            serde_json::json!({
+                "jobs": [
+                    {
+                        "name": "portal-recovery",
+                        "cron": "*/15 * * * *",
+                        "prompt": "Check portal-first recovery flow",
+                        "agent": "codex",
+                        "project": "billing-web",
+                        "task_group": "recovery",
+                        "use_worktree": false
+                    },
+                    {
+                        "name": "paused-job",
+                        "cron": "0 12 * * *",
+                        "prompt": "This one stays paused",
+                        "disabled": true
+                    },
+                    {
+                        "name": "broken-job",
+                        "prompt": "Missing cron"
+                    }
+                ]
+            })
+            .to_string(),
+        )?;
+
+        let tempdb = TestDir::new("legacy-schedule-import-dry-run-db")?;
+        let db = StateStore::open(&tempdb.path().join("state.db"))?;
+        let report = import_legacy_schedules(&db, &config::Config::default(), root, true)?;
+
+        assert!(report.dry_run);
+        assert_eq!(report.jobs_detected, 3);
+        assert_eq!(report.ready_jobs, 1);
+        assert_eq!(report.imported_jobs, 0);
+        assert_eq!(report.disabled_jobs, 1);
+        assert_eq!(report.invalid_jobs, 1);
+        assert_eq!(report.skipped_jobs, 0);
+        assert_eq!(report.jobs.len(), 3);
+        assert!(report
+            .jobs
+            .iter()
+            .any(|job| job.command_snippet.as_deref() == Some("ecc schedule add --cron \"*/15 * * * *\" --task \"Check portal-first recovery flow\" --agent \"codex\" --no-worktree --project \"billing-web\" --task-group \"recovery\"")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_schedules_creates_real_ecc2_schedules() -> Result<()> {
+        let tempdir = TestDir::new("legacy-schedule-import-live")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("cron"))?;
+        fs::write(
+            root.join("cron/jobs.json"),
+            serde_json::json!({
+                "jobs": [
+                    {
+                        "name": "portal-recovery",
+                        "cron": "*/15 * * * *",
+                        "prompt": "Check portal-first recovery flow",
+                        "agent": "codex",
+                        "project": "billing-web",
+                        "task_group": "recovery",
+                        "use_worktree": false
+                    }
+                ]
+            })
+            .to_string(),
+        )?;
+
+        let target_repo = tempdir.path().join("target");
+        fs::create_dir_all(&target_repo)?;
+        fs::write(target_repo.join(".gitignore"), "target\n")?;
+
+        let tempdb = TestDir::new("legacy-schedule-import-live-db")?;
+        let db = StateStore::open(&tempdb.path().join("state.db"))?;
+        struct CurrentDirGuard(PathBuf);
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _cwd_guard = CurrentDirGuard(std::env::current_dir()?);
+        std::env::set_current_dir(&target_repo)?;
+        let report = import_legacy_schedules(&db, &config::Config::default(), root, false)?;
+
+        assert!(!report.dry_run);
+        assert_eq!(report.ready_jobs, 1);
+        assert_eq!(report.imported_jobs, 1);
+        assert_eq!(
+            report.jobs[0].status,
+            LegacyScheduleImportJobStatus::Imported
+        );
+        assert!(report.jobs[0].imported_schedule_id.is_some());
+
+        let schedules = db.list_scheduled_tasks()?;
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(schedules[0].task, "Check portal-first recovery flow");
+        assert_eq!(schedules[0].agent_type, "codex");
+        assert_eq!(schedules[0].project, "billing-web");
+        assert_eq!(schedules[0].task_group, "recovery");
+        assert!(!schedules[0].use_worktree);
+        assert_eq!(
+            schedules[0].working_dir.canonicalize()?,
+            target_repo.canonicalize()?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_memory_imports_workspace_markdown_and_jsonl() -> Result<()> {
+        let tempdir = TestDir::new("legacy-memory-import")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("workspace/notes"))?;
+        fs::create_dir_all(root.join("workspace/memory"))?;
+        fs::write(
+            root.join("workspace/notes/recovery.md"),
+            r#"# Billing incident
+Customer wiped setup and got charged twice after reinstalling.
+
+## Portal routing
+Route existing installs to portal first before checkout.
+"#,
+        )?;
+        fs::write(
+            root.join("workspace/memory/hermes.jsonl"),
+            [
+                serde_json::json!({
+                    "entity_name": "Billing recovery checklist",
+                    "summary": "Use portal-first routing before offering checkout again"
+                })
+                .to_string(),
+                serde_json::json!({
+                    "entity_name": "Repair before reinstall",
+                    "summary": "Recommend ecc repair before purchase flows"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )?;
+
+        let tempdb = TestDir::new("legacy-memory-import-db")?;
+        let db = StateStore::open(&tempdb.path().join("state.db"))?;
+        let report = import_legacy_memory(&db, &config::Config::default(), root, 10)?;
+
+        assert_eq!(report.connectors_detected, 2);
+        assert_eq!(report.report.connectors_synced, 2);
+        assert_eq!(report.report.records_read, 4);
+        assert_eq!(report.report.entities_upserted, 4);
+        assert_eq!(report.report.observations_added, 4);
+
+        let recalled = db.recall_context_entities(None, "charged twice portal reinstall", 10)?;
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Billing incident"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Billing recovery checklist"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "Repair before reinstall"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_memory_reports_no_workspace_connectors_when_absent() -> Result<()> {
+        let tempdir = TestDir::new("legacy-memory-import-empty")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("skills"))?;
+
+        let tempdb = TestDir::new("legacy-memory-import-empty-db")?;
+        let db = StateStore::open(&tempdb.path().join("state.db"))?;
+        let report = import_legacy_memory(&db, &config::Config::default(), root, 10)?;
+
+        assert_eq!(report.connectors_detected, 0);
+        assert_eq!(report.report.connectors_synced, 0);
+        assert_eq!(report.report.records_read, 0);
+        assert_eq!(report.report.entities_upserted, 0);
+        assert_eq!(report.report.observations_added, 0);
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_remote_dispatch_dry_run_reports_ready_disabled_and_invalid_requests(
+    ) -> Result<()> {
+        let tempdir = TestDir::new("legacy-remote-import-dry-run")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("gateway"))?;
+        fs::write(
+            root.join("gateway/dispatch.json"),
+            serde_json::json!({
+                "requests": [
+                    {
+                        "name": "route-account-recovery",
+                        "task": "Handle account recovery triage",
+                        "priority": "high",
+                        "agent": "codex",
+                        "project": "ecc-tools",
+                        "task_group": "recovery",
+                        "use_worktree": false
+                    },
+                    {
+                        "name": "browser-billing-check",
+                        "kind": "computer_use",
+                        "goal": "Verify the billing portal warning banner",
+                        "target_url": "https://ecc.tools/account",
+                        "context": "Use the production account flow",
+                        "priority": "critical"
+                    },
+                    {
+                        "name": "paused-remote",
+                        "task": "Do not migrate this now",
+                        "disabled": true
+                    },
+                    {
+                        "name": "broken-remote",
+                        "kind": "computer_use",
+                        "context": "Missing goal"
+                    }
+                ]
+            })
+            .to_string(),
+        )?;
+
+        let tempdb = TestDir::new("legacy-remote-import-dry-run-db")?;
+        let db = StateStore::open(&tempdb.path().join("state.db"))?;
+        let report = import_legacy_remote_dispatch(&db, &Config::default(), root, true)?;
+
+        assert!(report.dry_run);
+        assert_eq!(report.requests_detected, 4);
+        assert_eq!(report.ready_requests, 2);
+        assert_eq!(report.imported_requests, 0);
+        assert_eq!(report.disabled_requests, 1);
+        assert_eq!(report.invalid_requests, 1);
+        assert_eq!(report.skipped_requests, 0);
+        assert_eq!(report.requests.len(), 4);
+        assert!(report.requests.iter().any(|request| request.command_snippet.as_deref()
+            == Some("ecc remote add --task \"Handle account recovery triage\" --priority high --agent \"codex\" --no-worktree --project \"ecc-tools\" --task-group \"recovery\"")));
+        assert!(report.requests.iter().any(|request| request.command_snippet.as_deref()
+            == Some("ecc remote computer-use --goal \"Verify the billing portal warning banner\" --target-url \"https://ecc.tools/account\" --context \"Use the production account flow\" --priority critical")));
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_remote_dispatch_creates_real_pending_requests() -> Result<()> {
+        let tempdir = TestDir::new("legacy-remote-import-live")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("gateway"))?;
+        fs::write(
+            root.join("gateway/dispatch.jsonl"),
+            [
+                serde_json::json!({
+                    "name": "route-account-recovery",
+                    "task": "Handle account recovery triage",
+                    "priority": "high",
+                    "agent": "codex",
+                    "project": "ecc-tools",
+                    "task_group": "recovery",
+                    "use_worktree": false
+                })
+                .to_string(),
+                serde_json::json!({
+                    "name": "browser-billing-check",
+                    "kind": "computer_use",
+                    "goal": "Verify the billing portal warning banner",
+                    "target_url": "https://ecc.tools/account",
+                    "context": "Use the production account flow",
+                    "priority": "critical",
+                    "project": "remote-ops",
+                    "task_group": "browser"
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )?;
+
+        let target_repo = tempdir.path().join("target");
+        fs::create_dir_all(&target_repo)?;
+        fs::write(target_repo.join(".gitignore"), "target\n")?;
+
+        let tempdb = TestDir::new("legacy-remote-import-live-db")?;
+        let db = StateStore::open(&tempdb.path().join("state.db"))?;
+        struct CurrentDirGuard(PathBuf);
+        impl Drop for CurrentDirGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.0);
+            }
+        }
+        let _cwd_guard = CurrentDirGuard(std::env::current_dir()?);
+        std::env::set_current_dir(&target_repo)?;
+
+        let report = import_legacy_remote_dispatch(&db, &Config::default(), root, false)?;
+
+        assert!(!report.dry_run);
+        assert_eq!(report.ready_requests, 2);
+        assert_eq!(report.imported_requests, 2);
+        assert_eq!(
+            report.requests[0].status,
+            LegacyRemoteImportRequestStatus::Imported
+        );
+        assert!(report
+            .requests
+            .iter()
+            .all(|request| request.imported_request_id.is_some()));
+
+        let requests = db.list_pending_remote_dispatch_requests(10)?;
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].request_kind,
+            session::RemoteDispatchKind::ComputerUse
+        );
+        assert_eq!(requests[0].priority, comms::TaskPriority::Critical);
+        assert_eq!(requests[0].project, "remote-ops");
+        assert_eq!(requests[0].task_group, "browser");
+        assert_eq!(
+            requests[0].target_url.as_deref(),
+            Some("https://ecc.tools/account")
+        );
+        assert!(requests[0].task.contains("Computer-use task."));
+        assert_eq!(
+            requests[1].request_kind,
+            session::RemoteDispatchKind::Standard
+        );
+        assert_eq!(requests[1].priority, comms::TaskPriority::High);
+        assert_eq!(requests[1].agent_type, "codex");
+        assert_eq!(requests[1].project, "ecc-tools");
+        assert_eq!(requests[1].task_group, "recovery");
+        assert!(!requests[1].use_worktree);
+        assert_eq!(requests[1].task, "Handle account recovery triage");
+        assert_eq!(
+            requests[1].working_dir.canonicalize()?,
+            target_repo.canonicalize()?
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_migration_scaffold_writes_plan_and_config_files() -> Result<()> {
+        let tempdir = TestDir::new("legacy-migration-scaffold")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("workspace/notes"))?;
+        fs::create_dir_all(root.join("skills/ecc-imports"))?;
+        fs::write(root.join("config.yaml"), "model: claude\n")?;
+        fs::write(root.join("workspace/notes/recovery.md"), "# recovery\n")?;
+        fs::write(root.join("skills/ecc-imports/triage.md"), "# triage\n")?;
+
+        let audit = build_legacy_migration_audit_report(root)?;
+        let plan = build_legacy_migration_plan_report(&audit);
+        let output_dir = root.join("out");
+        let report = write_legacy_migration_scaffold(&plan, &output_dir)?;
+
+        assert_eq!(report.steps_scaffolded, plan.steps.len());
+        assert_eq!(report.files_written.len(), 2);
+
+        let plan_text = fs::read_to_string(output_dir.join("migration-plan.md"))?;
+        let config_text = fs::read_to_string(output_dir.join("ecc2.migration.toml"))?;
+        assert!(plan_text.contains("Legacy migration plan"));
+        assert!(config_text.contains("[memory_connectors.hermes_workspace]"));
+        assert!(config_text.contains("[orchestration_templates.legacy_workflow]"));
+
+        Ok(())
     }
 
     #[test]

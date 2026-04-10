@@ -3018,6 +3018,7 @@ fn build_agent_command(
     if let Some(runner) = cfg.harness_runner(&SessionHarnessInfo::runner_key(agent_type)) {
         return build_configured_harness_command(
             runner,
+            agent_type,
             agent_program,
             task,
             session_id,
@@ -3028,7 +3029,7 @@ fn build_agent_command(
 
     let task = normalize_task_for_harness(harness, task, profile);
     let mut command = Command::new(agent_program);
-    command.env("ECC_SESSION_ID", session_id);
+    apply_shared_harness_runtime_env(&mut command, agent_type, session_id, working_dir, profile);
     match harness {
         HarnessKind::Claude => {
             command
@@ -3125,6 +3126,7 @@ fn build_agent_command(
 
 fn build_configured_harness_command(
     runner: &crate::config::HarnessRunnerConfig,
+    agent_type: &str,
     agent_program: &Path,
     task: &str,
     session_id: &str,
@@ -3132,7 +3134,7 @@ fn build_configured_harness_command(
     profile: Option<&SessionAgentProfile>,
 ) -> Command {
     let mut command = Command::new(agent_program);
-    command.env("ECC_SESSION_ID", session_id);
+    apply_shared_harness_runtime_env(&mut command, agent_type, session_id, working_dir, profile);
     for (key, value) in &runner.env {
         if !value.trim().is_empty() {
             command.env(key, value);
@@ -3209,6 +3211,125 @@ fn build_configured_harness_command(
         .current_dir(working_dir)
         .stdin(Stdio::null());
     command
+}
+
+fn apply_shared_harness_runtime_env(
+    command: &mut Command,
+    agent_type: &str,
+    session_id: &str,
+    working_dir: &Path,
+    profile: Option<&SessionAgentProfile>,
+) {
+    let harness_label = SessionHarnessInfo::runner_key(agent_type);
+    command.env("ECC_SESSION_ID", session_id);
+    command.env("ECC_HARNESS", &harness_label);
+    command.env("ECC_WORKING_DIR", working_dir);
+    command.env("ECC_PROJECT_DIR", working_dir);
+    command.env("CLAUDE_SESSION_ID", session_id);
+    command.env("CLAUDE_PROJECT_DIR", working_dir);
+    command.env("CLAUDE_CODE_ENTRYPOINT", "cli");
+    if let Some(package_manager) = resolve_project_package_manager(working_dir) {
+        command.env("CLAUDE_PACKAGE_MANAGER", package_manager);
+        command.env("CLAUDE_CODE_PACKAGE_MANAGER", package_manager);
+    }
+    if let Some(model) = profile.and_then(|profile| profile.model.as_ref()) {
+        command.env("CLAUDE_MODEL", model);
+    }
+    if let Some(plugin_root) = resolve_ecc_plugin_root() {
+        command.env("ECC_PLUGIN_ROOT", &plugin_root);
+        command.env("CLAUDE_PLUGIN_ROOT", &plugin_root);
+    }
+}
+
+fn resolve_ecc_plugin_root() -> Option<PathBuf> {
+    let mut seeds = Vec::new();
+    if let Ok(current_exe) = std::env::current_exe() {
+        seeds.push(current_exe);
+    }
+    seeds.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    for seed in seeds {
+        for candidate in seed.ancestors() {
+            if is_ecc_plugin_root(candidate) {
+                return Some(candidate.to_path_buf());
+            }
+        }
+    }
+
+    None
+}
+
+fn is_ecc_plugin_root(candidate: &Path) -> bool {
+    candidate.join("scripts/lib/utils.js").is_file() && candidate.join("hooks/hooks.json").is_file()
+}
+
+fn resolve_project_package_manager(working_dir: &Path) -> Option<&'static str> {
+    if let Ok(package_manager) = std::env::var("CLAUDE_PACKAGE_MANAGER") {
+        if let Some(package_manager) = normalize_package_manager_name(&package_manager) {
+            return Some(package_manager);
+        }
+    }
+
+    read_package_manager_from_json(
+        &working_dir.join(".claude").join("package-manager.json"),
+        "packageManager",
+    )
+    .or_else(|| read_package_manager_from_package_json(&working_dir.join("package.json")))
+    .or_else(|| detect_package_manager_from_lockfile(working_dir))
+    .or_else(|| {
+        dirs::home_dir().and_then(|home_dir| {
+            read_package_manager_from_json(
+                &home_dir.join(".claude").join("package-manager.json"),
+                "packageManager",
+            )
+        })
+    })
+    .or(Some("npm"))
+}
+
+fn read_package_manager_from_json(path: &Path, field_name: &str) -> Option<&'static str> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value
+        .get(field_name)
+        .and_then(|value| value.as_str())
+        .and_then(normalize_package_manager_name)
+}
+
+fn read_package_manager_from_package_json(path: &Path) -> Option<&'static str> {
+    let package_manager = read_package_manager_from_json(path, "packageManager")?;
+    Some(package_manager)
+}
+
+fn detect_package_manager_from_lockfile(working_dir: &Path) -> Option<&'static str> {
+    [
+        ("pnpm", "pnpm-lock.yaml"),
+        ("bun", "bun.lockb"),
+        ("yarn", "yarn.lock"),
+        ("npm", "package-lock.json"),
+    ]
+    .into_iter()
+    .find_map(|(package_manager, lockfile)| {
+        working_dir
+            .join(lockfile)
+            .is_file()
+            .then_some(package_manager)
+    })
+}
+
+fn normalize_package_manager_name(package_manager: &str) -> Option<&'static str> {
+    let canonical = package_manager
+        .split('@')
+        .next()
+        .unwrap_or(package_manager)
+        .trim();
+    match canonical {
+        "npm" => Some("npm"),
+        "pnpm" => Some("pnpm"),
+        "yarn" => Some("yarn"),
+        "bun" => Some("bun"),
+        _ => None,
+    }
 }
 
 fn normalize_task_for_harness(
@@ -4246,6 +4367,24 @@ mod tests {
                 "System instructions:\nReview thoroughly.\n\nECC execution profile:\n- Allowed tools: Read\n- Disallowed tools: Bash\n- Permission mode: plan\n- Max budget USD: 1.25\n- Token budget: 750\n\nTask:\nreview this change",
             ]
         );
+
+        let envs = command_env_map(&command);
+        assert_eq!(envs.get("ECC_SESSION_ID"), Some(&"sess-1234".to_string()));
+        assert_eq!(
+            envs.get("CLAUDE_SESSION_ID"),
+            Some(&"sess-1234".to_string())
+        );
+        assert_eq!(
+            envs.get("CLAUDE_PROJECT_DIR"),
+            Some(&"/tmp/repo".to_string())
+        );
+        assert_eq!(envs.get("CLAUDE_CODE_ENTRYPOINT"), Some(&"cli".to_string()));
+        assert_eq!(envs.get("ECC_HARNESS"), Some(&"codex".to_string()));
+        assert_eq!(envs.get("CLAUDE_MODEL"), Some(&"gpt-5.4".to_string()));
+        assert!(
+            envs.contains_key("CLAUDE_PLUGIN_ROOT"),
+            "shared compatibility env should expose the ECC plugin root"
+        );
     }
 
     #[test]
@@ -4441,24 +4580,20 @@ mod tests {
                 "System instructions:\nUse repo context carefully.\n\nTask:\nfix callback regression",
             ]
         );
-        let mut envs = command
-            .as_std()
-            .get_envs()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().to_string(),
-                    value.map(|value| value.to_string_lossy().to_string()),
-                )
-            })
-            .collect::<Vec<_>>();
-        envs.sort();
+        let envs = command_env_map(&command);
+        assert_eq!(envs.get("ECC_SESSION_ID"), Some(&"sess-cur1".to_string()));
         assert_eq!(
-            envs,
-            vec![
-                ("ECC_HARNESS".to_string(), Some("cursor".to_string())),
-                ("ECC_SESSION_ID".to_string(), Some("sess-cur1".to_string())),
-            ]
+            envs.get("CLAUDE_SESSION_ID"),
+            Some(&"sess-cur1".to_string())
         );
+        assert_eq!(
+            envs.get("CLAUDE_PROJECT_DIR"),
+            Some(&"/tmp/repo".to_string())
+        );
+        assert_eq!(envs.get("CLAUDE_CODE_ENTRYPOINT"), Some(&"cli".to_string()));
+        assert_eq!(envs.get("ECC_HARNESS"), Some(&"cursor".to_string()));
+        assert_eq!(envs.get("CLAUDE_MODEL"), Some(&"gpt-5.4".to_string()));
+        assert_eq!(envs.get("ECC_PLUGIN_ROOT"), envs.get("CLAUDE_PLUGIN_ROOT"));
     }
 
     #[test]
@@ -4512,6 +4647,69 @@ mod tests {
                 "System instructions:\nUse repo context carefully.\n\nECC execution profile:\n- Additional context dirs: docs, specs\n- Allowed tools: Read\n- Disallowed tools: Bash\n- Permission mode: plan\n- Max budget USD: 2.5\n- Token budget: 900\n\nTask:\nfix callback regression",
             ]
         );
+    }
+
+    #[test]
+    fn build_agent_command_exports_detected_package_manager_env_from_lockfile() -> Result<()> {
+        let tempdir = TestDir::new("manager-package-manager-lockfile")?;
+        let repo_root = tempdir.path().join("repo");
+        fs::create_dir_all(&repo_root)?;
+        write_package_manager_project_files(&repo_root, None, Some("pnpm-lock.yaml"), None)?;
+
+        let cfg = Config::default();
+        let command = build_agent_command(
+            &cfg,
+            "codex",
+            Path::new("codex"),
+            "inspect dependency graph",
+            "sess-pnpm",
+            &repo_root,
+            None,
+        );
+        let envs = command_env_map(&command);
+        assert_eq!(
+            envs.get("CLAUDE_PACKAGE_MANAGER"),
+            Some(&"pnpm".to_string())
+        );
+        assert_eq!(
+            envs.get("CLAUDE_CODE_PACKAGE_MANAGER"),
+            Some(&"pnpm".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_agent_command_prefers_project_package_manager_config_over_lockfile() -> Result<()> {
+        let tempdir = TestDir::new("manager-package-manager-config")?;
+        let repo_root = tempdir.path().join("repo");
+        fs::create_dir_all(&repo_root)?;
+        write_package_manager_project_files(
+            &repo_root,
+            Some("pnpm@9.0.0"),
+            Some("package-lock.json"),
+            Some("yarn"),
+        )?;
+
+        let cfg = Config::default();
+        let command = build_agent_command(
+            &cfg,
+            "codex",
+            Path::new("codex"),
+            "inspect dependency graph",
+            "sess-yarn",
+            &repo_root,
+            None,
+        );
+        let envs = command_env_map(&command);
+        assert_eq!(
+            envs.get("CLAUDE_PACKAGE_MANAGER"),
+            Some(&"yarn".to_string())
+        );
+        assert_eq!(
+            envs.get("CLAUDE_CODE_PACKAGE_MANAGER"),
+            Some(&"yarn".to_string())
+        );
+        Ok(())
     }
 
     #[test]
@@ -4806,7 +5004,7 @@ mod tests {
         let script_path = root.join("fake-claude.sh");
         let log_path = root.join("fake-claude.log");
         let script = format!(
-            "#!/usr/bin/env python3\nimport os\nimport pathlib\nimport signal\nimport sys\nimport time\n\nlog_path = pathlib.Path(r\"{}\")\nlog_path.write_text(os.getcwd() + \"\\n\", encoding=\"utf-8\")\nwith log_path.open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\n    handle.write(\"ECC_SESSION_ID=\" + os.environ.get(\"ECC_SESSION_ID\", \"\") + \"\\n\")\n\ndef handle_term(signum, frame):\n    raise SystemExit(0)\n\nsignal.signal(signal.SIGTERM, handle_term)\nwhile True:\n    time.sleep(0.1)\n",
+            "#!/usr/bin/env python3\nimport os\nimport pathlib\nimport signal\nimport sys\nimport time\n\nlog_path = pathlib.Path(r\"{}\")\nlog_path.write_text(os.getcwd() + \"\\n\", encoding=\"utf-8\")\nwith log_path.open(\"a\", encoding=\"utf-8\") as handle:\n    handle.write(\" \".join(sys.argv[1:]) + \"\\n\")\n    handle.write(\"ECC_SESSION_ID=\" + os.environ.get(\"ECC_SESSION_ID\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_SESSION_ID=\" + os.environ.get(\"CLAUDE_SESSION_ID\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_PROJECT_DIR=\" + os.environ.get(\"CLAUDE_PROJECT_DIR\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_CODE_ENTRYPOINT=\" + os.environ.get(\"CLAUDE_CODE_ENTRYPOINT\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_PACKAGE_MANAGER=\" + os.environ.get(\"CLAUDE_PACKAGE_MANAGER\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_CODE_PACKAGE_MANAGER=\" + os.environ.get(\"CLAUDE_CODE_PACKAGE_MANAGER\", \"\") + \"\\n\")\n    handle.write(\"CLAUDE_PLUGIN_ROOT=\" + os.environ.get(\"CLAUDE_PLUGIN_ROOT\", \"\") + \"\\n\")\n    handle.write(\"ECC_HARNESS=\" + os.environ.get(\"ECC_HARNESS\", \"\") + \"\\n\")\n\ndef handle_term(signum, frame):\n    raise SystemExit(0)\n\nsignal.signal(signal.SIGTERM, handle_term)\nwhile True:\n    time.sleep(0.1)\n",
             log_path.display()
         );
 
@@ -4834,11 +5032,54 @@ mod tests {
         anyhow::bail!("timed out waiting for {}", path.display());
     }
 
+    fn command_env_map(command: &Command) -> BTreeMap<String, String> {
+        command
+            .as_std()
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().to_string(),
+                        value.to_string_lossy().to_string(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn write_package_manager_project_files(
+        repo_root: &Path,
+        package_manager_field: Option<&str>,
+        lockfile_name: Option<&str>,
+        project_config_package_manager: Option<&str>,
+    ) -> Result<()> {
+        let package_json = match package_manager_field {
+            Some(package_manager_field) => format!(
+                "{{\"name\":\"ecc-smoke\",\"packageManager\":\"{package_manager_field}\"}}\n"
+            ),
+            None => "{\"name\":\"ecc-smoke\"}\n".to_string(),
+        };
+        fs::write(repo_root.join("package.json"), package_json)?;
+        if let Some(lockfile_name) = lockfile_name {
+            fs::write(repo_root.join(lockfile_name), "lockfile\n")?;
+        }
+        if let Some(project_config_package_manager) = project_config_package_manager {
+            let claude_dir = repo_root.join(".claude");
+            fs::create_dir_all(&claude_dir)?;
+            fs::write(
+                claude_dir.join("package-manager.json"),
+                format!("{{\"packageManager\":\"{project_config_package_manager}\"}}\n"),
+            )?;
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn create_session_spawns_process_and_marks_session_running() -> Result<()> {
         let tempdir = TestDir::new("manager-create-session")?;
         let repo_root = tempdir.path().join("repo");
         init_git_repo(&repo_root)?;
+        write_package_manager_project_files(&repo_root, None, Some("pnpm-lock.yaml"), None)?;
 
         let cfg = build_config(tempdir.path());
         let db = StateStore::open(&cfg.db_path)?;
@@ -4869,6 +5110,15 @@ mod tests {
         assert!(log.contains("--print"));
         assert!(log.contains("implement lifecycle"));
         assert!(log.contains(&format!("ECC_SESSION_ID={session_id}")));
+        assert!(log.contains(&format!("CLAUDE_SESSION_ID={session_id}")));
+        assert!(log.contains(&format!(
+            "CLAUDE_PROJECT_DIR={}",
+            repo_root.to_string_lossy()
+        )));
+        assert!(log.contains("CLAUDE_CODE_ENTRYPOINT=cli"));
+        assert!(log.contains("CLAUDE_PACKAGE_MANAGER=pnpm"));
+        assert!(log.contains("CLAUDE_CODE_PACKAGE_MANAGER=pnpm"));
+        assert!(log.contains("ECC_HARNESS=claude"));
 
         stop_session_with_options(&db, &session_id, false).await?;
         Ok(())
