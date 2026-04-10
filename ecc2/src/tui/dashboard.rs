@@ -8,7 +8,7 @@ use ratatui::{
     },
 };
 use regex::Regex;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::UNIX_EPOCH;
 use tokio::sync::broadcast;
 
@@ -117,6 +117,7 @@ pub struct Dashboard {
     selected_git_patch_hunk_offsets_split: Vec<usize>,
     selected_git_patch_hunk: usize,
     output_mode: OutputMode,
+    graph_entity_filter: GraphEntityFilter,
     output_filter: OutputFilter,
     output_time_filter: OutputTimeFilter,
     timeline_event_filter: TimelineEventFilter,
@@ -182,10 +183,20 @@ enum Pane {
 enum OutputMode {
     SessionOutput,
     Timeline,
+    ContextGraph,
     WorktreeDiff,
     ConflictProtocol,
     GitStatus,
     GitPatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphEntityFilter {
+    All,
+    Decisions,
+    Files,
+    Functions,
+    Sessions,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,6 +258,12 @@ struct SearchMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct GraphDisplayLine {
+    session_id: String,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PrPromptSpec {
     title: String,
     base_branch: Option<String>,
@@ -273,16 +290,31 @@ struct TimelineEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SpawnRequest {
-    requested_count: usize,
-    task: String,
+enum SpawnRequest {
+    AdHoc {
+        requested_count: usize,
+        task: String,
+    },
+    Template {
+        name: String,
+        task: Option<String>,
+        variables: BTreeMap<String, String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SpawnPlan {
-    requested_count: usize,
-    spawn_count: usize,
-    task: String,
+enum SpawnPlan {
+    AdHoc {
+        requested_count: usize,
+        spawn_count: usize,
+        task: String,
+    },
+    Template {
+        name: String,
+        task: Option<String>,
+        variables: BTreeMap<String, String>,
+        step_count: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -520,6 +552,7 @@ impl Dashboard {
             selected_git_patch_hunk_offsets_split: Vec::new(),
             selected_git_patch_hunk: 0,
             output_mode: OutputMode::SessionOutput,
+            graph_entity_filter: GraphEntityFilter::All,
             output_filter: OutputFilter::All,
             output_time_filter: OutputTimeFilter::AllTime,
             timeline_event_filter: TimelineEventFilter::All,
@@ -802,6 +835,21 @@ impl Dashboard {
                     };
                     (self.output_title(), content)
                 }
+                OutputMode::ContextGraph => {
+                    let lines = self.visible_graph_lines();
+                    let content = if lines.is_empty() {
+                        Text::from(self.empty_graph_message())
+                    } else if self.search_query.is_some() {
+                        self.render_searchable_graph(&lines)
+                    } else {
+                        Text::from(
+                            lines.into_iter()
+                                .map(|line| Line::from(line.text))
+                                .collect::<Vec<_>>(),
+                        )
+                    };
+                    (self.output_title(), content)
+                }
                 OutputMode::WorktreeDiff => {
                     let content = if let Some(patch) = self.selected_diff_patch.as_ref() {
                         build_unified_diff_text(patch, self.theme_palette())
@@ -907,6 +955,25 @@ impl Dashboard {
                 self.timeline_event_filter.title_suffix(),
                 self.output_time_filter.title_suffix()
             );
+        }
+
+        if self.output_mode == OutputMode::ContextGraph {
+            let scope = self.search_scope.title_suffix();
+            let filter = self.graph_entity_filter.title_suffix();
+            let time = self.output_time_filter.title_suffix();
+            if let Some(input) = self.search_input.as_ref() {
+                return format!(" Graph{scope}{filter}{time} /{input}_ ");
+            }
+            if let Some(query) = self.search_query.as_ref() {
+                let total = self.search_matches.len();
+                let current = if total == 0 {
+                    0
+                } else {
+                    self.selected_search_match.min(total.saturating_sub(1)) + 1
+                };
+                return format!(" Graph{scope}{filter}{time} /{query} {current}/{total} ");
+            }
+            return format!(" Graph{scope}{filter}{time} ");
         }
 
         if self.output_mode == OutputMode::WorktreeDiff {
@@ -1101,6 +1168,34 @@ impl Dashboard {
         }
     }
 
+    fn empty_graph_message(&self) -> &'static str {
+        match (
+            self.search_scope,
+            self.graph_entity_filter,
+            self.output_time_filter,
+        ) {
+            (SearchScope::SelectedSession, GraphEntityFilter::All, OutputTimeFilter::AllTime) => {
+                "No graph entities for this session yet."
+            }
+            (_, GraphEntityFilter::Decisions, OutputTimeFilter::AllTime) => {
+                "No decision graph entities in the current scope yet."
+            }
+            (_, GraphEntityFilter::Files, OutputTimeFilter::AllTime) => {
+                "No file graph entities in the current scope yet."
+            }
+            (_, GraphEntityFilter::Functions, OutputTimeFilter::AllTime) => {
+                "No function graph entities in the current scope yet."
+            }
+            (_, GraphEntityFilter::Sessions, OutputTimeFilter::AllTime) => {
+                "No session graph entities in the current scope yet."
+            }
+            (SearchScope::AllSessions, GraphEntityFilter::All, OutputTimeFilter::AllTime) => {
+                "No graph entities across all sessions yet."
+            }
+            (_, _, _) => "No graph entities in the selected filter/time range.",
+        }
+    }
+
     fn render_searchable_output(&self, lines: &[&OutputLine]) -> Text<'static> {
         let Some(query) = self.search_query.as_deref() else {
             return Text::from(
@@ -1126,6 +1221,39 @@ impl Dashboard {
                             .zip(selected_session_id)
                             .map(|(search_match, session_id)| {
                                 search_match.session_id == session_id
+                                    && search_match.line_index == index
+                            })
+                            .unwrap_or(false),
+                        self.theme_palette(),
+                    )
+                })
+            .collect::<Vec<_>>(),
+        )
+    }
+
+    fn render_searchable_graph(&self, lines: &[GraphDisplayLine]) -> Text<'static> {
+        let Some(query) = self.search_query.as_deref() else {
+            return Text::from(
+                lines
+                    .iter()
+                    .map(|line| Line::from(line.text.clone()))
+                    .collect::<Vec<_>>(),
+            );
+        };
+
+        let active_match = self.search_matches.get(self.selected_search_match);
+
+        Text::from(
+            lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| {
+                    highlight_output_line(
+                        &line.text,
+                        query,
+                        active_match
+                            .map(|search_match| {
+                                search_match.session_id == line.session_id
                                     && search_match.line_index == index
                             })
                             .unwrap_or(false),
@@ -1357,7 +1485,7 @@ impl Dashboard {
             "Keyboard Shortcuts:".to_string(),
             "".to_string(),
             "  n       New session".to_string(),
-            "  N       Natural-language multi-agent spawn prompt".to_string(),
+            "  N       Natural-language multi-agent or template spawn prompt".to_string(),
             "  a       Assign follow-up work from selected session".to_string(),
             "  b       Rebalance backed-up delegate handoff backlog for selected lead".to_string(),
             "  B       Rebalance backed-up delegate handoff backlog across lead teams".to_string(),
@@ -1365,10 +1493,11 @@ impl Dashboard {
             "  I       Jump to the next unread approval/conflict target session".to_string(),
             "  g       Auto-dispatch unread handoffs across lead sessions".to_string(),
             "  G       Dispatch then rebalance backlog across lead teams".to_string(),
+            "  K       Toggle selected-session context graph view".to_string(),
             "  h       Collapse the focused non-session pane".to_string(),
             "  H       Restore all collapsed panes".to_string(),
             "  y       Toggle selected-session timeline view".to_string(),
-            "  E       Cycle timeline event filter".to_string(),
+            "  E       Cycle timeline event filter or graph entity filter".to_string(),
             "  v       Toggle selected worktree diff or selected-file patch in output pane"
                 .to_string(),
             "  z       Toggle selected worktree git status in output pane".to_string(),
@@ -1381,7 +1510,7 @@ impl Dashboard {
                 .to_string(),
             "  e       Cycle output content filter: all/errors/tool calls/file changes".to_string(),
             "  f       Cycle output or timeline time range between all/15m/1h/24h".to_string(),
-            "  A       Toggle search or timeline scope between selected session and all sessions"
+            "  A       Toggle search, graph, or timeline scope between selected session and all sessions"
                 .to_string(),
             "  o       Toggle search agent filter between all agents and selected agent type"
                 .to_string(),
@@ -1415,7 +1544,7 @@ impl Dashboard {
             "  k/↑     Scroll up".to_string(),
             "  [ or ]  Focus previous/next delegate in lead Metrics board".to_string(),
             "  Enter   Open focused delegate from lead Metrics board".to_string(),
-            "  /       Search current session output".to_string(),
+            "  /       Search session output or graph lines".to_string(),
             "  n/N     Next/previous search match when search is active".to_string(),
             "  Esc     Clear active search or cancel search input".to_string(),
             "  +/=     Increase pane size and persist it".to_string(),
@@ -2094,6 +2223,11 @@ impl Dashboard {
                 self.set_operator_note("showing session output".to_string());
             }
             OutputMode::Timeline => {
+                self.output_mode = OutputMode::SessionOutput;
+                self.reset_output_view();
+                self.set_operator_note("showing session output".to_string());
+            }
+            OutputMode::ContextGraph => {
                 self.output_mode = OutputMode::SessionOutput;
                 self.reset_output_view();
                 self.set_operator_note("showing session output".to_string());
@@ -3042,6 +3176,10 @@ impl Dashboard {
         self.search_query.is_some()
     }
 
+    pub fn is_context_graph_mode(&self) -> bool {
+        self.output_mode == OutputMode::ContextGraph
+    }
+
     pub fn has_active_completion_popup(&self) -> bool {
         self.active_completion_popup.is_some()
     }
@@ -3062,7 +3200,7 @@ impl Dashboard {
 
         self.spawn_input = Some(self.spawn_prompt_seed());
         self.set_operator_note(
-            "spawn mode | try: give me 3 agents working on fix flaky tests".to_string(),
+            "spawn mode | try: give me 3 agents working on fix flaky tests | or: template feature_development for fix flaky tests".to_string(),
         );
     }
 
@@ -3077,9 +3215,27 @@ impl Dashboard {
             return;
         }
 
+        if self.output_mode == OutputMode::ContextGraph {
+            self.search_scope = self.search_scope.next();
+            self.recompute_search_matches();
+            self.sync_output_scroll(self.last_output_height.max(1));
+
+            if self.search_query.is_some() {
+                self.set_operator_note(format!(
+                    "graph scope set to {} | {} match(es)",
+                    self.search_scope.label(),
+                    self.search_matches.len()
+                ));
+            } else {
+                self.set_operator_note(format!("graph scope set to {}", self.search_scope.label()));
+            }
+            return;
+        }
+
         if self.output_mode != OutputMode::SessionOutput {
             self.set_operator_note(
-                "scope toggle is only available in session output or timeline view".to_string(),
+                "scope toggle is only available in session output, graph, or timeline view"
+                    .to_string(),
             );
             return;
         }
@@ -3139,13 +3295,20 @@ impl Dashboard {
             return;
         }
 
-        if self.output_mode != OutputMode::SessionOutput {
-            self.set_operator_note("search is only available in session output view".to_string());
+        if !matches!(self.output_mode, OutputMode::SessionOutput | OutputMode::ContextGraph) {
+            self.set_operator_note(
+                "search is only available in session output or graph view".to_string(),
+            );
             return;
         }
 
         self.search_input = Some(self.search_query.clone().unwrap_or_default());
-        self.set_operator_note("search mode | type a query and press Enter".to_string());
+        let mode = if self.output_mode == OutputMode::ContextGraph {
+            "graph search"
+        } else {
+            "search"
+        };
+        self.set_operator_note(format!("{mode} mode | type a query and press Enter"));
     }
 
     pub fn push_input_char(&mut self, ch: char) {
@@ -3312,10 +3475,20 @@ impl Dashboard {
         self.search_query = Some(query.clone());
         self.recompute_search_matches();
         if self.search_matches.is_empty() {
-            self.set_operator_note(format!("search /{query} found no matches"));
+            let mode = if self.output_mode == OutputMode::ContextGraph {
+                "graph search"
+            } else {
+                "search"
+            };
+            self.set_operator_note(format!("{mode} /{query} found no matches"));
         } else {
+            let mode = if self.output_mode == OutputMode::ContextGraph {
+                "graph search"
+            } else {
+                "search"
+            };
             self.set_operator_note(format!(
-                "search /{query} matched {} line(s) across {} session(s) | n/N navigate matches",
+                "{mode} /{query} matched {} line(s) across {} session(s) | n/N navigate matches",
                 self.search_matches.len(),
                 self.search_match_session_count()
             ));
@@ -3419,64 +3592,96 @@ impl Dashboard {
         let agent = self.cfg.default_agent.clone();
         let mut created_ids = Vec::new();
 
-        for task in expand_spawn_tasks(&plan.task, plan.spawn_count) {
-            let session_id = match manager::create_session_with_grouping(
+        match &plan {
+            SpawnPlan::AdHoc {
+                requested_count: _,
+                spawn_count,
+                task,
+            } => {
+                for task in expand_spawn_tasks(task, *spawn_count) {
+                    let session_id = match manager::create_session_with_grouping(
+                        &self.db,
+                        &self.cfg,
+                        &task,
+                        &agent,
+                        self.cfg.auto_create_worktrees,
+                        source_grouping.clone(),
+                    )
+                    .await
+                    {
+                        Ok(session_id) => session_id,
+                        Err(error) => {
+                            let preferred_selection =
+                                post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
+                            self.refresh_after_spawn(preferred_selection.as_deref());
+                            let mut summary = if created_ids.is_empty() {
+                                format!("spawn failed: {error}")
+                            } else {
+                                format!(
+                                    "spawn partially completed: {} of {} queued before failure: {error}",
+                                    created_ids.len(),
+                                    spawn_count
+                                )
+                            };
+                            if let Some(layout_note) =
+                                self.auto_split_layout_after_spawn(created_ids.len())
+                            {
+                                summary.push_str(" | ");
+                                summary.push_str(&layout_note);
+                            }
+                            self.set_operator_note(summary);
+                            return;
+                        }
+                    };
+
+                    if let (Some(source_id), Some(task), Some(context)) = (
+                        source_session_id.as_ref(),
+                        source_task.as_ref(),
+                        handoff_context.as_ref(),
+                    ) {
+                        if let Err(error) = comms::send(
+                            &self.db,
+                            source_id,
+                            &session_id,
+                            &comms::MessageType::TaskHandoff {
+                                task: task.clone(),
+                                context: context.clone(),
+                            },
+                        ) {
+                            tracing::warn!(
+                                "Failed to send handoff from session {} to {}: {error}",
+                                source_id,
+                                session_id
+                            );
+                        }
+                    }
+
+                    created_ids.push(session_id);
+                }
+            }
+            SpawnPlan::Template {
+                name,
+                task,
+                variables,
+                ..
+            } => match manager::launch_orchestration_template(
                 &self.db,
                 &self.cfg,
-                &task,
-                &agent,
-                self.cfg.auto_create_worktrees,
-                source_grouping.clone(),
+                name,
+                source_session_id.as_deref(),
+                task.as_deref(),
+                variables.clone(),
             )
             .await
             {
-                Ok(session_id) => session_id,
+                Ok(outcome) => {
+                    created_ids.extend(outcome.created.into_iter().map(|step| step.session_id));
+                }
                 Err(error) => {
-                    let preferred_selection =
-                        post_spawn_selection_id(source_session_id.as_deref(), &created_ids);
-                    self.refresh_after_spawn(preferred_selection.as_deref());
-                    let mut summary = if created_ids.is_empty() {
-                        format!("spawn failed: {error}")
-                    } else {
-                        format!(
-                            "spawn partially completed: {} of {} queued before failure: {error}",
-                            created_ids.len(),
-                            plan.spawn_count
-                        )
-                    };
-                    if let Some(layout_note) = self.auto_split_layout_after_spawn(created_ids.len())
-                    {
-                        summary.push_str(" | ");
-                        summary.push_str(&layout_note);
-                    }
-                    self.set_operator_note(summary);
+                    self.set_operator_note(format!("template launch failed: {error}"));
                     return;
                 }
-            };
-
-            if let (Some(source_id), Some(task), Some(context)) = (
-                source_session_id.as_ref(),
-                source_task.as_ref(),
-                handoff_context.as_ref(),
-            ) {
-                if let Err(error) = comms::send(
-                    &self.db,
-                    source_id,
-                    &session_id,
-                    &comms::MessageType::TaskHandoff {
-                        task: task.clone(),
-                        context: context.clone(),
-                    },
-                ) {
-                    tracing::warn!(
-                        "Failed to send handoff from session {} to {}: {error}",
-                        source_id,
-                        session_id
-                    );
-                }
-            }
-
-            created_ids.push(session_id);
+            },
         }
 
         let preferred_selection =
@@ -3504,7 +3709,12 @@ impl Dashboard {
         self.search_matches.clear();
         self.selected_search_match = 0;
         if had_query || had_input {
-            self.set_operator_note("cleared output search".to_string());
+            let mode = if self.output_mode == OutputMode::ContextGraph {
+                "graph search"
+            } else {
+                "output search"
+            };
+            self.set_operator_note(format!("cleared {mode}"));
         }
     }
 
@@ -3554,23 +3764,27 @@ impl Dashboard {
     pub fn cycle_output_time_filter(&mut self) {
         if !matches!(
             self.output_mode,
-            OutputMode::SessionOutput | OutputMode::Timeline
+            OutputMode::SessionOutput | OutputMode::Timeline | OutputMode::ContextGraph
         ) {
             self.set_operator_note(
-                "time filters are only available in session output or timeline view".to_string(),
+                "time filters are only available in session output, graph, or timeline view"
+                    .to_string(),
             );
             return;
         }
 
         self.output_time_filter = self.output_time_filter.next();
-        if self.output_mode == OutputMode::SessionOutput {
+        if matches!(
+            self.output_mode,
+            OutputMode::SessionOutput | OutputMode::ContextGraph
+        ) {
             self.recompute_search_matches();
         }
         self.sync_output_scroll(self.last_output_height.max(1));
-        let note_prefix = if self.output_mode == OutputMode::Timeline {
-            "timeline range"
-        } else {
-            "output time filter"
+        let note_prefix = match self.output_mode {
+            OutputMode::Timeline => "timeline range",
+            OutputMode::ContextGraph => "graph range",
+            _ => "output time filter",
         };
         self.set_operator_note(format!(
             "{note_prefix} set to {}",
@@ -3591,6 +3805,41 @@ impl Dashboard {
         self.set_operator_note(format!(
             "timeline filter set to {}",
             self.timeline_event_filter.label()
+        ));
+    }
+
+    pub fn toggle_context_graph_mode(&mut self) {
+        match self.output_mode {
+            OutputMode::ContextGraph => {
+                self.output_mode = OutputMode::SessionOutput;
+                self.reset_output_view();
+                self.set_operator_note("showing session output".to_string());
+            }
+            _ => {
+                self.output_mode = OutputMode::ContextGraph;
+                self.selected_pane = Pane::Output;
+                self.output_follow = false;
+                self.output_scroll_offset = 0;
+                self.recompute_search_matches();
+                self.set_operator_note("showing selected session context graph".to_string());
+            }
+        }
+    }
+
+    pub fn cycle_graph_entity_filter(&mut self) {
+        if self.output_mode != OutputMode::ContextGraph {
+            self.set_operator_note(
+                "graph entity filters are only available in context graph view".to_string(),
+            );
+            return;
+        }
+
+        self.graph_entity_filter = self.graph_entity_filter.next();
+        self.recompute_search_matches();
+        self.sync_output_scroll(self.last_output_height.max(1));
+        self.set_operator_note(format!(
+            "graph filter set to {}",
+            self.graph_entity_filter.label()
         ));
     }
 
@@ -4795,6 +5044,97 @@ impl Dashboard {
             .unwrap_or_default()
     }
 
+    fn visible_graph_lines(&self) -> Vec<GraphDisplayLine> {
+        let session_scope = match self.search_scope {
+            SearchScope::SelectedSession => self.selected_session_id(),
+            SearchScope::AllSessions => None,
+        };
+        let entity_type = self.graph_entity_filter.entity_type();
+        let entities = self
+            .db
+            .list_context_entities(session_scope, entity_type, 48)
+            .unwrap_or_default();
+        let show_session_label = self.search_scope == SearchScope::AllSessions;
+
+        entities
+            .into_iter()
+            .filter(|entity| self.output_time_filter.matches_timestamp(entity.updated_at))
+            .flat_map(|entity| self.graph_lines_for_entity(entity, show_session_label))
+            .collect()
+    }
+
+    fn graph_lines_for_entity(
+        &self,
+        entity: crate::session::ContextGraphEntity,
+        show_session_label: bool,
+    ) -> Vec<GraphDisplayLine> {
+        let session_id = entity.session_id.clone().unwrap_or_default();
+        let session_label = if show_session_label {
+            if session_id.is_empty() {
+                "global ".to_string()
+            } else {
+                format!("{} ", format_session_id(&session_id))
+            }
+        } else {
+            String::new()
+        };
+        let entity_title = format!(
+            "[{}] {}{:<8} {}",
+            entity.updated_at.format("%H:%M:%S"),
+            session_label,
+            entity.entity_type,
+            entity.name
+        );
+        let mut lines = vec![GraphDisplayLine {
+            session_id: session_id.clone(),
+            text: entity_title,
+        }];
+
+        if let Some(path) = entity.path.as_ref() {
+            lines.push(GraphDisplayLine {
+                session_id: session_id.clone(),
+                text: format!("               path {}", truncate_for_dashboard(path, 96)),
+            });
+        }
+
+        if !entity.summary.trim().is_empty() {
+            lines.push(GraphDisplayLine {
+                session_id: session_id.clone(),
+                text: format!(
+                    "               summary {}",
+                    truncate_for_dashboard(&entity.summary, 96)
+                ),
+            });
+        }
+
+        if let Ok(Some(detail)) = self.db.get_context_entity_detail(entity.id, 2) {
+            for relation in detail.outgoing {
+                lines.push(GraphDisplayLine {
+                    session_id: session_id.clone(),
+                    text: format!(
+                        "               -> {} {}:{}",
+                        relation.relation_type,
+                        relation.to_entity_type,
+                        truncate_for_dashboard(&relation.to_entity_name, 72)
+                    ),
+                });
+            }
+            for relation in detail.incoming {
+                lines.push(GraphDisplayLine {
+                    session_id: session_id.clone(),
+                    text: format!(
+                        "               <- {} {}:{}",
+                        relation.relation_type,
+                        relation.from_entity_type,
+                        truncate_for_dashboard(&relation.from_entity_name, 72)
+                    ),
+                });
+            }
+        }
+
+        lines
+    }
+
     fn visible_git_status_lines(&self) -> Vec<Line<'static>> {
         self.selected_git_status_entries
             .iter()
@@ -5019,22 +5359,34 @@ impl Dashboard {
             return;
         };
 
-        self.search_matches = self
-            .search_target_session_ids()
-            .into_iter()
-            .flat_map(|session_id| {
-                self.visible_output_lines_for_session(session_id)
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(index, line)| {
-                        regex.is_match(&line.text).then_some(SearchMatch {
-                            session_id: session_id.to_string(),
-                            line_index: index,
-                        })
+        self.search_matches = if self.output_mode == OutputMode::ContextGraph {
+            self.visible_graph_lines()
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, line)| {
+                    regex.is_match(&line.text).then_some(SearchMatch {
+                        session_id: line.session_id,
+                        line_index: index,
                     })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+                })
+                .collect()
+        } else {
+            self.search_target_session_ids()
+                .into_iter()
+                .flat_map(|session_id| {
+                    self.visible_output_lines_for_session(session_id)
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(index, line)| {
+                            regex.is_match(&line.text).then_some(SearchMatch {
+                                session_id: session_id.to_string(),
+                                line_index: index,
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
 
         if self.search_matches.is_empty() {
             self.selected_search_match = 0;
@@ -5053,7 +5405,9 @@ impl Dashboard {
             return;
         };
 
-        if self.selected_session_id() != Some(search_match.session_id.as_str()) {
+        if !search_match.session_id.is_empty()
+            && self.selected_session_id() != Some(search_match.session_id.as_str())
+        {
             self.sync_selection_by_id(Some(&search_match.session_id));
             self.sync_selected_output();
             self.sync_selected_diff();
@@ -5079,8 +5433,13 @@ impl Dashboard {
             self.selected_search_match.min(total.saturating_sub(1)) + 1
         };
 
+        let mode = if self.output_mode == OutputMode::ContextGraph {
+            "graph search"
+        } else {
+            "search"
+        };
         format!(
-            "search /{query} match {current}/{total} | {}",
+            "{mode} /{query} match {current}/{total} | {}",
             self.search_scope.label()
         )
     }
@@ -5088,6 +5447,7 @@ impl Dashboard {
     fn search_match_session_count(&self) -> usize {
         self.search_matches
             .iter()
+            .filter(|search_match| !search_match.session_id.is_empty())
             .map(|search_match| search_match.session_id.as_str())
             .collect::<HashSet<_>>()
             .len()
@@ -5177,6 +5537,8 @@ impl Dashboard {
             self.active_patch_text()
                 .map(|patch| patch.lines().count())
                 .unwrap_or(0)
+        } else if self.output_mode == OutputMode::ContextGraph {
+            self.visible_graph_lines().len()
         } else if self.output_mode == OutputMode::Timeline {
             self.visible_timeline_lines().len()
         } else {
@@ -5392,11 +5754,7 @@ impl Dashboard {
     fn selected_session_metrics_text(&self) -> String {
         if let Some(session) = self.sessions.get(self.selected_session) {
             let metrics = &session.metrics;
-            let selected_profile = self
-                .db
-                .get_session_profile(&session.id)
-                .ok()
-                .flatten();
+            let selected_profile = self.db.get_session_profile(&session.id).ok().flatten();
             let group_peers = self
                 .sessions
                 .iter()
@@ -5433,10 +5791,8 @@ impl Dashboard {
                     ));
                 }
                 if let Some(max_budget_usd) = profile.max_budget_usd {
-                    profile_details.push(format!(
-                        "Profile cost {}",
-                        format_currency(max_budget_usd)
-                    ));
+                    profile_details
+                        .push(format!("Profile cost {}", format_currency(max_budget_usd)));
                 }
                 if !profile.allowed_tools.is_empty() {
                     profile_details.push(format!(
@@ -5958,18 +6314,58 @@ impl Dashboard {
             .max_parallel_sessions
             .saturating_sub(self.active_session_count());
 
-        if available_slots == 0 {
-            return Err(format!(
-                "cannot queue sessions: active session limit reached ({})",
-                self.cfg.max_parallel_sessions
-            ));
-        }
+        match request {
+            SpawnRequest::AdHoc {
+                requested_count,
+                task,
+            } => {
+                if available_slots == 0 {
+                    return Err(format!(
+                        "cannot queue sessions: active session limit reached ({})",
+                        self.cfg.max_parallel_sessions
+                    ));
+                }
 
-        Ok(SpawnPlan {
-            requested_count: request.requested_count,
-            spawn_count: request.requested_count.min(available_slots),
-            task: request.task,
-        })
+                Ok(SpawnPlan::AdHoc {
+                    requested_count,
+                    spawn_count: requested_count.min(available_slots),
+                    task,
+                })
+            }
+            SpawnRequest::Template {
+                name,
+                task,
+                variables,
+            } => {
+                let repo_root = std::env::current_dir().map_err(|error| {
+                    format!("failed to resolve cwd for template preview: {error}")
+                })?;
+                let source_session = self.sessions.get(self.selected_session);
+                let preview_vars = manager::build_template_variables(
+                    &repo_root,
+                    source_session,
+                    task.as_deref(),
+                    variables.clone(),
+                );
+                let template = self
+                    .cfg
+                    .resolve_orchestration_template(&name, &preview_vars)
+                    .map_err(|error| error.to_string())?;
+                if available_slots < template.steps.len() {
+                    return Err(format!(
+                        "template {name} requires {} session slots but only {available_slots} available",
+                        template.steps.len()
+                    ));
+                }
+
+                Ok(SpawnPlan::Template {
+                    name,
+                    task,
+                    variables,
+                    step_count: template.steps.len(),
+                })
+            }
+        }
     }
 
     fn pane_areas(&self, area: Rect) -> PaneAreas {
@@ -6289,6 +6685,10 @@ fn parse_spawn_request(input: &str) -> Result<SpawnRequest, String> {
         return Err("spawn request cannot be empty".to_string());
     }
 
+    if let Some(template_request) = parse_template_spawn_request(trimmed)? {
+        return Ok(template_request);
+    }
+
     let count = Regex::new(r"\b([1-9]\d*)\b")
         .expect("spawn count regex")
         .captures(trimmed)
@@ -6301,10 +6701,64 @@ fn parse_spawn_request(input: &str) -> Result<SpawnRequest, String> {
         return Err("spawn request must include a task description".to_string());
     }
 
-    Ok(SpawnRequest {
+    Ok(SpawnRequest::AdHoc {
         requested_count: count,
         task,
     })
+}
+
+fn parse_template_spawn_request(input: &str) -> Result<Option<SpawnRequest>, String> {
+    let captures = Regex::new(
+        r"(?is)^\s*template\s+(?P<name>[A-Za-z0-9_-]+)(?:\s+for\s+(?P<task>.*?))?(?:\s+with\s+(?P<vars>.+))?\s*$",
+    )
+    .expect("template spawn regex")
+    .captures(input);
+
+    let Some(captures) = captures else {
+        return Ok(None);
+    };
+
+    let name = captures
+        .name("name")
+        .map(|value| value.as_str().trim().to_string())
+        .ok_or_else(|| "template request must include a template name".to_string())?;
+    let task = captures
+        .name("task")
+        .map(|value| value.as_str().trim().to_string())
+        .filter(|value| !value.is_empty());
+    let variables = captures
+        .name("vars")
+        .map(|value| parse_template_request_variables(value.as_str()))
+        .transpose()?
+        .unwrap_or_default();
+
+    Ok(Some(SpawnRequest::Template {
+        name,
+        task,
+        variables,
+    }))
+}
+
+fn parse_template_request_variables(input: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut variables = BTreeMap::new();
+    for entry in input
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (key, value) = entry
+            .split_once('=')
+            .ok_or_else(|| format!("template vars must use key=value form: {entry}"))?;
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() || value.is_empty() {
+            return Err(format!(
+                "template vars must use non-empty key=value form: {entry}"
+            ));
+        }
+        variables.insert(key.to_string(), value.to_string());
+    }
+    Ok(variables)
 }
 
 fn extract_spawn_task(input: &str) -> String {
@@ -6344,14 +6798,33 @@ fn expand_spawn_tasks(task: &str, count: usize) -> Vec<String> {
 }
 
 fn build_spawn_note(plan: &SpawnPlan, created_count: usize, queued_count: usize) -> String {
-    let task = truncate_for_dashboard(&plan.task, 72);
-    let mut note = if plan.spawn_count < plan.requested_count {
-        format!(
-            "spawned {created_count} session(s) for {task} (requested {}, capped at {})",
-            plan.requested_count, plan.spawn_count
-        )
-    } else {
-        format!("spawned {created_count} session(s) for {task}")
+    let mut note = match plan {
+        SpawnPlan::AdHoc {
+            requested_count,
+            spawn_count,
+            task,
+        } => {
+            let task = truncate_for_dashboard(task, 72);
+            if spawn_count < requested_count {
+                format!(
+                    "spawned {created_count} session(s) for {task} (requested {requested_count}, capped at {spawn_count})"
+                )
+            } else {
+                format!("spawned {created_count} session(s) for {task}")
+            }
+        }
+        SpawnPlan::Template {
+            name,
+            task,
+            step_count,
+            ..
+        } => {
+            let scope = task
+                .as_ref()
+                .map(|task| format!(" for {}", truncate_for_dashboard(task, 72)))
+                .unwrap_or_default();
+            format!("launched template {name} ({created_count}/{step_count} step(s)){scope}")
+        }
     };
 
     if queued_count > 0 {
@@ -6543,6 +7016,48 @@ impl TimelineEventFilter {
             Self::ToolCalls => " tool calls",
             Self::FileChanges => " file changes",
             Self::Decisions => " decisions",
+        }
+    }
+}
+
+impl GraphEntityFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Decisions,
+            Self::Decisions => Self::Files,
+            Self::Files => Self::Functions,
+            Self::Functions => Self::Sessions,
+            Self::Sessions => Self::All,
+        }
+    }
+
+    fn entity_type(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Decisions => Some("decision"),
+            Self::Files => Some("file"),
+            Self::Functions => Some("function"),
+            Self::Sessions => Some("session"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all entities",
+            Self::Decisions => "decisions",
+            Self::Files => "files",
+            Self::Functions => "functions",
+            Self::Sessions => "sessions",
+        }
+    }
+
+    fn title_suffix(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Decisions => " decisions",
+            Self::Files => " files",
+            Self::Functions => " functions",
+            Self::Sessions => " sessions",
         }
     }
 }
@@ -9426,6 +9941,187 @@ diff --git a/src/lib.rs b/src/lib.rs\n\
     }
 
     #[test]
+    fn toggle_context_graph_mode_renders_selected_session_entities_and_relations() -> Result<()> {
+        let session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session)?;
+
+        let file = dashboard.db.upsert_context_entity(
+            Some(&session.id),
+            "file",
+            "dashboard.rs",
+            Some("ecc2/src/tui/dashboard.rs"),
+            "dashboard renderer",
+            &std::collections::BTreeMap::new(),
+        )?;
+        let function = dashboard.db.upsert_context_entity(
+            Some(&session.id),
+            "function",
+            "render_output",
+            None,
+            "renders the output pane",
+            &std::collections::BTreeMap::new(),
+        )?;
+        dashboard.db.upsert_context_relation(
+            Some(&session.id),
+            file.id,
+            function.id,
+            "contains",
+            "output rendering path",
+        )?;
+
+        dashboard.toggle_context_graph_mode();
+
+        assert_eq!(dashboard.output_mode, OutputMode::ContextGraph);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("showing selected session context graph")
+        );
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("Graph"));
+        assert!(rendered.contains("dashboard.rs"));
+        assert!(rendered.contains("summary dashboard renderer"));
+        assert!(rendered.contains("-> contains function:render_output"));
+        Ok(())
+    }
+
+    #[test]
+    fn cycle_graph_entity_filter_limits_rendered_entities() -> Result<()> {
+        let session = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![session.clone()], 0);
+        dashboard.db.insert_session(&session)?;
+        dashboard.db.insert_decision(
+            &session.id,
+            "Use sqlite graph sync",
+            &[],
+            "Keeps shared memory queryable",
+        )?;
+        dashboard.db.upsert_context_entity(
+            Some(&session.id),
+            "file",
+            "dashboard.rs",
+            Some("ecc2/src/tui/dashboard.rs"),
+            "dashboard renderer",
+            &std::collections::BTreeMap::new(),
+        )?;
+
+        dashboard.toggle_context_graph_mode();
+        dashboard.cycle_graph_entity_filter();
+
+        assert_eq!(dashboard.graph_entity_filter, GraphEntityFilter::Decisions);
+        assert_eq!(dashboard.output_title(), " Graph decisions ");
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("Use sqlite graph sync"));
+        assert!(!rendered.contains("dashboard.rs"));
+
+        dashboard.cycle_graph_entity_filter();
+        assert_eq!(dashboard.graph_entity_filter, GraphEntityFilter::Files);
+        assert_eq!(dashboard.output_title(), " Graph files ");
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("dashboard.rs"));
+        assert!(!rendered.contains("Use sqlite graph sync"));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_scope_all_sessions_renders_cross_session_entities() -> Result<()> {
+        let focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let review = sample_session(
+            "review-87654321",
+            "reviewer",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![focus.clone(), review.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&review)?;
+        dashboard.db.insert_decision(&focus.id, "Alpha graph path", &[], "planner path")?;
+        dashboard.db.insert_decision(&review.id, "Beta graph path", &[], "review path")?;
+
+        dashboard.toggle_context_graph_mode();
+        dashboard.toggle_search_scope();
+
+        assert_eq!(dashboard.search_scope, SearchScope::AllSessions);
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("graph scope set to all sessions")
+        );
+        assert_eq!(dashboard.output_title(), " Graph all sessions ");
+        let rendered = dashboard.rendered_output_text(180, 30);
+        assert!(rendered.contains("focus-12"));
+        assert!(rendered.contains("review-8"));
+        assert!(rendered.contains("Alpha graph path"));
+        assert!(rendered.contains("Beta graph path"));
+        Ok(())
+    }
+
+    #[test]
+    fn graph_search_matches_and_switches_selected_session() -> Result<()> {
+        let focus = sample_session(
+            "focus-12345678",
+            "planner",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let review = sample_session(
+            "review-87654321",
+            "reviewer",
+            SessionState::Running,
+            None,
+            1,
+            1,
+        );
+        let mut dashboard = test_dashboard(vec![focus.clone(), review.clone()], 0);
+        dashboard.db.insert_session(&focus)?;
+        dashboard.db.insert_session(&review)?;
+        dashboard.db.insert_decision(&focus.id, "alpha local graph", &[], "planner path")?;
+        dashboard.db.insert_decision(&review.id, "alpha remote graph", &[], "review path")?;
+
+        dashboard.toggle_context_graph_mode();
+        dashboard.toggle_search_scope();
+        dashboard.begin_search();
+        for ch in "alpha.*".chars() {
+            dashboard.push_input_char(ch);
+        }
+        dashboard.submit_search();
+
+        assert_eq!(dashboard.search_matches.len(), 2);
+        let first_session = dashboard.selected_session_id().map(str::to_string);
+        dashboard.next_search_match();
+        assert_eq!(
+            dashboard.operator_note.as_deref(),
+            Some("graph search /alpha.* match 2/2 | all sessions")
+        );
+        assert_ne!(dashboard.selected_session_id().map(str::to_string), first_session);
+        Ok(())
+    }
+
+    #[test]
     fn worktree_diff_columns_split_removed_and_added_lines() {
         let patch = "\
 --- Branch diff vs main ---
@@ -11053,7 +11749,7 @@ diff --git a/src/lib.rs b/src/lib.rs
 
         assert_eq!(
             request,
-            SpawnRequest {
+            SpawnRequest::AdHoc {
                 requested_count: 10,
                 task: "stabilize the queue".to_string(),
             }
@@ -11066,9 +11762,29 @@ diff --git a/src/lib.rs b/src/lib.rs
 
         assert_eq!(
             request,
-            SpawnRequest {
+            SpawnRequest::AdHoc {
                 requested_count: 1,
                 task: "stabilize the queue".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_spawn_request_extracts_template_request() {
+        let request = parse_spawn_request(
+            "template feature_development for stabilize auth callback with component=billing, area=oauth",
+        )
+        .expect("template request should parse");
+
+        assert_eq!(
+            request,
+            SpawnRequest::Template {
+                name: "feature_development".to_string(),
+                task: Some("stabilize auth callback".to_string()),
+                variables: BTreeMap::from([
+                    ("area".to_string(), "oauth".to_string()),
+                    ("component".to_string(), "billing".to_string()),
+                ]),
             }
         );
     }
@@ -11090,12 +11806,152 @@ diff --git a/src/lib.rs b/src/lib.rs
 
         assert_eq!(
             plan,
-            SpawnPlan {
+            SpawnPlan::AdHoc {
                 requested_count: 9,
                 spawn_count: 5,
                 task: "ship release notes".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn build_spawn_plan_resolves_template_steps() {
+        let mut dashboard = test_dashboard(Vec::new(), 0);
+        dashboard.cfg.orchestration_templates = BTreeMap::from([(
+            "feature_development".to_string(),
+            crate::config::OrchestrationTemplateConfig {
+                description: None,
+                project: None,
+                task_group: None,
+                agent: Some("claude".to_string()),
+                profile: None,
+                worktree: Some(true),
+                steps: vec![
+                    crate::config::OrchestrationTemplateStepConfig {
+                        name: Some("planner".to_string()),
+                        task: "Plan {{task}}".to_string(),
+                        project: None,
+                        task_group: None,
+                        agent: None,
+                        profile: None,
+                        worktree: None,
+                    },
+                    crate::config::OrchestrationTemplateStepConfig {
+                        name: Some("builder".to_string()),
+                        task: "Build {{task}} in {{component}}".to_string(),
+                        project: None,
+                        task_group: None,
+                        agent: None,
+                        profile: None,
+                        worktree: None,
+                    },
+                ],
+            },
+        )]);
+
+        let plan = dashboard
+            .build_spawn_plan(
+                "template feature_development for stabilize auth callback with component=billing",
+            )
+            .expect("template spawn plan");
+
+        assert_eq!(
+            plan,
+            SpawnPlan::Template {
+                name: "feature_development".to_string(),
+                task: Some("stabilize auth callback".to_string()),
+                variables: BTreeMap::from([("component".to_string(), "billing".to_string(),)]),
+                step_count: 2,
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn submit_spawn_prompt_launches_orchestration_template() -> Result<()> {
+        let tempdir = std::env::temp_dir().join(format!("dashboard-template-{}", Uuid::new_v4()));
+        let repo_root = tempdir.join("repo");
+        init_git_repo(&repo_root)?;
+
+        let original_dir = std::env::current_dir()?;
+        std::env::set_current_dir(&repo_root)?;
+
+        let mut cfg = build_config(&tempdir);
+        cfg.orchestration_templates = BTreeMap::from([(
+            "feature_development".to_string(),
+            crate::config::OrchestrationTemplateConfig {
+                description: None,
+                project: Some("ecc2-smoke".to_string()),
+                task_group: Some("{{task}}".to_string()),
+                agent: Some("claude".to_string()),
+                profile: None,
+                worktree: Some(false),
+                steps: vec![
+                    crate::config::OrchestrationTemplateStepConfig {
+                        name: Some("planner".to_string()),
+                        task: "Plan {{task}}".to_string(),
+                        project: None,
+                        task_group: None,
+                        agent: None,
+                        profile: None,
+                        worktree: None,
+                    },
+                    crate::config::OrchestrationTemplateStepConfig {
+                        name: Some("builder".to_string()),
+                        task: "Build {{task}} in {{component}}".to_string(),
+                        project: None,
+                        task_group: None,
+                        agent: None,
+                        profile: None,
+                        worktree: None,
+                    },
+                ],
+            },
+        )]);
+
+        let db = StateStore::open(&cfg.db_path)?;
+        let mut dashboard = Dashboard::new(db, cfg);
+        dashboard.spawn_input = Some(
+            "template feature_development for stabilize auth callback with component=billing"
+                .to_string(),
+        );
+
+        dashboard.submit_spawn_prompt().await;
+
+        let operator_note = dashboard
+            .operator_note
+            .clone()
+            .expect("template launch should set an operator note");
+        assert!(
+            operator_note.contains(
+                "launched template feature_development (2/2 step(s)) for stabilize auth callback"
+            ),
+            "unexpected operator note: {operator_note}"
+        );
+        assert_eq!(dashboard.sessions.len(), 2);
+        assert!(dashboard
+            .sessions
+            .iter()
+            .all(|session| session.project == "ecc2-smoke"));
+        assert!(dashboard
+            .sessions
+            .iter()
+            .all(|session| session.task_group == "stabilize auth callback"));
+        let tasks = dashboard
+            .sessions
+            .iter()
+            .map(|session| session.task.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            tasks,
+            std::collections::BTreeSet::from([
+                "Build stabilize auth callback in billing",
+                "Plan stabilize auth callback",
+            ])
+        );
+
+        std::env::set_current_dir(original_dir)?;
+        let _ = std::fs::remove_dir_all(&tempdir);
+        Ok(())
     }
 
     #[test]
@@ -13025,6 +13881,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             selected_git_patch_hunk_offsets_split: Vec::new(),
             selected_git_patch_hunk: 0,
             output_mode: OutputMode::SessionOutput,
+            graph_entity_filter: GraphEntityFilter::All,
             output_filter: OutputFilter::All,
             output_time_filter: OutputTimeFilter::AllTime,
             timeline_event_filter: TimelineEventFilter::All,
@@ -13074,6 +13931,7 @@ diff --git a/src/lib.rs b/src/lib.rs
             default_agent: "claude".to_string(),
             default_agent_profile: None,
             agent_profiles: Default::default(),
+            orchestration_templates: Default::default(),
             auto_dispatch_unread_handoffs: false,
             auto_dispatch_limit_per_session: 5,
             auto_create_worktrees: true,
