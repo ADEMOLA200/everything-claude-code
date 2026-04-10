@@ -632,6 +632,57 @@ enum MigrationCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Import safe legacy env/service config context into the ECC2 context graph
+    ImportEnv {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Preview detected importable sources without writing to the ECC2 graph
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum imported records across all synthesized connectors
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scaffold ECC-native orchestration templates from legacy skill markdown
+    ImportSkills {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Directory where imported ECC2 skill artifacts should be written
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scaffold ECC-native templates from legacy tool scripts
+    ImportTools {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Directory where imported ECC2 tool artifacts should be written
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
+    /// Scaffold ECC-native templates from legacy bridge plugins
+    ImportPlugins {
+        /// Path to the legacy Hermes/OpenClaw workspace root
+        #[arg(long)]
+        source: PathBuf,
+        /// Directory where imported ECC2 plugin artifacts should be written
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// Emit machine-readable JSON instead of the human summary
+        #[arg(long)]
+        json: bool,
+    },
     /// Import legacy gateway/dispatch tasks into the ECC2 remote queue
     ImportRemote {
         /// Path to the legacy Hermes/OpenClaw workspace root
@@ -1048,6 +1099,105 @@ struct LegacyMemoryImportReport {
     source: String,
     connectors_detected: usize,
     report: GraphConnectorSyncReport,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LegacyEnvImportSourceStatus {
+    Ready,
+    Imported,
+    ManualOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyEnvImportSourceReport {
+    source_path: String,
+    connector_name: Option<String>,
+    status: LegacyEnvImportSourceStatus,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyEnvImportReport {
+    source: String,
+    dry_run: bool,
+    importable_sources: usize,
+    imported_sources: usize,
+    manual_reentry_sources: usize,
+    connectors_detected: usize,
+    report: GraphConnectorSyncReport,
+    sources: Vec<LegacyEnvImportSourceReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacySkillImportEntry {
+    source_path: String,
+    template_name: String,
+    title: String,
+    summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacySkillImportReport {
+    source: String,
+    output_dir: String,
+    skills_detected: usize,
+    templates_generated: usize,
+    files_written: Vec<String>,
+    skills: Vec<LegacySkillImportEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct LegacySkillTemplateFile {
+    orchestration_templates: BTreeMap<String, config::OrchestrationTemplateConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyToolImportEntry {
+    source_path: String,
+    template_name: String,
+    title: String,
+    summary: String,
+    suggested_surface: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyToolImportReport {
+    source: String,
+    output_dir: String,
+    tools_detected: usize,
+    templates_generated: usize,
+    files_written: Vec<String>,
+    tools: Vec<LegacyToolImportEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct LegacyToolTemplateFile {
+    orchestration_templates: BTreeMap<String, config::OrchestrationTemplateConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyPluginImportEntry {
+    source_path: String,
+    template_name: String,
+    title: String,
+    summary: String,
+    suggested_surface: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct LegacyPluginImportReport {
+    source: String,
+    output_dir: String,
+    plugins_detected: usize,
+    templates_generated: usize,
+    files_written: Vec<String>,
+    plugins: Vec<LegacyPluginImportEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct LegacyPluginTemplateFile {
+    orchestration_templates: BTreeMap<String, config::OrchestrationTemplateConfig>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1886,6 +2036,55 @@ async fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 } else {
                     println!("{}", format_legacy_memory_import_human(&report));
+                }
+            }
+            MigrationCommands::ImportEnv {
+                source,
+                dry_run,
+                limit,
+                json,
+            } => {
+                let report = import_legacy_env_services(&db, &source, dry_run, limit)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_legacy_env_import_human(&report));
+                }
+            }
+            MigrationCommands::ImportSkills {
+                source,
+                output_dir,
+                json,
+            } => {
+                let report = import_legacy_skills(&source, &output_dir)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_legacy_skill_import_human(&report));
+                }
+            }
+            MigrationCommands::ImportTools {
+                source,
+                output_dir,
+                json,
+            } => {
+                let report = import_legacy_tools(&source, &output_dir)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_legacy_tool_import_human(&report));
+                }
+            }
+            MigrationCommands::ImportPlugins {
+                source,
+                output_dir,
+                json,
+            } => {
+                let report = import_legacy_plugins(&source, &output_dir)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    println!("{}", format_legacy_plugin_import_human(&report));
                 }
             }
             MigrationCommands::ImportRemote {
@@ -5050,19 +5249,25 @@ fn build_legacy_migration_next_steps(artifacts: &[LegacyMigrationArtifact]) -> V
     }
     if categories.contains("skills") {
         steps.push(
-            "Translate reusable Hermes/OpenClaw skills into ECC skills or orchestration templates one lane at a time instead of bulk-copying them."
+            "Scaffold translated legacy skills with `ecc migrate import-skills --source <legacy-workspace> --output-dir <dir>`, then promote the reusable ones into ECC skills or orchestration templates one lane at a time instead of bulk-copying them."
                 .to_string(),
         );
     }
-    if categories.contains("tools") || categories.contains("plugins") {
+    if categories.contains("tools") {
         steps.push(
-            "Rebuild valuable tool/plugin wrappers as ECC agents, commands, hooks, or harness runners, keeping only reusable workflow behavior."
+            "Scaffold translated legacy tools with `ecc migrate import-tools --source <legacy-workspace> --output-dir <dir>`, then rebuild the valuable ones as ECC-native commands, hooks, or harness runners instead of shelling back out to the old stack."
+                .to_string(),
+        );
+    }
+    if categories.contains("plugins") {
+        steps.push(
+            "Scaffold translated bridge plugins with `ecc migrate import-plugins --source <legacy-workspace> --output-dir <dir>`, then port the valuable ones into ECC-native hooks, commands, or skills."
                 .to_string(),
         );
     }
     if categories.contains("env_services") {
         steps.push(
-            "Reconfigure credentials locally through Claude connectors, MCP config, OAuth, or local API key setup; do not import raw secret material."
+            "Preview safe env/service context with `ecc migrate import-env --source <legacy-workspace> --dry-run`, then reconfigure credentials locally through Claude connectors, MCP config, OAuth, or local API key setup without importing raw secret material."
                 .to_string(),
         );
     }
@@ -5804,6 +6009,835 @@ fn import_legacy_memory(
     })
 }
 
+fn import_legacy_env_services(
+    db: &session::store::StateStore,
+    source: &Path,
+    dry_run: bool,
+    limit: usize,
+) -> Result<LegacyEnvImportReport> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("Legacy workspace not found: {}", source.display()))?;
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Legacy workspace source must be a directory: {}",
+            source.display()
+        );
+    }
+
+    let env_service_paths = collect_env_service_paths(&source)?;
+    let mut report = LegacyEnvImportReport {
+        source: source.display().to_string(),
+        dry_run,
+        importable_sources: 0,
+        imported_sources: 0,
+        manual_reentry_sources: 0,
+        connectors_detected: 0,
+        report: GraphConnectorSyncReport::default(),
+        sources: Vec::new(),
+    };
+
+    let mut import_cfg = config::Config::default();
+    for relative_path in env_service_paths {
+        if let Some(connector) = build_legacy_env_connector(&source, &relative_path) {
+            report.importable_sources += 1;
+            report.connectors_detected += 1;
+            report.sources.push(LegacyEnvImportSourceReport {
+                source_path: relative_path.clone(),
+                connector_name: Some(connector.0.clone()),
+                status: if dry_run {
+                    LegacyEnvImportSourceStatus::Ready
+                } else {
+                    LegacyEnvImportSourceStatus::Imported
+                },
+                reason: Some("safe dotenv-style import available".to_string()),
+            });
+            import_cfg.memory_connectors.insert(
+                connector.0,
+                config::MemoryConnectorConfig::DotenvFile(connector.1),
+            );
+        } else {
+            report.manual_reentry_sources += 1;
+            report.sources.push(LegacyEnvImportSourceReport {
+                source_path: relative_path,
+                connector_name: None,
+                status: LegacyEnvImportSourceStatus::ManualOnly,
+                reason: Some(
+                    "manual auth/config translation still required; raw secret-bearing config is not imported"
+                        .to_string(),
+                ),
+            });
+        }
+    }
+
+    if dry_run || import_cfg.memory_connectors.is_empty() {
+        return Ok(report);
+    }
+
+    let sync_report = sync_all_memory_connectors(db, &import_cfg, limit)?;
+    report.imported_sources = sync_report.connectors_synced;
+    report.report = sync_report;
+    Ok(report)
+}
+
+fn build_legacy_env_connector(
+    source: &Path,
+    relative_path: &str,
+) -> Option<(String, config::MemoryConnectorDotenvFileConfig)> {
+    let is_importable = matches!(
+        relative_path,
+        ".env" | ".env.local" | ".env.production" | ".envrc"
+    );
+    if !is_importable {
+        return None;
+    }
+
+    let connector_name = format!(
+        "legacy_env_{}",
+        relative_path
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+            .collect::<String>()
+            .trim_matches('_')
+    );
+    Some((
+        connector_name,
+        config::MemoryConnectorDotenvFileConfig {
+            path: source.join(relative_path),
+            session_id: None,
+            default_entity_type: Some("legacy_service_config".to_string()),
+            default_observation_type: Some("legacy_env_context".to_string()),
+            key_prefixes: Vec::new(),
+            include_keys: Vec::new(),
+            exclude_keys: Vec::new(),
+            include_safe_values: true,
+        },
+    ))
+}
+
+fn import_legacy_skills(source: &Path, output_dir: &Path) -> Result<LegacySkillImportReport> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("Legacy workspace not found: {}", source.display()))?;
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Legacy workspace source must be a directory: {}",
+            source.display()
+        );
+    }
+
+    let skills_dir = source.join("skills");
+    let mut report = LegacySkillImportReport {
+        source: source.display().to_string(),
+        output_dir: output_dir.display().to_string(),
+        skills_detected: 0,
+        templates_generated: 0,
+        files_written: Vec::new(),
+        skills: Vec::new(),
+    };
+    if !skills_dir.is_dir() {
+        return Ok(report);
+    }
+
+    let skill_paths = collect_markdown_paths(&skills_dir, true)?;
+    if skill_paths.is_empty() {
+        return Ok(report);
+    }
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create legacy skill output dir {}", output_dir.display()))?;
+
+    let mut templates = BTreeMap::new();
+    for path in skill_paths {
+        let draft = build_legacy_skill_draft(&source, &skills_dir, &path)?;
+        report.skills_detected += 1;
+        report.templates_generated += 1;
+        report.skills.push(LegacySkillImportEntry {
+            source_path: draft.source_path.clone(),
+            template_name: draft.template_name.clone(),
+            title: draft.title.clone(),
+            summary: draft.summary.clone(),
+        });
+        templates.insert(
+            draft.template_name.clone(),
+            config::OrchestrationTemplateConfig {
+                description: Some(format!(
+                    "Migrated legacy skill scaffold from {}",
+                    draft.source_path
+                )),
+                project: Some("legacy-migration".to_string()),
+                task_group: Some("legacy skill".to_string()),
+                agent: Some("claude".to_string()),
+                profile: None,
+                worktree: Some(false),
+                steps: vec![config::OrchestrationTemplateStepConfig {
+                    name: Some("operator".to_string()),
+                    task: format!(
+                        "Use the migrated legacy skill context from {}.\nLegacy skill title: {}\nLegacy summary: {}\nLegacy excerpt:\n{}\nTranslate and run that workflow for {{{{task}}}}.",
+                        draft.source_path, draft.title, draft.summary, draft.excerpt
+                    ),
+                    agent: None,
+                    profile: None,
+                    worktree: Some(false),
+                    project: Some("legacy-migration".to_string()),
+                    task_group: Some("legacy skill".to_string()),
+                }],
+            },
+        );
+    }
+
+    let templates_path = output_dir.join("ecc2.imported-skills.toml");
+    fs::write(
+        &templates_path,
+        toml::to_string_pretty(&LegacySkillTemplateFile {
+            orchestration_templates: templates,
+        })?,
+    )
+    .with_context(|| {
+        format!(
+            "write imported skill templates {}",
+            templates_path.display()
+        )
+    })?;
+    report
+        .files_written
+        .push(templates_path.display().to_string());
+
+    let summary_path = output_dir.join("imported-skills.md");
+    fs::write(
+        &summary_path,
+        format_legacy_skill_import_summary_markdown(&report),
+    )
+    .with_context(|| format!("write imported skill summary {}", summary_path.display()))?;
+    report
+        .files_written
+        .push(summary_path.display().to_string());
+
+    Ok(report)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacySkillDraft {
+    source_path: String,
+    template_name: String,
+    title: String,
+    summary: String,
+    excerpt: String,
+}
+
+fn build_legacy_skill_draft(
+    source: &Path,
+    skills_dir: &Path,
+    path: &Path,
+) -> Result<LegacySkillDraft> {
+    let body = fs::read_to_string(path)
+        .with_context(|| format!("read legacy skill file {}", path.display()))?;
+    let source_path = path
+        .strip_prefix(source)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    let relative_to_skills = path.strip_prefix(skills_dir).unwrap_or(path);
+    let title = extract_legacy_skill_title(relative_to_skills, &body);
+    let summary = extract_legacy_skill_summary(&body).unwrap_or_else(|| title.clone());
+    let excerpt = extract_legacy_skill_excerpt(&body, 8, 600).unwrap_or_else(|| summary.clone());
+    let template_name = slugify_legacy_skill_template_name(relative_to_skills);
+
+    Ok(LegacySkillDraft {
+        source_path,
+        template_name,
+        title,
+        summary,
+        excerpt,
+    })
+}
+
+fn extract_legacy_skill_title(relative_path: &Path, body: &str) -> String {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(title) = trimmed.strip_prefix("#") {
+            let title = title.trim();
+            if !title.is_empty() {
+                return title.to_string();
+            }
+        }
+    }
+    relative_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.replace(['-', '_'], " "))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "legacy skill".to_string())
+}
+
+fn extract_legacy_skill_summary(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(ToString::to_string)
+}
+
+fn extract_legacy_skill_excerpt(body: &str, max_lines: usize, max_chars: usize) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut chars = 0usize;
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if chars >= max_chars || lines.len() >= max_lines {
+            break;
+        }
+        let remaining = max_chars.saturating_sub(chars);
+        if remaining == 0 {
+            break;
+        }
+        let truncated = truncate_connector_text(line, remaining);
+        chars += truncated.len();
+        lines.push(truncated);
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn slugify_legacy_skill_template_name(relative_path: &Path) -> String {
+    relative_path
+        .to_string_lossy()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .split('_')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn format_legacy_skill_import_summary_markdown(report: &LegacySkillImportReport) -> String {
+    let mut lines = vec![
+        "# Imported legacy skills".to_string(),
+        String::new(),
+        format!("- Source: `{}`", report.source),
+        format!("- Output dir: `{}`", report.output_dir),
+        format!("- Skills detected: {}", report.skills_detected),
+        format!("- Templates generated: {}", report.templates_generated),
+        String::new(),
+    ];
+
+    if report.skills.is_empty() {
+        lines.push("No legacy skill markdown files were detected.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("## Skills".to_string());
+    lines.push(String::new());
+    for skill in &report.skills {
+        lines.push(format!(
+            "- `{}` -> `{}`",
+            skill.source_path, skill.template_name
+        ));
+        lines.push(format!("  - Title: {}", skill.title));
+        lines.push(format!("  - Summary: {}", skill.summary));
+    }
+
+    lines.join("\n")
+}
+
+fn import_legacy_tools(source: &Path, output_dir: &Path) -> Result<LegacyToolImportReport> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("Legacy workspace not found: {}", source.display()))?;
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Legacy workspace source must be a directory: {}",
+            source.display()
+        );
+    }
+
+    let tools_dir = source.join("tools");
+    let mut report = LegacyToolImportReport {
+        source: source.display().to_string(),
+        output_dir: output_dir.display().to_string(),
+        tools_detected: 0,
+        templates_generated: 0,
+        files_written: Vec::new(),
+        tools: Vec::new(),
+    };
+    if !tools_dir.is_dir() {
+        return Ok(report);
+    }
+
+    let tool_paths = collect_legacy_tool_paths(&tools_dir)?;
+    if tool_paths.is_empty() {
+        return Ok(report);
+    }
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create legacy tool output dir {}", output_dir.display()))?;
+
+    let mut templates = BTreeMap::new();
+    for path in tool_paths {
+        let draft = build_legacy_tool_draft(&source, &tools_dir, &path)?;
+        report.tools_detected += 1;
+        report.templates_generated += 1;
+        report.tools.push(LegacyToolImportEntry {
+            source_path: draft.source_path.clone(),
+            template_name: draft.template_name.clone(),
+            title: draft.title.clone(),
+            summary: draft.summary.clone(),
+            suggested_surface: draft.suggested_surface.clone(),
+        });
+        templates.insert(
+            draft.template_name.clone(),
+            config::OrchestrationTemplateConfig {
+                description: Some(format!(
+                    "Migrated legacy tool scaffold from {}",
+                    draft.source_path
+                )),
+                project: Some("legacy-migration".to_string()),
+                task_group: Some("legacy tool".to_string()),
+                agent: Some("claude".to_string()),
+                profile: None,
+                worktree: Some(false),
+                steps: vec![config::OrchestrationTemplateStepConfig {
+                    name: Some("operator".to_string()),
+                    task: format!(
+                        "Use the migrated legacy tool context from {}.\nSuggested ECC target surface: {}\nLegacy tool title: {}\nLegacy summary: {}\nLegacy excerpt:\n{}\nRebuild or wrap that behavior as an ECC-native {} for {{{{task}}}}.",
+                        draft.source_path,
+                        draft.suggested_surface,
+                        draft.title,
+                        draft.summary,
+                        draft.excerpt,
+                        draft.suggested_surface
+                    ),
+                    agent: None,
+                    profile: None,
+                    worktree: Some(false),
+                    project: Some("legacy-migration".to_string()),
+                    task_group: Some("legacy tool".to_string()),
+                }],
+            },
+        );
+    }
+
+    let templates_path = output_dir.join("ecc2.imported-tools.toml");
+    fs::write(
+        &templates_path,
+        toml::to_string_pretty(&LegacyToolTemplateFile {
+            orchestration_templates: templates,
+        })?,
+    )
+    .with_context(|| format!("write imported tool templates {}", templates_path.display()))?;
+    report
+        .files_written
+        .push(templates_path.display().to_string());
+
+    let summary_path = output_dir.join("imported-tools.md");
+    fs::write(
+        &summary_path,
+        format_legacy_tool_import_summary_markdown(&report),
+    )
+    .with_context(|| format!("write imported tool summary {}", summary_path.display()))?;
+    report
+        .files_written
+        .push(summary_path.display().to_string());
+
+    Ok(report)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyToolDraft {
+    source_path: String,
+    template_name: String,
+    title: String,
+    summary: String,
+    excerpt: String,
+    suggested_surface: String,
+}
+
+fn collect_legacy_tool_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    collect_legacy_tool_paths_inner(root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_legacy_tool_paths_inner(root: &Path, paths: &mut Vec<PathBuf>) -> Result<()> {
+    let mut entries = fs::read_dir(root)
+        .with_context(|| format!("read legacy tools dir {}", root.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("read entries under {}", root.display()))?;
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("read file type for {}", path.display()))?;
+        if file_type.is_dir() {
+            collect_legacy_tool_paths_inner(&path, paths)?;
+            continue;
+        }
+        if file_type.is_file() && is_legacy_tool_candidate(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn is_legacy_tool_candidate(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("py" | "js" | "ts" | "mjs" | "cjs" | "sh" | "bash" | "zsh" | "rb" | "pl" | "php")
+    ) || path.extension().is_none()
+}
+
+fn build_legacy_tool_draft(
+    source: &Path,
+    tools_dir: &Path,
+    path: &Path,
+) -> Result<LegacyToolDraft> {
+    let body =
+        fs::read(path).with_context(|| format!("read legacy tool file {}", path.display()))?;
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let source_path = path
+        .strip_prefix(source)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    let relative_to_tools = path.strip_prefix(tools_dir).unwrap_or(path);
+    let title = extract_legacy_tool_title(relative_to_tools);
+    let summary = extract_legacy_tool_summary(&body).unwrap_or_else(|| title.clone());
+    let excerpt = extract_legacy_tool_excerpt(&body, 10, 700).unwrap_or_else(|| summary.clone());
+    let template_name = format!(
+        "tool_{}",
+        slugify_legacy_skill_template_name(relative_to_tools)
+    );
+    let suggested_surface = classify_legacy_tool_surface(&source_path, &body).to_string();
+
+    Ok(LegacyToolDraft {
+        source_path,
+        template_name,
+        title,
+        summary,
+        excerpt,
+        suggested_surface,
+    })
+}
+
+fn extract_legacy_tool_title(relative_path: &Path) -> String {
+    relative_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .map(|value| value.replace(['-', '_'], " "))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "legacy tool".to_string())
+}
+
+fn extract_legacy_tool_summary(body: &str) -> Option<String> {
+    body.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("#!"))
+        .find_map(|line| {
+            let stripped = line
+                .trim_start_matches("#")
+                .trim_start_matches("//")
+                .trim_start_matches("--")
+                .trim_start_matches("/*")
+                .trim_start_matches('*')
+                .trim();
+            if stripped.is_empty() {
+                None
+            } else {
+                Some(truncate_connector_text(stripped, 160))
+            }
+        })
+}
+
+fn extract_legacy_tool_excerpt(body: &str, max_lines: usize, max_chars: usize) -> Option<String> {
+    let mut lines = Vec::new();
+    let mut chars = 0usize;
+    for line in body.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if line.starts_with("#!") {
+            continue;
+        }
+        if chars >= max_chars || lines.len() >= max_lines {
+            break;
+        }
+        let remaining = max_chars.saturating_sub(chars);
+        if remaining == 0 {
+            break;
+        }
+        let truncated = truncate_connector_text(line, remaining);
+        chars += truncated.len();
+        lines.push(truncated);
+    }
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
+fn classify_legacy_tool_surface(source_path: &str, body: &str) -> &'static str {
+    let source_lower = source_path.to_ascii_lowercase();
+    let body_lower = body.to_ascii_lowercase();
+    if source_lower.contains("hook")
+        || body_lower.contains("pretooluse")
+        || body_lower.contains("posttooluse")
+        || body_lower.contains("notification")
+    {
+        "hook"
+    } else if source_lower.contains("runner")
+        || source_lower.contains("agent")
+        || body_lower.contains("session_name_flag")
+        || body_lower.contains("include-directories")
+    {
+        "harness runner"
+    } else {
+        "command"
+    }
+}
+
+fn format_legacy_tool_import_summary_markdown(report: &LegacyToolImportReport) -> String {
+    let mut lines = vec![
+        "# Imported legacy tools".to_string(),
+        String::new(),
+        format!("- Source: `{}`", report.source),
+        format!("- Output dir: `{}`", report.output_dir),
+        format!("- Tools detected: {}", report.tools_detected),
+        format!("- Templates generated: {}", report.templates_generated),
+        String::new(),
+    ];
+
+    if report.tools.is_empty() {
+        lines.push("No legacy tool scripts were detected.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("## Tools".to_string());
+    lines.push(String::new());
+    for tool in &report.tools {
+        lines.push(format!(
+            "- `{}` -> `{}`",
+            tool.source_path, tool.template_name
+        ));
+        lines.push(format!("  - Title: {}", tool.title));
+        lines.push(format!("  - Summary: {}", tool.summary));
+        lines.push(format!("  - Suggested surface: {}", tool.suggested_surface));
+    }
+
+    lines.join("\n")
+}
+
+fn import_legacy_plugins(source: &Path, output_dir: &Path) -> Result<LegacyPluginImportReport> {
+    let source = source
+        .canonicalize()
+        .with_context(|| format!("Legacy workspace not found: {}", source.display()))?;
+    if !source.is_dir() {
+        anyhow::bail!(
+            "Legacy workspace source must be a directory: {}",
+            source.display()
+        );
+    }
+
+    let plugins_dir = source.join("plugins");
+    let mut report = LegacyPluginImportReport {
+        source: source.display().to_string(),
+        output_dir: output_dir.display().to_string(),
+        plugins_detected: 0,
+        templates_generated: 0,
+        files_written: Vec::new(),
+        plugins: Vec::new(),
+    };
+    if !plugins_dir.is_dir() {
+        return Ok(report);
+    }
+
+    let plugin_paths = collect_legacy_tool_paths(&plugins_dir)?;
+    if plugin_paths.is_empty() {
+        return Ok(report);
+    }
+
+    fs::create_dir_all(output_dir)
+        .with_context(|| format!("create legacy plugin output dir {}", output_dir.display()))?;
+
+    let mut templates = BTreeMap::new();
+    for path in plugin_paths {
+        let draft = build_legacy_plugin_draft(&source, &plugins_dir, &path)?;
+        report.plugins_detected += 1;
+        report.templates_generated += 1;
+        report.plugins.push(LegacyPluginImportEntry {
+            source_path: draft.source_path.clone(),
+            template_name: draft.template_name.clone(),
+            title: draft.title.clone(),
+            summary: draft.summary.clone(),
+            suggested_surface: draft.suggested_surface.clone(),
+        });
+        templates.insert(
+            draft.template_name.clone(),
+            config::OrchestrationTemplateConfig {
+                description: Some(format!(
+                    "Migrated legacy plugin scaffold from {}",
+                    draft.source_path
+                )),
+                project: Some("legacy-migration".to_string()),
+                task_group: Some("legacy plugin".to_string()),
+                agent: Some("claude".to_string()),
+                profile: None,
+                worktree: Some(false),
+                steps: vec![config::OrchestrationTemplateStepConfig {
+                    name: Some("operator".to_string()),
+                    task: format!(
+                        "Use the migrated legacy plugin context from {}.\nSuggested ECC target surface: {}\nLegacy plugin title: {}\nLegacy summary: {}\nLegacy excerpt:\n{}\nPort that behavior into an ECC-native {} for {{{{task}}}}.",
+                        draft.source_path,
+                        draft.suggested_surface,
+                        draft.title,
+                        draft.summary,
+                        draft.excerpt,
+                        draft.suggested_surface
+                    ),
+                    agent: None,
+                    profile: None,
+                    worktree: Some(false),
+                    project: Some("legacy-migration".to_string()),
+                    task_group: Some("legacy plugin".to_string()),
+                }],
+            },
+        );
+    }
+
+    let templates_path = output_dir.join("ecc2.imported-plugins.toml");
+    fs::write(
+        &templates_path,
+        toml::to_string_pretty(&LegacyPluginTemplateFile {
+            orchestration_templates: templates,
+        })?,
+    )
+    .with_context(|| {
+        format!(
+            "write imported plugin templates {}",
+            templates_path.display()
+        )
+    })?;
+    report
+        .files_written
+        .push(templates_path.display().to_string());
+
+    let summary_path = output_dir.join("imported-plugins.md");
+    fs::write(
+        &summary_path,
+        format_legacy_plugin_import_summary_markdown(&report),
+    )
+    .with_context(|| format!("write imported plugin summary {}", summary_path.display()))?;
+    report
+        .files_written
+        .push(summary_path.display().to_string());
+
+    Ok(report)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LegacyPluginDraft {
+    source_path: String,
+    template_name: String,
+    title: String,
+    summary: String,
+    excerpt: String,
+    suggested_surface: String,
+}
+
+fn build_legacy_plugin_draft(
+    source: &Path,
+    plugins_dir: &Path,
+    path: &Path,
+) -> Result<LegacyPluginDraft> {
+    let body =
+        fs::read(path).with_context(|| format!("read legacy plugin file {}", path.display()))?;
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let source_path = path
+        .strip_prefix(source)
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    let relative_to_plugins = path.strip_prefix(plugins_dir).unwrap_or(path);
+    let title = extract_legacy_tool_title(relative_to_plugins);
+    let summary = extract_legacy_tool_summary(&body).unwrap_or_else(|| title.clone());
+    let excerpt = extract_legacy_tool_excerpt(&body, 10, 700).unwrap_or_else(|| summary.clone());
+    let template_name = format!(
+        "plugin_{}",
+        slugify_legacy_skill_template_name(relative_to_plugins)
+    );
+    let suggested_surface = classify_legacy_plugin_surface(&source_path, &body).to_string();
+
+    Ok(LegacyPluginDraft {
+        source_path,
+        template_name,
+        title,
+        summary,
+        excerpt,
+        suggested_surface,
+    })
+}
+
+fn classify_legacy_plugin_surface(source_path: &str, body: &str) -> &'static str {
+    let source_lower = source_path.to_ascii_lowercase();
+    let body_lower = body.to_ascii_lowercase();
+    if source_lower.contains("hook")
+        || body_lower.contains("pretooluse")
+        || body_lower.contains("posttooluse")
+        || body_lower.contains("notification")
+    {
+        "hook"
+    } else if source_lower.contains("skill")
+        || body_lower.contains("skill")
+        || body_lower.contains("system prompt")
+        || body_lower.contains("context")
+    {
+        "skill"
+    } else {
+        "command"
+    }
+}
+
+fn format_legacy_plugin_import_summary_markdown(report: &LegacyPluginImportReport) -> String {
+    let mut lines = vec![
+        "# Imported legacy plugins".to_string(),
+        String::new(),
+        format!("- Source: `{}`", report.source),
+        format!("- Output dir: `{}`", report.output_dir),
+        format!("- Plugins detected: {}", report.plugins_detected),
+        format!("- Templates generated: {}", report.templates_generated),
+        String::new(),
+    ];
+
+    if report.plugins.is_empty() {
+        lines.push("No legacy plugin scripts were detected.".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("## Plugins".to_string());
+    lines.push(String::new());
+    for plugin in &report.plugins {
+        lines.push(format!(
+            "- `{}` -> `{}`",
+            plugin.source_path, plugin.template_name
+        ));
+        lines.push(format!("  - Title: {}", plugin.title));
+        lines.push(format!("  - Summary: {}", plugin.summary));
+        lines.push(format!(
+            "  - Suggested surface: {}",
+            plugin.suggested_surface
+        ));
+    }
+
+    lines.join("\n")
+}
+
 fn build_legacy_remote_add_command(draft: &LegacyRemoteDispatchDraft) -> Option<String> {
     match draft.request_kind {
         session::RemoteDispatchKind::Standard => {
@@ -6211,6 +7245,10 @@ fn build_legacy_migration_plan_report(
                 target_surface: "ECC skills / orchestration templates".to_string(),
                 source_paths: artifact.source_paths.clone(),
                 command_snippets: vec![
+                    format!(
+                        "ecc migrate import-skills --source {} --output-dir migration-artifacts/skills",
+                        shell_quote_double(&audit.source)
+                    ),
                     "ecc template <template-name> --task \"<translated workflow goal>\"".to_string(),
                 ],
                 config_snippets: vec![
@@ -6225,7 +7263,11 @@ fn build_legacy_migration_plan_report(
                 target_surface: "ECC agents / hooks / commands / harness runners".to_string(),
                 source_paths: artifact.source_paths.clone(),
                 command_snippets: vec![
-                    "ecc start --task \"Rebuild one legacy tool as an ECC-native command or hook\"".to_string(),
+                    format!(
+                        "ecc migrate import-tools --source {} --output-dir migration-artifacts/tools",
+                        shell_quote_double(&audit.source)
+                    ),
+                    "ecc template <template-name> --task \"Rebuild one legacy tool as an ECC-native command, hook, or harness runner\"".to_string(),
                 ],
                 config_snippets: vec![
                     "[harness_runners.legacy-runner]\nprogram = \"<runner-binary>\"\nbase_args = []\nproject_markers = [\".legacy-runner\"]".to_string(),
@@ -6239,7 +7281,11 @@ fn build_legacy_migration_plan_report(
                 target_surface: "ECC hooks / commands / skills".to_string(),
                 source_paths: artifact.source_paths.clone(),
                 command_snippets: vec![
-                    "ecc start --task \"Port one bridge plugin behavior into an ECC hook or command\"".to_string(),
+                    format!(
+                        "ecc migrate import-plugins --source {} --output-dir migration-artifacts/plugins",
+                        shell_quote_double(&audit.source)
+                    ),
+                    "ecc template <template-name> --task \"Port one bridge plugin behavior into an ECC hook, command, or skill\"".to_string(),
                 ],
                 config_snippets: Vec::new(),
                 notes: artifact.notes.clone(),
@@ -6250,7 +7296,17 @@ fn build_legacy_migration_plan_report(
                 title: "Reconfigure local auth and connectors without importing secrets".to_string(),
                 target_surface: "Claude connectors / MCP / local API key setup".to_string(),
                 source_paths: artifact.source_paths.clone(),
-                command_snippets: Vec::new(),
+                command_snippets: vec![
+                    format!(
+                        "ecc migrate import-env --source {} --dry-run",
+                        shell_quote_double(&audit.source)
+                    ),
+                    format!(
+                        "ecc migrate import-env --source {}",
+                        shell_quote_double(&audit.source)
+                    ),
+                    "ecc graph recall \"<service or env key>\"".to_string(),
+                ],
                 config_snippets: vec![
                     "# Re-enter connector auth locally; do not copy legacy secrets into ECC2.\n# Typical targets: Google Drive OAuth, GitHub, Stripe, Linear, browser creds.".to_string(),
                 ],
@@ -6539,6 +7595,145 @@ fn format_legacy_memory_import_human(report: &LegacyMemoryImportReport) -> Strin
                 connector.observations_added,
                 connector.skipped_unchanged_sources
             ));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_legacy_env_import_human(report: &LegacyEnvImportReport) -> String {
+    let mut lines = vec![
+        format!(
+            "Legacy env/service import {} for {}",
+            if report.dry_run {
+                "preview"
+            } else {
+                "complete"
+            },
+            report.source
+        ),
+        format!("- importable sources {}", report.importable_sources),
+        format!("- imported sources {}", report.imported_sources),
+        format!("- manual reentry sources {}", report.manual_reentry_sources),
+        format!("- connectors detected {}", report.connectors_detected),
+        format!("- connectors synced {}", report.report.connectors_synced),
+        format!("- records read {}", report.report.records_read),
+        format!("- entities upserted {}", report.report.entities_upserted),
+        format!("- observations added {}", report.report.observations_added),
+        format!("- skipped records {}", report.report.skipped_records),
+        format!(
+            "- skipped unchanged sources {}",
+            report.report.skipped_unchanged_sources
+        ),
+    ];
+
+    if report.sources.is_empty() {
+        lines.push("- no recognized env/service migration sources were found".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("Sources".to_string());
+    for source in &report.sources {
+        let status = match source.status {
+            LegacyEnvImportSourceStatus::Ready => "ready",
+            LegacyEnvImportSourceStatus::Imported => "imported",
+            LegacyEnvImportSourceStatus::ManualOnly => "manual",
+        };
+        lines.push(format!("- {} [{}]", source.source_path, status));
+        if let Some(connector_name) = source.connector_name.as_deref() {
+            lines.push(format!("  connector {}", connector_name));
+        }
+        if let Some(reason) = source.reason.as_deref() {
+            lines.push(format!("  note {}", reason));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_legacy_skill_import_human(report: &LegacySkillImportReport) -> String {
+    let mut lines = vec![
+        format!("Legacy skill import complete for {}", report.source),
+        format!("- output dir {}", report.output_dir),
+        format!("- skills detected {}", report.skills_detected),
+        format!("- templates generated {}", report.templates_generated),
+    ];
+
+    if !report.files_written.is_empty() {
+        lines.push("Files".to_string());
+        for path in &report.files_written {
+            lines.push(format!("- {}", path));
+        }
+    }
+
+    if !report.skills.is_empty() {
+        lines.push("Skills".to_string());
+        for skill in &report.skills {
+            lines.push(format!(
+                "- {} -> {}",
+                skill.source_path, skill.template_name
+            ));
+            lines.push(format!("  title {}", skill.title));
+            lines.push(format!("  summary {}", skill.summary));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_legacy_tool_import_human(report: &LegacyToolImportReport) -> String {
+    let mut lines = vec![
+        format!("Legacy tool import complete for {}", report.source),
+        format!("- output dir {}", report.output_dir),
+        format!("- tools detected {}", report.tools_detected),
+        format!("- templates generated {}", report.templates_generated),
+    ];
+
+    if !report.files_written.is_empty() {
+        lines.push("Files".to_string());
+        for path in &report.files_written {
+            lines.push(format!("- {}", path));
+        }
+    }
+
+    if !report.tools.is_empty() {
+        lines.push("Tools".to_string());
+        for tool in &report.tools {
+            lines.push(format!("- {} -> {}", tool.source_path, tool.template_name));
+            lines.push(format!("  title {}", tool.title));
+            lines.push(format!("  summary {}", tool.summary));
+            lines.push(format!("  suggested surface {}", tool.suggested_surface));
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn format_legacy_plugin_import_human(report: &LegacyPluginImportReport) -> String {
+    let mut lines = vec![
+        format!("Legacy plugin import complete for {}", report.source),
+        format!("- output dir {}", report.output_dir),
+        format!("- plugins detected {}", report.plugins_detected),
+        format!("- templates generated {}", report.templates_generated),
+    ];
+
+    if !report.files_written.is_empty() {
+        lines.push("Files".to_string());
+        for path in &report.files_written {
+            lines.push(format!("- {}", path));
+        }
+    }
+
+    if !report.plugins.is_empty() {
+        lines.push("Plugins".to_string());
+        for plugin in &report.plugins {
+            lines.push(format!(
+                "- {} -> {}",
+                plugin.source_path, plugin.template_name
+            ));
+            lines.push(format!("  title {}", plugin.title));
+            lines.push(format!("  summary {}", plugin.summary));
+            lines.push(format!("  suggested surface {}", plugin.suggested_surface));
         }
     }
 
@@ -9178,6 +10373,133 @@ mod tests {
     }
 
     #[test]
+    fn cli_parses_migrate_import_env_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "migrate",
+            "import-env",
+            "--source",
+            "/tmp/hermes",
+            "--dry-run",
+            "--limit",
+            "42",
+            "--json",
+        ])
+        .expect("migrate import-env should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                command:
+                    MigrationCommands::ImportEnv {
+                        source,
+                        dry_run,
+                        limit,
+                        json,
+                    },
+            }) => {
+                assert_eq!(source, PathBuf::from("/tmp/hermes"));
+                assert!(dry_run);
+                assert_eq!(limit, 42);
+                assert!(json);
+            }
+            _ => panic!("expected migrate import-env subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_migrate_import_skills_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "migrate",
+            "import-skills",
+            "--source",
+            "/tmp/hermes",
+            "--output-dir",
+            "/tmp/out",
+            "--json",
+        ])
+        .expect("migrate import-skills should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                command:
+                    MigrationCommands::ImportSkills {
+                        source,
+                        output_dir,
+                        json,
+                    },
+            }) => {
+                assert_eq!(source, PathBuf::from("/tmp/hermes"));
+                assert_eq!(output_dir, PathBuf::from("/tmp/out"));
+                assert!(json);
+            }
+            _ => panic!("expected migrate import-skills subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_migrate_import_tools_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "migrate",
+            "import-tools",
+            "--source",
+            "/tmp/hermes",
+            "--output-dir",
+            "/tmp/out",
+            "--json",
+        ])
+        .expect("migrate import-tools should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                command:
+                    MigrationCommands::ImportTools {
+                        source,
+                        output_dir,
+                        json,
+                    },
+            }) => {
+                assert_eq!(source, PathBuf::from("/tmp/hermes"));
+                assert_eq!(output_dir, PathBuf::from("/tmp/out"));
+                assert!(json);
+            }
+            _ => panic!("expected migrate import-tools subcommand"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_migrate_import_plugins_command() {
+        let cli = Cli::try_parse_from([
+            "ecc",
+            "migrate",
+            "import-plugins",
+            "--source",
+            "/tmp/hermes",
+            "--output-dir",
+            "/tmp/out",
+            "--json",
+        ])
+        .expect("migrate import-plugins should parse");
+
+        match cli.command {
+            Some(Commands::Migrate {
+                command:
+                    MigrationCommands::ImportPlugins {
+                        source,
+                        output_dir,
+                        json,
+                    },
+            }) => {
+                assert_eq!(source, PathBuf::from("/tmp/hermes"));
+                assert_eq!(output_dir, PathBuf::from("/tmp/out"));
+                assert!(json);
+            }
+            _ => panic!("expected migrate import-plugins subcommand"),
+        }
+    }
+
+    #[test]
     fn legacy_migration_audit_report_maps_detected_artifacts() -> Result<()> {
         let tempdir = TestDir::new("legacy-migration-audit")?;
         let root = tempdir.path();
@@ -9251,6 +10573,9 @@ mod tests {
         fs::create_dir_all(root.join("cron"))?;
         fs::create_dir_all(root.join("gateway"))?;
         fs::create_dir_all(root.join("workspace/notes"))?;
+        fs::create_dir_all(root.join("skills/ecc-imports"))?;
+        fs::create_dir_all(root.join("tools"))?;
+        fs::create_dir_all(root.join("plugins"))?;
         fs::write(root.join("config.yaml"), "model: claude\n")?;
         fs::write(
             root.join("cron/jobs.json"),
@@ -9307,6 +10632,16 @@ mod tests {
             .join("\n"),
         )?;
         fs::write(root.join("workspace/notes/recovery.md"), "# recovery\n")?;
+        fs::write(root.join("skills/ecc-imports/research.md"), "# research\n")?;
+        fs::create_dir_all(root.join("tools"))?;
+        fs::write(
+            root.join("tools/browser.py"),
+            "# Verify the billing portal banner\nprint('browser')\n",
+        )?;
+        fs::write(
+            root.join("plugins/recovery.py"),
+            "# Account recovery command bridge\nprint('recovery')\n",
+        )?;
 
         let audit = build_legacy_migration_audit_report(root)?;
         let plan = build_legacy_migration_plan_report(&audit);
@@ -9371,6 +10706,42 @@ mod tests {
         let rendered = format_legacy_migration_plan_human(&plan);
         assert!(rendered.contains("Legacy migration plan"));
         assert!(rendered.contains("Import sanitized workspace memory through ECC2 connectors"));
+        let env_step = plan
+            .steps
+            .iter()
+            .find(|step| step.category == "env_services")
+            .expect("env services step");
+        assert!(env_step
+            .command_snippets
+            .iter()
+            .any(|command| command.contains("ecc migrate import-env --source")));
+        let skills_step = plan
+            .steps
+            .iter()
+            .find(|step| step.category == "skills")
+            .expect("skills step");
+        assert!(skills_step
+            .command_snippets
+            .iter()
+            .any(|command| command.contains("ecc migrate import-skills --source")));
+        let tools_step = plan
+            .steps
+            .iter()
+            .find(|step| step.category == "tools")
+            .expect("tools step");
+        assert!(tools_step
+            .command_snippets
+            .iter()
+            .any(|command| command.contains("ecc migrate import-tools --source")));
+        let plugins_step = plan
+            .steps
+            .iter()
+            .find(|step| step.category == "plugins")
+            .expect("plugins step");
+        assert!(plugins_step
+            .command_snippets
+            .iter()
+            .any(|command| command.contains("ecc migrate import-plugins --source")));
 
         Ok(())
     }
@@ -9718,6 +11089,254 @@ Route existing installs to portal first before checkout.
             requests[1].working_dir.canonicalize()?,
             target_repo.canonicalize()?
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_env_dry_run_reports_importable_and_manual_sources() -> Result<()> {
+        let tempdir = TestDir::new("legacy-env-import-dry-run")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("services"))?;
+        fs::write(
+            root.join(".env.local"),
+            "STRIPE_SECRET_KEY=sk_test_secret\nPUBLIC_BASE_URL=https://ecc.tools\n",
+        )?;
+        fs::write(
+            root.join(".envrc"),
+            "export OPENAI_API_KEY=sk-openai-secret\nexport PUBLIC_DOCS_URL=https://docs.ecc.tools\n",
+        )?;
+        fs::write(root.join("config.yaml"), "model: claude\n")?;
+        fs::write(
+            root.join("services").join("billing.json"),
+            "{\"port\": 3000}\n",
+        )?;
+
+        let tempdb = TestDir::new("legacy-env-import-dry-run-db")?;
+        let db = StateStore::open(&tempdb.path().join("state.db"))?;
+        let report = import_legacy_env_services(&db, root, true, 10)?;
+
+        assert!(report.dry_run);
+        assert_eq!(report.importable_sources, 2);
+        assert_eq!(report.imported_sources, 0);
+        assert_eq!(report.manual_reentry_sources, 2);
+        assert_eq!(report.connectors_detected, 2);
+        assert_eq!(report.report.connectors_synced, 0);
+        assert_eq!(
+            report
+                .sources
+                .iter()
+                .filter(|item| item.status == LegacyEnvImportSourceStatus::Ready)
+                .count(),
+            2
+        );
+        assert!(report.sources.iter().any(|item| {
+            item.source_path == "config.yaml"
+                && item.status == LegacyEnvImportSourceStatus::ManualOnly
+        }));
+        assert!(report.sources.iter().any(|item| {
+            item.source_path == "services" && item.status == LegacyEnvImportSourceStatus::ManualOnly
+        }));
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_env_imports_safe_context_into_graph() -> Result<()> {
+        let tempdir = TestDir::new("legacy-env-import-live")?;
+        let root = tempdir.path();
+        fs::write(
+            root.join(".env.local"),
+            "STRIPE_SECRET_KEY=sk_test_secret\nPUBLIC_BASE_URL=https://ecc.tools\n",
+        )?;
+        fs::write(
+            root.join(".env.production"),
+            "export OPENAI_API_KEY=sk-openai-secret\nexport PUBLIC_DOCS_URL=https://docs.ecc.tools\n",
+        )?;
+
+        let tempdb = TestDir::new("legacy-env-import-live-db")?;
+        let db = StateStore::open(&tempdb.path().join("state.db"))?;
+        let report = import_legacy_env_services(&db, root, false, 10)?;
+
+        assert!(!report.dry_run);
+        assert_eq!(report.importable_sources, 2);
+        assert_eq!(report.imported_sources, 2);
+        assert_eq!(report.manual_reentry_sources, 0);
+        assert_eq!(report.report.connectors_synced, 2);
+        assert_eq!(report.report.records_read, 4);
+        assert!(report.sources.iter().all(|item| {
+            item.status == LegacyEnvImportSourceStatus::Imported
+                || item.status == LegacyEnvImportSourceStatus::Ready
+        }));
+
+        let recalled = db.recall_context_entities(None, "stripe docs ecc.tools", 10)?;
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "STRIPE_SECRET_KEY"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "PUBLIC_BASE_URL"));
+        assert!(recalled
+            .iter()
+            .any(|entry| entry.entity.name == "PUBLIC_DOCS_URL"));
+
+        let secret = recalled
+            .iter()
+            .find(|entry| entry.entity.name == "STRIPE_SECRET_KEY")
+            .expect("secret entry should exist");
+        let observations = db.list_context_observations(Some(secret.entity.id), 5)?;
+        assert_eq!(
+            observations[0]
+                .details
+                .get("secret_redacted")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(!observations[0].details.contains_key("value"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_skills_writes_template_artifacts() -> Result<()> {
+        let tempdir = TestDir::new("legacy-skill-import")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("skills/ecc-imports"))?;
+        fs::create_dir_all(root.join("skills/ops"))?;
+        fs::write(
+            root.join("skills/ecc-imports/research.md"),
+            "# Recovery research\nGather billing/account context before touching checkout logic.\n",
+        )?;
+        fs::write(
+            root.join("skills/ops/recovery.markdown"),
+            "# Portal repair\nRoute wiped installs toward repair before presenting new checkout.\n",
+        )?;
+
+        let output_dir = root.join("out");
+        let report = import_legacy_skills(root, &output_dir)?;
+
+        assert_eq!(report.skills_detected, 2);
+        assert_eq!(report.templates_generated, 2);
+        assert_eq!(report.files_written.len(), 2);
+        assert!(report
+            .skills
+            .iter()
+            .any(|skill| skill.template_name == "ecc_imports_research_md"));
+        assert!(report
+            .skills
+            .iter()
+            .any(|skill| skill.template_name == "ops_recovery_markdown"));
+
+        let config_text = fs::read_to_string(output_dir.join("ecc2.imported-skills.toml"))?;
+        assert!(config_text.contains("[orchestration_templates.ecc_imports_research_md]"));
+        assert!(config_text.contains("[orchestration_templates.ops_recovery_markdown]"));
+        assert!(config_text.contains("Translate and run that workflow for {{task}}."));
+
+        let summary_text = fs::read_to_string(output_dir.join("imported-skills.md"))?;
+        assert!(summary_text.contains("skills/ecc-imports/research.md"));
+        assert!(summary_text.contains("skills/ops/recovery.markdown"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_tools_writes_template_artifacts() -> Result<()> {
+        let tempdir = TestDir::new("legacy-tool-import")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("tools/browser"))?;
+        fs::create_dir_all(root.join("tools/hooks"))?;
+        fs::write(
+            root.join("tools/browser/check_portal.py"),
+            "# Verify the billing portal warning banner\nprint('check banner')\n",
+        )?;
+        fs::write(
+            root.join("tools/hooks/preflight.sh"),
+            "#!/usr/bin/env bash\n# PretoolUse guard for dangerous commands\nexit 0\n",
+        )?;
+
+        let output_dir = root.join("out");
+        let report = import_legacy_tools(root, &output_dir)?;
+
+        assert_eq!(report.tools_detected, 2);
+        assert_eq!(report.templates_generated, 2);
+        assert_eq!(report.files_written.len(), 2);
+        assert!(report
+            .tools
+            .iter()
+            .any(|tool| tool.template_name == "tool_browser_check_portal_py"));
+        assert!(report
+            .tools
+            .iter()
+            .any(|tool| tool.template_name == "tool_hooks_preflight_sh"));
+        assert!(report
+            .tools
+            .iter()
+            .any(|tool| tool.suggested_surface == "command"));
+        assert!(report
+            .tools
+            .iter()
+            .any(|tool| tool.suggested_surface == "hook"));
+
+        let config_text = fs::read_to_string(output_dir.join("ecc2.imported-tools.toml"))?;
+        assert!(config_text.contains("[orchestration_templates.tool_browser_check_portal_py]"));
+        assert!(config_text.contains("[orchestration_templates.tool_hooks_preflight_sh]"));
+        assert!(config_text.contains("Rebuild or wrap that behavior as an ECC-native"));
+
+        let summary_text = fs::read_to_string(output_dir.join("imported-tools.md"))?;
+        assert!(summary_text.contains("tools/browser/check_portal.py"));
+        assert!(summary_text.contains("tools/hooks/preflight.sh"));
+        assert!(summary_text.contains("Suggested surface: hook"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn import_legacy_plugins_writes_template_artifacts() -> Result<()> {
+        let tempdir = TestDir::new("legacy-plugin-import")?;
+        let root = tempdir.path();
+        fs::create_dir_all(root.join("plugins/hooks"))?;
+        fs::create_dir_all(root.join("plugins/skills"))?;
+        fs::write(
+            root.join("plugins/hooks/review.py"),
+            "# PostToolUse notifier for risky changes\nprint('review')\n",
+        )?;
+        fs::write(
+            root.join("plugins/skills/recovery.py"),
+            "# Recovery skill bridge for wiped setups\nprint('recovery')\n",
+        )?;
+
+        let output_dir = root.join("out");
+        let report = import_legacy_plugins(root, &output_dir)?;
+
+        assert_eq!(report.plugins_detected, 2);
+        assert_eq!(report.templates_generated, 2);
+        assert_eq!(report.files_written.len(), 2);
+        assert!(report
+            .plugins
+            .iter()
+            .any(|plugin| plugin.template_name == "plugin_hooks_review_py"));
+        assert!(report
+            .plugins
+            .iter()
+            .any(|plugin| plugin.template_name == "plugin_skills_recovery_py"));
+        assert!(report
+            .plugins
+            .iter()
+            .any(|plugin| plugin.suggested_surface == "hook"));
+        assert!(report
+            .plugins
+            .iter()
+            .any(|plugin| plugin.suggested_surface == "skill"));
+
+        let config_text = fs::read_to_string(output_dir.join("ecc2.imported-plugins.toml"))?;
+        assert!(config_text.contains("[orchestration_templates.plugin_hooks_review_py]"));
+        assert!(config_text.contains("[orchestration_templates.plugin_skills_recovery_py]"));
+        assert!(config_text.contains("Port that behavior into an ECC-native"));
+
+        let summary_text = fs::read_to_string(output_dir.join("imported-plugins.md"))?;
+        assert!(summary_text.contains("plugins/hooks/review.py"));
+        assert!(summary_text.contains("plugins/skills/recovery.py"));
+        assert!(summary_text.contains("Suggested surface: skill"));
 
         Ok(())
     }
