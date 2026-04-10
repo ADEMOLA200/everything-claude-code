@@ -111,9 +111,34 @@ pub struct SessionHarnessInfo {
     pub primary: HarnessKind,
     pub primary_label: String,
     pub detected: Vec<HarnessKind>,
+    pub detected_labels: Vec<String>,
 }
 
 impl SessionHarnessInfo {
+    fn detected_labels_for(detected: &[HarnessKind]) -> Vec<String> {
+        detected.iter().map(|harness| harness.to_string()).collect()
+    }
+
+    fn configured_detected_labels(cfg: &crate::config::Config, working_dir: &Path) -> Vec<String> {
+        let mut labels = Vec::new();
+        for (name, runner) in &cfg.harness_runners {
+            if runner.project_markers.is_empty() {
+                continue;
+            }
+            if runner
+                .project_markers
+                .iter()
+                .any(|marker| working_dir.join(marker).exists())
+            {
+                let label = Self::runner_key(name);
+                if !label.is_empty() && !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+        }
+        labels
+    }
+
     pub fn runner_key(agent_type: &str) -> String {
         let canonical = HarnessKind::canonical_agent_type(agent_type);
         match HarnessKind::from_agent_type(&canonical) {
@@ -167,10 +192,12 @@ impl SessionHarnessInfo {
             harness => harness,
         };
 
+        let detected_labels = Self::detected_labels_for(&detected);
         Self {
             primary,
             primary_label: Self::primary_label_for(agent_type, primary),
             detected,
+            detected_labels,
         }
     }
 
@@ -187,6 +214,7 @@ impl SessionHarnessInfo {
         }
 
         let normalized_label = harness_label.trim().to_ascii_lowercase();
+        let detected_labels = Self::detected_labels_for(&detected);
         Self {
             primary,
             primary_label: if normalized_label.is_empty() {
@@ -195,18 +223,54 @@ impl SessionHarnessInfo {
                 normalized_label
             },
             detected,
+            detected_labels,
         }
     }
 
+    pub fn with_config_detection(
+        mut self,
+        cfg: &crate::config::Config,
+        working_dir: &Path,
+    ) -> Self {
+        for label in Self::configured_detected_labels(cfg, working_dir) {
+            if !self.detected_labels.contains(&label) {
+                self.detected_labels.push(label);
+            }
+        }
+
+        if self.primary == HarnessKind::Unknown
+            && self.primary_label == HarnessKind::Unknown.as_str()
+            && !self.detected_labels.is_empty()
+        {
+            self.primary_label = self.detected_labels[0].clone();
+        }
+
+        self
+    }
+
+    pub fn resolve_requested_agent_type(
+        cfg: &crate::config::Config,
+        requested_agent_type: &str,
+        working_dir: &Path,
+    ) -> String {
+        let canonical = HarnessKind::canonical_agent_type(requested_agent_type);
+        if !canonical.is_empty() && canonical != "auto" {
+            return canonical;
+        }
+
+        let detected = Self::detect("", working_dir).with_config_detection(cfg, working_dir);
+        if detected.primary_label != HarnessKind::Unknown.as_str() {
+            return Self::runner_key(&detected.primary_label);
+        }
+
+        HarnessKind::Claude.as_str().to_string()
+    }
+
     pub fn detected_summary(&self) -> String {
-        if self.detected.is_empty() {
+        if self.detected_labels.is_empty() {
             "none detected".to_string()
         } else {
-            self.detected
-                .iter()
-                .map(|harness| harness.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            self.detected_labels.join(", ")
         }
     }
 }
@@ -347,6 +411,84 @@ pub struct ScheduledTask {
     pub next_run_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteDispatchRequest {
+    pub id: i64,
+    pub request_kind: RemoteDispatchKind,
+    pub target_session_id: Option<String>,
+    pub task: String,
+    pub target_url: Option<String>,
+    pub priority: crate::comms::TaskPriority,
+    pub agent_type: String,
+    pub profile_name: Option<String>,
+    pub working_dir: PathBuf,
+    pub project: String,
+    pub task_group: String,
+    pub use_worktree: bool,
+    pub source: String,
+    pub requester: Option<String>,
+    pub status: RemoteDispatchStatus,
+    pub result_session_id: Option<String>,
+    pub result_action: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub dispatched_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteDispatchKind {
+    Standard,
+    ComputerUse,
+}
+
+impl fmt::Display for RemoteDispatchKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Standard => write!(f, "standard"),
+            Self::ComputerUse => write!(f, "computer_use"),
+        }
+    }
+}
+
+impl RemoteDispatchKind {
+    pub fn from_db_value(value: &str) -> Self {
+        match value {
+            "computer_use" => Self::ComputerUse,
+            _ => Self::Standard,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteDispatchStatus {
+    Pending,
+    Dispatched,
+    Failed,
+}
+
+impl fmt::Display for RemoteDispatchStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Dispatched => write!(f, "dispatched"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl RemoteDispatchStatus {
+    pub fn from_db_value(value: &str) -> Self {
+        match value {
+            "dispatched" => Self::Dispatched,
+            "failed" => Self::Failed,
+            _ => Self::Pending,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -573,6 +715,7 @@ mod tests {
             harness.detected,
             vec![HarnessKind::Claude, HarnessKind::Codex]
         );
+        assert_eq!(harness.detected_labels, vec!["claude", "codex"]);
         assert_eq!(harness.detected_summary(), "claude, codex");
         Ok(())
     }
@@ -587,6 +730,7 @@ mod tests {
         assert_eq!(harness.primary, HarnessKind::Gemini);
         assert_eq!(harness.primary_label, "gemini");
         assert_eq!(harness.detected, vec![HarnessKind::Gemini]);
+        assert_eq!(harness.detected_labels, vec!["gemini"]);
         Ok(())
     }
 
@@ -610,6 +754,7 @@ mod tests {
         assert_eq!(harness.primary, HarnessKind::Unknown);
         assert_eq!(harness.primary_label, "custom-runner");
         assert!(harness.detected.is_empty());
+        assert!(harness.detected_labels.is_empty());
     }
 
     #[test]
@@ -626,6 +771,54 @@ mod tests {
             harness.detected,
             vec![HarnessKind::Claude, HarnessKind::Codex]
         );
+        assert_eq!(harness.detected_labels, vec!["claude", "codex"]);
+        Ok(())
+    }
+
+    #[test]
+    fn config_detection_adds_custom_markers_to_detected_summary(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let repo = TestDir::new("session-harness-custom-config")?;
+        fs::create_dir_all(repo.path().join(".acme"))?;
+        let mut cfg = crate::config::Config::default();
+        cfg.harness_runners.insert(
+            "acme-runner".to_string(),
+            crate::config::HarnessRunnerConfig {
+                project_markers: vec![PathBuf::from(".acme")],
+                ..Default::default()
+            },
+        );
+
+        let harness =
+            SessionHarnessInfo::detect("", repo.path()).with_config_detection(&cfg, repo.path());
+        assert_eq!(harness.primary, HarnessKind::Unknown);
+        assert_eq!(harness.primary_label, "acme-runner");
+        assert_eq!(harness.detected_labels, vec!["acme-runner"]);
+        assert_eq!(harness.detected_summary(), "acme-runner");
+        Ok(())
+    }
+
+    #[test]
+    fn config_detection_preserves_custom_primary_label_and_appends_marker_matches(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let repo = TestDir::new("session-harness-config-append")?;
+        fs::create_dir_all(repo.path().join(".acme"))?;
+        fs::create_dir_all(repo.path().join(".codex"))?;
+        let mut cfg = crate::config::Config::default();
+        cfg.harness_runners.insert(
+            "acme-runner".to_string(),
+            crate::config::HarnessRunnerConfig {
+                project_markers: vec![PathBuf::from(".acme")],
+                ..Default::default()
+            },
+        );
+
+        let harness = SessionHarnessInfo::detect("acme-runner", repo.path())
+            .with_config_detection(&cfg, repo.path());
+        assert_eq!(harness.primary, HarnessKind::Unknown);
+        assert_eq!(harness.primary_label, "acme-runner");
+        assert_eq!(harness.detected_labels, vec!["codex", "acme-runner"]);
+        assert_eq!(harness.detected_summary(), "codex, acme-runner");
         Ok(())
     }
 
@@ -636,5 +829,49 @@ mod tests {
             "custom-runner"
         );
         assert_eq!(SessionHarnessInfo::runner_key("claude-code"), "claude");
+    }
+
+    #[test]
+    fn resolve_requested_agent_type_uses_detected_builtin_marker_for_auto(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let repo = TestDir::new("session-harness-resolve-auto-built-in")?;
+        fs::create_dir_all(repo.path().join(".codex"))?;
+
+        let resolved = SessionHarnessInfo::resolve_requested_agent_type(
+            &crate::config::Config::default(),
+            "auto",
+            repo.path(),
+        );
+        assert_eq!(resolved, "codex");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_requested_agent_type_uses_configured_marker_for_auto(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let repo = TestDir::new("session-harness-resolve-auto-custom")?;
+        fs::create_dir_all(repo.path().join(".acme"))?;
+        let mut cfg = crate::config::Config::default();
+        cfg.harness_runners.insert(
+            "acme-runner".to_string(),
+            crate::config::HarnessRunnerConfig {
+                project_markers: vec![PathBuf::from(".acme")],
+                ..Default::default()
+            },
+        );
+
+        let resolved = SessionHarnessInfo::resolve_requested_agent_type(&cfg, "auto", repo.path());
+        assert_eq!(resolved, "acme-runner");
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_requested_agent_type_falls_back_to_claude_without_markers() {
+        let resolved = SessionHarnessInfo::resolve_requested_agent_type(
+            &crate::config::Config::default(),
+            "auto",
+            Path::new("."),
+        );
+        assert_eq!(resolved, "claude");
     }
 }

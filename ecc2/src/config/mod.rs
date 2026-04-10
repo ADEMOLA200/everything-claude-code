@@ -50,6 +50,16 @@ pub struct ConflictResolutionConfig {
     pub notify_lead: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ComputerUseDispatchConfig {
+    pub agent: Option<String>,
+    pub profile: Option<String>,
+    pub use_worktree: bool,
+    pub project: Option<String>,
+    pub task_group: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentProfileConfig {
@@ -84,6 +94,7 @@ pub struct ResolvedAgentProfile {
 pub struct HarnessRunnerConfig {
     pub program: String,
     pub base_args: Vec<String>,
+    pub project_markers: Vec<PathBuf>,
     pub cwd_flag: Option<String>,
     pub session_name_flag: Option<String>,
     pub task_flag: Option<String>,
@@ -222,6 +233,7 @@ pub struct Config {
     pub agent_profiles: BTreeMap<String, AgentProfileConfig>,
     pub orchestration_templates: BTreeMap<String, OrchestrationTemplateConfig>,
     pub memory_connectors: BTreeMap<String, MemoryConnectorConfig>,
+    pub computer_use_dispatch: ComputerUseDispatchConfig,
     pub auto_dispatch_unread_handoffs: bool,
     pub auto_dispatch_limit_per_session: usize,
     pub auto_create_worktrees: bool,
@@ -288,6 +300,7 @@ impl Default for Config {
             agent_profiles: BTreeMap::new(),
             orchestration_templates: BTreeMap::new(),
             memory_connectors: BTreeMap::new(),
+            computer_use_dispatch: ComputerUseDispatchConfig::default(),
             auto_dispatch_unread_handoffs: false,
             auto_dispatch_limit_per_session: 5,
             auto_create_worktrees: true,
@@ -344,6 +357,26 @@ impl Config {
 
     pub fn effective_budget_alert_thresholds(&self) -> BudgetAlertThresholds {
         self.budget_alert_thresholds.sanitized()
+    }
+
+    pub fn computer_use_dispatch_defaults(&self) -> ResolvedComputerUseDispatchConfig {
+        let agent = self
+            .computer_use_dispatch
+            .agent
+            .clone()
+            .unwrap_or_else(|| self.default_agent.clone());
+        let profile = self
+            .computer_use_dispatch
+            .profile
+            .clone()
+            .or_else(|| self.default_agent_profile.clone());
+        ResolvedComputerUseDispatchConfig {
+            agent,
+            profile,
+            use_worktree: self.computer_use_dispatch.use_worktree,
+            project: self.computer_use_dispatch.project.clone(),
+            task_group: self.computer_use_dispatch.task_group.clone(),
+        }
     }
 
     pub fn resolve_agent_profile(&self, name: &str) -> Result<ResolvedAgentProfile> {
@@ -752,6 +785,7 @@ impl Default for HarnessRunnerConfig {
         Self {
             program: String::new(),
             base_args: Vec::new(),
+            project_markers: Vec::new(),
             cwd_flag: None,
             session_name_flag: None,
             task_flag: None,
@@ -767,6 +801,27 @@ impl Default for HarnessRunnerConfig {
             env: BTreeMap::new(),
         }
     }
+}
+
+impl Default for ComputerUseDispatchConfig {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            profile: None,
+            use_worktree: false,
+            project: None,
+            task_group: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResolvedComputerUseDispatchConfig {
+    pub agent: String,
+    pub profile: Option<String>,
+    pub use_worktree: bool,
+    pub project: Option<String>,
+    pub task_group: Option<String>,
 }
 
 fn merge_unique<T>(base: &mut Vec<T>, additions: &[T])
@@ -849,8 +904,8 @@ impl BudgetAlertThresholds {
 #[cfg(test)]
 mod tests {
     use super::{
-        BudgetAlertThresholds, Config, ConflictResolutionConfig, ConflictResolutionStrategy,
-        PaneLayout,
+        BudgetAlertThresholds, ComputerUseDispatchConfig, Config, ConflictResolutionConfig,
+        ConflictResolutionStrategy, PaneLayout, ResolvedComputerUseDispatchConfig,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::BTreeMap;
@@ -1201,6 +1256,42 @@ notify_lead = false
     }
 
     #[test]
+    fn computer_use_dispatch_deserializes_from_toml() {
+        let config: Config = toml::from_str(
+            r#"
+[computer_use_dispatch]
+agent = "codex"
+profile = "browser"
+use_worktree = true
+project = "ops"
+task_group = "remote browser"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.computer_use_dispatch,
+            ComputerUseDispatchConfig {
+                agent: Some("codex".to_string()),
+                profile: Some("browser".to_string()),
+                use_worktree: true,
+                project: Some("ops".to_string()),
+                task_group: Some("remote browser".to_string()),
+            }
+        );
+        assert_eq!(
+            config.computer_use_dispatch_defaults(),
+            ResolvedComputerUseDispatchConfig {
+                agent: "codex".to_string(),
+                profile: Some("browser".to_string()),
+                use_worktree: true,
+                project: Some("ops".to_string()),
+                task_group: Some("remote browser".to_string()),
+            }
+        );
+    }
+
+    #[test]
     fn agent_profiles_resolve_inheritance_and_defaults() {
         let config: Config = toml::from_str(
             r#"
@@ -1266,6 +1357,7 @@ inherits = "a"
 [harness_runners.cursor]
 program = "cursor-agent"
 base_args = ["run"]
+project_markers = [".cursor", ".cursor/rules"]
 cwd_flag = "--cwd"
 session_name_flag = "--name"
 task_flag = "--task"
@@ -1282,6 +1374,10 @@ ECC_HARNESS = "cursor"
         let runner = config.harness_runner("cursor").expect("cursor runner");
         assert_eq!(runner.program, "cursor-agent");
         assert_eq!(runner.base_args, vec!["run"]);
+        assert_eq!(
+            runner.project_markers,
+            vec![PathBuf::from(".cursor"), PathBuf::from(".cursor/rules")]
+        );
         assert_eq!(runner.cwd_flag.as_deref(), Some("--cwd"));
         assert_eq!(runner.session_name_flag.as_deref(), Some("--name"));
         assert_eq!(runner.task_flag.as_deref(), Some("--task"));
