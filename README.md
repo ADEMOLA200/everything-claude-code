@@ -179,6 +179,34 @@ Most Claude Code users should use exactly one install path:
 
 If you already layered multiple installs and things look duplicated, skip straight to [Reset / Uninstall ECC](#reset--uninstall-ecc).
 
+### Low-context / no-hooks path
+
+If hooks feel too global or you only want ECC's rules, agents, commands, and core workflow skills, skip the plugin and use the minimal manual profile:
+
+```bash
+./install.sh --profile minimal --target claude
+```
+
+```powershell
+.\install.ps1 --profile minimal --target claude
+# or
+npx ecc-install --profile minimal --target claude
+```
+
+This profile intentionally excludes `hooks-runtime`.
+
+If you want the normal core profile but need hooks off, use:
+
+```bash
+./install.sh --profile core --without baseline:hooks --target claude
+```
+
+Add hooks later only if you want runtime enforcement:
+
+```bash
+./install.sh --target claude --modules hooks-runtime
+```
+
 ### Step 1: Install the Plugin (Recommended)
 
 > NOTE: The plugin is convenient, but the OSS installer below is still the most reliable path if your Claude Code build has trouble resolving self-hosted marketplace entries.
@@ -302,8 +330,8 @@ If you stacked methods, clean up in this order:
 # Skills are the primary workflow surface.
 # Existing slash-style command names still work while ECC migrates off commands/.
 
-# Plugin install uses the namespaced form
-/ecc:plan "Add user authentication"
+# Plugin install uses the canonical namespaced form
+/everything-claude-code:plan "Add user authentication"
 
 # Manual install keeps the shorter slash form:
 # /plan "Add user authentication"
@@ -916,8 +944,8 @@ Not sure where to start? Use this quick reference. Skills are the canonical work
 
 | I want to... | Use this surface | Agent used |
 |--------------|-----------------|------------|
-| Plan a new feature | `/ecc:plan "Add auth"` | planner |
-| Design system architecture | `/ecc:plan` + architect agent | architect |
+| Plan a new feature | `/everything-claude-code:plan "Add auth"` | planner |
+| Design system architecture | `/everything-claude-code:plan` + architect agent | architect |
 | Write code with tests first | `tdd-workflow` skill | tdd-guide |
 | Review code I just wrote | `/code-review` | code-reviewer |
 | Fix a failing build | `/build-fix` | build-error-resolver |
@@ -936,7 +964,7 @@ Slash forms below are shown where they remain part of the maintained command sur
 
 **Starting a new feature:**
 ```
-/ecc:plan "Add user authentication with OAuth"
+/everything-claude-code:plan "Add user authentication with OAuth"
                                               → planner creates implementation blueprint
 tdd-workflow skill                            → tdd-guide enforces write-tests-first
 /code-review                                  → code-reviewer checks your work
@@ -1107,7 +1135,7 @@ These are not bundled with ECC and are not audited by this repo, but they are wo
 
 ## Cursor IDE Support
 
-ECC provides **full Cursor IDE support** with hooks, rules, agents, skills, commands, and MCP configs adapted for Cursor's native format.
+ECC provides Cursor IDE support with hooks, rules, agents, skills, commands, and MCP configs adapted for Cursor's project layout.
 
 ### Quick Start (Cursor)
 
@@ -1130,10 +1158,16 @@ ECC provides **full Cursor IDE support** with hooks, rules, agents, skills, comm
 | Hook Events | 15 | sessionStart, beforeShellExecution, afterFileEdit, beforeMCPExecution, beforeSubmitPrompt, and 10 more |
 | Hook Scripts | 16 | Thin Node.js scripts delegating to `scripts/hooks/` via shared adapter |
 | Rules | 34 | 9 common (alwaysApply) + 25 language-specific (TypeScript, Python, Go, Swift, PHP) |
-| Agents | Shared | Via AGENTS.md at root (read by Cursor natively) |
-| Skills | Shared + Bundled | Via AGENTS.md at root and `.cursor/skills/` for translated additions |
+| Agents | 48 | `.cursor/agents/ecc-*.md` when installed; prefixed to avoid collisions with user or marketplace agents |
+| Skills | Shared + Bundled | `.cursor/skills/` for translated additions |
 | Commands | Shared | `.cursor/commands/` if installed |
 | MCP Config | Shared | `.cursor/mcp.json` if installed |
+
+### Cursor Loading Notes
+
+ECC does not install root `AGENTS.md` into `.cursor/`. Cursor treats nested `AGENTS.md` files as directory context, so copying ECC's repo identity into a host project would pollute that project.
+
+Cursor-native loading behavior can vary by Cursor build. ECC installs agents as `.cursor/agents/ecc-*.md`; if your Cursor build does not expose project agents, those files still work as explicit reference definitions instead of hidden global prompt context.
 
 ### Hook Architecture (DRY Adapter Pattern)
 
